@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/src/assets/typesass-logo.png" />
+    <title>typesass</title>
+  </head>
+  <body>
+    <main id="floatShell" class="floatShell" data-tauri-drag-region>
+      <div id="statusBubble" class="statusBubble" role="alert"></div>
+
+      <section class="voicePill" aria-label="语音输入悬浮条" data-tauri-drag-region>
+        <button id="cancelButton" class="pillButton cancelButton" type="button" aria-label="取消录音" title="取消录音">
+          <span class="pillIcon" data-icon="close" aria-hidden="true"></span>
+        </button>
+
+        <button id="soundStage" class="dotsTrack" type="button" aria-label="开始或停止录音" title="开始或停止录音" data-state="idle">
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+        </button>
+
+        <button id="recordButton" class="pillButton confirmButton" type="button" aria-label="开始录音" title="开始录音">
+          <span class="pillIcon" data-icon="check" aria-hidden="true"></span>
+        </button>
+      </section>
+
+      <div id="statusText" class="statusText">按快捷键开始录音。</div>
+    </main>
+
+    <main id="hubShell" class="hubShell" aria-label="typesass Hub">
+      <aside class="hubSidebar">
+        <div class="brandBlock">
+          <div class="brandMark">
+            <img id="brandLogo" alt="" />
+            <i aria-hidden="true"></i>
+          </div>
+          <div>
+            <div class="brandName">typesass</div>
+            <div class="brandMeta">Voice Assistant</div>
+          </div>
+        </div>
+
+        <nav class="hubNav" aria-label="主导航">
+          <button class="hubNavButton isActive" type="button" data-view-target="home">
+            <span class="navIcon" data-icon="dashboard" aria-hidden="true"></span>
+            <span>仪表盘</span>
+          </button>
+          <button class="hubNavButton" type="button" data-view-target="modes">
+            <span class="navIcon" data-icon="voice" aria-hidden="true"></span>
+            <span>语音模式</span>
+          </button>
+          <button class="hubNavButton" type="button" data-view-target="shortcuts">
+            <span class="navIcon" data-icon="keyboard" aria-hidden="true"></span>
+            <span>快捷键</span>
+          </button>
+          <button class="hubNavButton" type="button" data-view-target="history">
+            <span class="navIcon" data-icon="history" aria-hidden="true"></span>
+            <span>历史记录</span>
+          </button>
+          <button class="hubNavButton" type="button" data-view-target="dictionary">
+            <span class="navIcon" data-icon="book" aria-hidden="true"></span>
+            <span>词典</span>
+          </button>
+          <button class="hubNavButton" type="button" data-view-target="settings">
+            <span class="navIcon" data-icon="setting" aria-hidden="true"></span>
+            <span>系统设置</span>
+          </button>
+        </nav>
+
+        <section class="usagePanel">
+          <div class="usageLabel">本地历史</div>
+          <div id="usageWords" class="usageValue">0 字</div>
+          <div class="usageTrack" aria-hidden="true"><span id="usageTrackFill"></span></div>
+        </section>
+      </aside>
+
+      <section class="hubContent">
+        <header class="hubHeader">
+          <div>
+            <div id="hubEyebrow" class="hubEyebrow">说话，不要打字</div>
+            <h1 id="hubTitle">仪表盘</h1>
+          </div>
+          <div class="hubHeaderTools">
+            <div class="runtimePill" id="systemStateText">本机运行中</div>
+            <label class="quickPolishSwitch" title="关闭后口述只做语音转文字，不等待 AI 润色">
+              <span>口述润色</span>
+              <input id="quickAiPolishInput" type="checkbox" aria-label="AI 润色" />
+            </label>
+            <button id="refreshStatusButton" class="smallIconButton" type="button" title="刷新状态" aria-label="刷新状态">
+              <span data-icon="refresh" aria-hidden="true"></span>
+            </button>
+            <button id="quickStartButton" class="toolbarPrimary" type="button">
+              <span class="buttonIcon" data-icon="play" aria-hidden="true"></span>
+              <span data-action-label>开始口述</span>
+            </button>
+          </div>
+        </header>
+        <div id="hubStatusText" class="hubStatusText" data-state="idle">所有设置和历史都只保存在本机。</div>
+
+        <section id="homeView" class="hubView isActive" data-view="home">
+          <div class="metricGrid">
+            <article class="metricCard">
+              <span>今日次数</span>
+              <strong id="metricSessions">0</strong>
+            </article>
+            <article class="metricCard">
+              <span>今日字数</span>
+              <strong id="metricWords">0</strong>
+            </article>
+            <article class="metricCard">
+              <span>平均速度</span>
+              <strong id="metricSpeed">--</strong>
+            </article>
+            <article class="metricCard">
+              <span>词典与偏好</span>
+              <strong id="metricPersonalization">本地词典</strong>
+            </article>
+          </div>
+
+          <section class="healthGrid" aria-label="准备状态">
+            <article class="healthPanel">
+              <div class="panelHeader">
+                <div>
+                  <div class="sectionTitle">准备状态</div>
+                  <p class="sectionHint">这些状态决定能否从快捷键到自动粘贴一口气完成。</p>
+                </div>
+                <button class="plainButton" type="button" data-view-jump="settings">打开设置</button>
+              </div>
+              <div class="healthRows">
+                <div class="healthRow">
+                  <span>Mimo Key</span>
+                  <strong id="homeApiKeyStatus">未检测</strong>
+                  <button class="healthAction" type="button" data-readiness-action="apiKey">配置</button>
+                </div>
+                <div class="healthRow">
+                  <span>麦克风</span>
+                  <strong id="homeMicrophoneStatus">未检测</strong>
+                  <button class="healthAction" type="button" data-readiness-action="microphone">授权</button>
+                </div>
+                <div class="healthRow">
+                  <span>辅助功能</span>
+                  <strong id="homeAccessibilityStatus">未检测</strong>
+                  <button class="healthAction" type="button" data-readiness-action="accessibility">打开</button>
+                </div>
+                <div class="healthRow">
+                  <span>快捷键</span>
+                  <strong id="homeShortcutStatus">未检测</strong>
+                  <button class="healthAction" type="button" data-readiness-action="shortcut">编辑</button>
+                </div>
+              </div>
+            </article>
+            <article class="healthPanel shortcutHealthPanel">
+              <div class="panelHeader">
+                <div>
+                  <div class="sectionTitle">快捷键动作</div>
+                  <p class="sectionHint">短按一次开始录音，再短按一次停止并处理。</p>
+                </div>
+                <button class="plainButton" type="button" data-view-jump="shortcuts">编辑</button>
+              </div>
+              <div class="shortcutHealthRows">
+                <span>口述 <strong id="homeDictateShortcutText">Control + P</strong></span>
+                <span>翻译 <strong id="homeTranslateShortcutText">Control + T</strong></span>
+                <span>随便问 <strong id="homeAskShortcutText">Control + Space</strong></span>
+              </div>
+            </article>
+          </section>
+
+          <section id="nextStepPanel" class="nextStepPanel" data-state="warning" aria-label="下一步操作">
+            <div class="nextStepContent">
+              <span class="nextStepKicker">下一步</span>
+              <h2 id="nextStepTitle">完成基础配置</h2>
+              <p id="nextStepDescription">保存 Mimo Key、授权麦克风和辅助功能后，就可以用快捷键完成转写并自动粘贴。</p>
+            </div>
+            <div class="nextStepActions">
+              <button id="nextStepPrimaryButton" class="primaryAction" type="button">
+                <span id="nextStepPrimaryIcon" class="buttonIcon" data-icon="setting" aria-hidden="true"></span>
+                <span id="nextStepPrimaryLabel">继续配置</span>
+              </button>
+              <button id="nextStepRefreshButton" class="plainButton" type="button">重新检查</button>
+            </div>
+          </section>
+
+          <section class="resultPanel">
+            <div class="sectionTitle">最近结果</div>
+            <textarea id="hubResultTextarea" readonly placeholder="完成一次语音输入后，这里会展示最近结果。"></textarea>
+            <div id="latestResultMeta" class="latestResultMeta">等待第一次语音输入</div>
+            <div class="rowActions">
+              <button id="copyHubResultButton" type="button" disabled>复制结果</button>
+              <button id="retryHubResultButton" type="button" disabled>重新整理</button>
+            </div>
+          </section>
+        </section>
+
+        <section id="modesView" class="hubView" data-view="modes">
+          <div class="modeChoiceGrid">
+            <article class="modeChoiceCard isActive" data-mode-action="dictate">
+              <div class="modeCardHeader">
+                <div>
+                  <span class="modeBadge">Dictation</span>
+                  <h2>口述</h2>
+                </div>
+                <strong id="dictateShortcutText">Control + P</strong>
+              </div>
+              <p>录音结束后转成可直接粘贴的文字，可用顶部 AI 润色开关控制是否等待润色。</p>
+              <button class="primaryAction" type="button" data-mode-start="dictate">
+                <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>
+                <span>开始口述</span>
+              </button>
+            </article>
+            <article class="modeChoiceCard" data-mode-action="translate">
+              <div class="modeCardHeader">
+                <div>
+                  <span class="modeBadge">Translate</span>
+                  <h2>翻译</h2>
+                </div>
+                <strong id="translateShortcutText">Control + T</strong>
+              </div>
+              <p>录音结束后先转写，再翻译到设置里的目标语言。</p>
+              <button class="primaryAction" type="button" data-mode-start="translate">
+                <span class="buttonIcon" data-icon="translate" aria-hidden="true"></span>
+                <span>开始翻译</span>
+              </button>
+            </article>
+            <article class="modeChoiceCard" data-mode-action="ask">
+              <div class="modeCardHeader">
+                <div>
+                  <span class="modeBadge">Ask</span>
+                  <h2>随便问</h2>
+                </div>
+                <strong id="askShortcutText">Control + Space</strong>
+              </div>
+              <p>把语音问题交给 AI 回答，结果展示在 Hub 中，不自动粘贴。</p>
+              <button class="primaryAction" type="button" data-mode-start="ask">
+                <span class="buttonIcon" data-icon="message" aria-hidden="true"></span>
+                <span>开始提问</span>
+              </button>
+            </article>
+          </div>
+          <section class="operationPanel">
+            <div>
+              <div class="sectionTitle">当前模式</div>
+              <p id="operationHint" class="sectionHint">点击卡片切换模式，准备完成后会唤起屏幕顶部的录音悬浮条。</p>
+            </div>
+            <button id="startDictateButton" class="primaryAction wideAction" type="button">
+              <span class="buttonIcon" data-icon="play" aria-hidden="true"></span>
+              <span data-action-label>开始口述</span>
+            </button>
+          </section>
+        </section>
+
+        <section id="shortcutsView" class="hubView" data-view="shortcuts">
+          <section class="settingsBlock shortcutLead">
+            <div>
+              <div class="sectionTitle">全局快捷键</div>
+              <p class="sectionHint">点击录制后按下新的组合键，保存后会重新注册到系统。</p>
+            </div>
+            <button id="saveShortcutButton" class="primaryAction" type="button">
+              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
+              <span>保存快捷键</span>
+            </button>
+          </section>
+
+          <div class="shortcutEditorGrid">
+            <label class="shortcutCard">
+              <span>口述</span>
+              <input id="dictateShortcutInput" type="text" readonly />
+              <button type="button" data-shortcut-record="dictate">录制</button>
+              <button type="button" data-shortcut-reset="dictate">默认</button>
+            </label>
+            <label class="shortcutCard">
+              <span>翻译</span>
+              <input id="translateShortcutInput" type="text" readonly />
+              <button type="button" data-shortcut-record="translate">录制</button>
+              <button type="button" data-shortcut-reset="translate">默认</button>
+            </label>
+            <label class="shortcutCard">
+              <span>随便问</span>
+              <input id="askShortcutInput" type="text" readonly />
+              <button type="button" data-shortcut-record="ask">录制</button>
+              <button type="button" data-shortcut-reset="ask">默认</button>
+            </label>
+          </div>
+          <div id="shortcutValidationText" class="shortcutValidationText" data-state="success">快捷键没有冲突。</div>
+        </section>
+
+        <section id="historyView" class="hubView" data-view="history">
+          <div class="toolbarLine">
+            <div class="segmentedControl" role="tablist">
+              <button class="historyFilter isActive" type="button" data-history-filter="all">全部</button>
+              <button class="historyFilter" type="button" data-history-filter="dictate">口述</button>
+              <button class="historyFilter" type="button" data-history-filter="translate">翻译</button>
+              <button class="historyFilter" type="button" data-history-filter="ask">随便问</button>
+            </div>
+            <button id="clearHistoryButton" class="plainButton" type="button">清空历史</button>
+          </div>
+          <div id="historyList" class="listSurface"></div>
+        </section>
+
+        <section id="dictionaryView" class="hubView" data-view="dictionary">
+          <div class="toolbarLine">
+            <div class="segmentedControl" role="tablist">
+              <button class="historyFilter isActive" type="button" data-dictionary-filter="all">全部</button>
+              <button class="historyFilter" type="button" data-dictionary-filter="manual">手动</button>
+            </div>
+            <div class="rowActions rowActionsInline">
+              <button id="importDictionaryButton" type="button">导入 CSV</button>
+              <button id="exportDictionaryButton" type="button" disabled>导出 CSV</button>
+              <input id="dictionaryImportInput" type="file" accept=".csv,text/csv,text/plain" hidden />
+            </div>
+          </div>
+          <form id="dictionaryForm" class="inlineForm">
+            <input id="dictionaryInput" type="text" autocomplete="off" placeholder="输入词条，支持逗号或换行批量添加" />
+            <button type="submit">
+              <span class="buttonIcon" data-icon="plus" aria-hidden="true"></span>
+              <span>添加词汇</span>
+            </button>
+          </form>
+          <input id="dictionarySearchInput" class="searchInput" type="search" placeholder="搜索词典" />
+          <div id="dictionaryList" class="tagList"></div>
+        </section>
+
+        <section id="settingsView" class="hubView" data-view="settings">
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">模型与识别</div>
+            <div class="settingsRows">
+              <label class="settingsRow">
+                <span>Mimo API Key</span>
+                <div class="apiKeyControl">
+                  <input id="apiKeyInput" type="password" autocomplete="off" placeholder="保存到 macOS 钥匙串，不写入配置文件" />
+                  <button id="clearApiKeyButton" type="button">清除 Key</button>
+                </div>
+              </label>
+              <label class="settingsRow">
+                <span>Base URL</span>
+                <input id="baseUrlInput" type="text" autocomplete="off" />
+              </label>
+              <label class="settingsRow">
+                <span>ASR 模型</span>
+                <input id="modelInput" type="text" autocomplete="off" />
+              </label>
+              <label class="settingsRow">
+                <span>AI 模型</span>
+                <input id="textModelInput" type="text" autocomplete="off" />
+              </label>
+              <label class="settingsRow">
+                <span>识别语言</span>
+                <select id="languageSelect">
+                  <option value="auto">自动</option>
+                  <option value="zh">中文</option>
+                  <option value="en">英文</option>
+                  <option value="ja">日文</option>
+                </select>
+              </label>
+              <label class="settingsRow">
+                <span>翻译目标</span>
+                <input id="targetLanguagesInput" type="text" autocomplete="off" placeholder="简体中文, 日语, 英语" />
+              </label>
+            </div>
+          </div>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">录音与输出</div>
+            <div class="settingsRows">
+              <label class="settingsRow">
+                <span>麦克风</span>
+                <div class="inlineControl">
+                  <select id="microphoneSelect">
+                    <option value="default">系统默认麦克风</option>
+                  </select>
+                  <button id="authorizeMicrophoneButton" type="button">授权</button>
+                  <button id="refreshMicrophonesButton" type="button">刷新</button>
+                </div>
+              </label>
+              <label class="settingsRow">
+                <span>历史保存</span>
+                <select id="historyRetentionSelect">
+                  <option value="forever">永远</option>
+                  <option value="30">30 天</option>
+                  <option value="7">7 天</option>
+                  <option value="never">不保存</option>
+                </select>
+              </label>
+              <label class="settingsRow switchRow">
+                <span>口述后 AI 润色</span>
+                <input id="postProcessDictationInput" type="checkbox" />
+              </label>
+              <label class="settingsRow switchRow">
+                <span>交互声音</span>
+                <input id="interactionSoundsInput" type="checkbox" />
+              </label>
+              <label class="settingsRow switchRow">
+                <span>录音时静音系统输出</span>
+                <input id="muteWhileDictatingInput" type="checkbox" />
+              </label>
+              <label class="settingsRow switchRow">
+                <span>开机启动</span>
+                <input id="launchAtLoginInput" type="checkbox" />
+              </label>
+              <label class="settingsRow switchRow">
+                <span>在 Dock 中显示</span>
+                <input id="showInDockInput" type="checkbox" />
+              </label>
+            </div>
+          </div>
+
+          <div class="settingsBlock">
+            <label class="wideLabel">
+              <span>个人输出偏好</span>
+              <textarea id="personalStyleInput" placeholder="填写你希望转写结果遵循的表达偏好。"></textarea>
+            </label>
+          </div>
+
+          <div class="settingsBlock">
+            <div class="sectionTitle">系统诊断</div>
+            <div class="diagnosticGrid">
+              <article class="diagnosticCard">
+                <span>Mimo Key</span>
+                <strong id="apiKeyStatus">未检测</strong>
+              </article>
+              <article class="diagnosticCard">
+                <span>麦克风</span>
+                <strong id="microphoneStatus">未检测</strong>
+              </article>
+              <article class="diagnosticCard">
+                <span>辅助功能</span>
+                <strong id="accessibilityStatus">未检测</strong>
+              </article>
+              <article class="diagnosticCard">
+                <span>快捷键</span>
+                <strong id="shortcutStatus">未检测</strong>
+              </article>
+            </div>
+            <div class="rowActions">
+              <button id="refreshDiagnosticsButton" type="button">刷新诊断</button>
+              <button id="openAccessibilityButton" type="button">打开辅助功能设置</button>
+            </div>
+          </div>
+
+          <div class="settingsActions">
+            <button id="saveConfigButton" class="primaryAction" type="button">
+              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
+              <span>保存设置</span>
+            </button>
+            <button id="clearConfigButton" class="plainButton" type="button">恢复默认</button>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <main id="resultShell" class="resultShell" aria-label="typesass 转写结果">
+      <section class="resultWindowCard" data-tauri-drag-region>
+        <header class="resultWindowHeader">
+          <div>
+            <div class="resultWindowEyebrow">自动粘贴未完成</div>
+            <h1>本次转写结果</h1>
+          </div>
+          <button id="resultCloseButton" class="resultCloseButton" type="button" aria-label="关闭结果窗口" title="关闭">
+            <span data-icon="close" aria-hidden="true"></span>
+          </button>
+        </header>
+        <div id="resultReason" class="resultReason" data-state="idle">结果已写入剪贴板。</div>
+        <textarea id="resultWindowTextarea" readonly></textarea>
+        <div class="resultActions">
+          <button id="resultCopyButton" class="primaryAction" type="button" disabled>
+            <span class="buttonIcon" data-icon="copy" aria-hidden="true"></span>
+            <span>复制结果</span>
+          </button>
+          <button id="resultOpenAccessibilityButton" class="plainButton" type="button" hidden>打开辅助功能设置</button>
+        </div>
+      </section>
+    </main>
+
+    <section class="hiddenState" aria-hidden="true">
+      <button id="copyButton" type="button" disabled>复制</button>
+      <div id="runtimeBadge">准备中</div>
+      <div id="recordTimer">00:00</div>
+      <span id="recordDurationText">--</span>
+      <span id="transcribeDurationText">--</span>
+      <span id="processDurationText">--</span>
+      <span id="audioSizeText">--</span>
+      <span id="resultMeta">等待录音</span>
+      <textarea id="resultTextarea"></textarea>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

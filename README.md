@@ -1,38 +1,67 @@
-### 3 分钟了解如何进入开发
+# typesass
 
-欢迎使用云效代码管理 Codeup，通过阅读以下内容，你可以快速熟悉 Codeup ，并立即开始今天的工作。
+轻量语音转文字桌面工具。当前版本已经具备 Typeless 风格核心闭环：
 
-### 提交**文件**
+- 填写小米 Mimo API Key
+- 全局快捷键唤起录音
+- 停止后自动转写、整理、翻译或问答
+- 口述/翻译结果自动粘贴到当前输入框
+- 口述可一键关闭 AI 润色，直接粘贴原始转写
+- 无法粘贴或随便问时在 Hub 展示结果
+- 本地历史、词典、设置和 Typeless 风格托盘菜单
 
-Codeup 支持两种方式进行代码提交：网页端提交，以及本地 Git 客户端提交。
+默认快捷键：
 
-* 如需体验本地命令行操作，请先安装 Git 工具，安装方法参见[安装Git](https://help.aliyun.com/document_detail/153800.html)。
+- 口述：`Control + P`
+- 翻译：`Control + T`
+- 随便问：`Control + Space`
 
-* 如需体验 SSH 方式克隆和提交代码，请先在平台账号内配置 SSH 公钥，配置方法参见[配置 SSH 密钥](https://help.aliyun.com/document_detail/153709.html)。
+## 本地预览
 
-* 如需体验 HTTP 方式克隆和提交代码，请先在平台账号内配置克隆账密，配置方法参见[配置 HTTPS 克隆账号密码](https://help.aliyun.com/document_detail/153710.html)。
+当前机器如果还没有 Rust/Cargo，可以先用网页预览模式验证转写效果：
 
-现在，你可以在 Codeup 中提交代码文件了，跟着文档「[__提交第一行代码__](https://help.aliyun.com/document_detail/153707.html?spm=a2c4g.153710.0.0.3c213774PFSMIV#6a5dbb1063ai5)」一起操作试试看吧。
+```bash
+npm install
+npm run build
+npm run preview:web
+```
 
-<img src="https://img.alicdn.com/imgextra/i3/O1CN013zHrNR1oXgGu8ccvY_!!6000000005235-0-tps-2866-1268.jpg" width="100%" />
+打开终端里显示的地址后，在页面输入 Mimo API Key 再录音。
 
+也可以用环境变量提供密钥：
 
-### 进行代码检测
+```bash
+MIMO_API_KEY=你的密钥 npm run preview:web
+```
 
-开发过程中，为了更好的维护你的代码质量，你可以开启 Codeup 内置开箱即用的「[代码检测服务](https://help.aliyun.com/document_detail/434321.html)」，开启后提交或合并请求的变更将自动触发检测，识别代码编写规范和安全漏洞问题，并及时提供结果报表和修复建议。
+## Tauri 桌面端
 
-<img src="https://img.alicdn.com/imgextra/i2/O1CN01BRzI1I1IO0CR2i4Aw_!!6000000000882-0-tps-2862-1362.jpg" width="100%" />
+安装 Rust 后运行：
 
-### 开展代码评审
+```bash
+npm install
+npm run dev
+```
 
-功能开发完毕后，通常你需要发起「[代码评审并执行合并](https://help.aliyun.com/document_detail/153872.html)」，Codeup 支持多人协作的代码评审服务，你可以通过「[保护分支设置合并规则](https://help.aliyun.com/document_detail/153873.html?spm=a2c4g.203108.0.0.430765d1l9tTRR#p-4on-aep-l5q)」策略及「[__合并请求设置__](https://help.aliyun.com/document_detail/153874.html?spm=a2c4g.153871.0.0.3d38686cJpcdJI)」对合并过程进行流程化管控，同时提供在线代码评审及冲突解决能力，让评审过程更加流畅。
+也可以用环境变量提供密钥，避免把 Key 填进界面：
 
-<img src="https://img.alicdn.com/imgextra/i1/O1CN01MaBDFH1WWcGnQqMHy_!!6000000002796-0-tps-2592-1336.jpg" width="100%" />
+```bash
+MIMO_API_KEY=你的密钥 npm run dev
+```
 
-### 成员协作
+打包：
 
-是时候邀请成员一起编写卓越的代码工程了，请点击左下角「成员」邀请你的小伙伴开始协作吧！
+```bash
+npm run tauri:build
+```
 
-### 更多
+## 默认配置
 
-Git 使用教学、高级功能指引等更多说明，参见[Codeup帮助文档](https://help.aliyun.com/document_detail/153402.html)。
+- Base URL: `https://token-plan-cn.xiaomimimo.com/v1`
+- ASR 模型: `mimo-v2.5-asr`
+- AI 模型: `mimo-v2.5`
+- 语言: 自动识别
+
+## 安全说明
+
+当前版本不会把 API Key 写死在代码里，也不会保存到 localStorage。桌面端设置页输入的 Key 会写入 macOS 钥匙串；也可以通过 `MIMO_API_KEY` 环境变量提供。

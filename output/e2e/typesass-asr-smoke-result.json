@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "status": 200,
+  "elapsedMs": 927,
+  "model": "mimo-v2.5-asr",
+  "text": "TypeSess测试语音输入。",
+  "error": ""
+}

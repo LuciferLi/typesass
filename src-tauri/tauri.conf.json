@@ -1,0 +1,113 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "typesass",
+  "version": "0.1.0",
+  "identifier": "asia.aijob.aitool",
+  "build": {
+    "beforeDevCommand": "npm run dev:frontend",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "typesass",
+        "width": 132,
+        "height": 46,
+        "minWidth": 132,
+        "minHeight": 46,
+        "maxWidth": 132,
+        "maxHeight": 46,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": false,
+        "focusable": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true
+      },
+      {
+        "label": "hub",
+        "url": "index.html?mode=hub",
+        "title": "typesass",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "shadow": true,
+        "focus": true,
+        "focusable": true,
+        "visible": false,
+        "alwaysOnTop": false
+      },
+      {
+        "label": "toast",
+        "url": "index.html?mode=toast",
+        "title": "typesass 提示",
+        "width": 460,
+        "height": 86,
+        "minWidth": 460,
+        "minHeight": 86,
+        "maxWidth": 460,
+        "maxHeight": 86,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": false,
+        "focusable": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true
+      },
+      {
+        "label": "result",
+        "url": "index.html?mode=result",
+        "title": "typesass 结果",
+        "width": 520,
+        "height": 320,
+        "minWidth": 520,
+        "minHeight": 320,
+        "maxWidth": 520,
+        "maxHeight": 320,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": true,
+        "focusable": true,
+        "visible": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": false
+    }
+  }
+}

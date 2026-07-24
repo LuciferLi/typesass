@@ -40,6 +40,10 @@ build/Release
 # Dependency directories
 node_modules/
 jspm_packages/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.playwright-cli/
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
