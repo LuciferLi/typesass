@@ -89,6 +89,48 @@
         "alwaysOnTop": true,
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true
+      },
+      {
+        "label": "subtitle",
+        "url": "index.html?mode=subtitle",
+        "title": "typesass 实时字幕",
+        "width": 1000,
+        "height": 170,
+        "minWidth": 1000,
+        "minHeight": 170,
+        "maxWidth": 1000,
+        "maxHeight": 170,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": false,
+        "focusable": false,
+        "visible": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true
+      },
+      {
+        "label": "subtitleHistory",
+        "url": "index.html?mode=subtitleHistory",
+        "title": "typesass 字幕历史",
+        "width": 360,
+        "height": 460,
+        "minWidth": 360,
+        "minHeight": 460,
+        "maxWidth": 360,
+        "maxHeight": 460,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "focus": false,
+        "focusable": true,
+        "visible": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true
       }
     ],
     "security": {
@@ -106,7 +148,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "-",
+      "signingIdentity": "Apple Development: shuo Li (KCW9LKVGJ6)",
       "hardenedRuntime": false
     }
   }

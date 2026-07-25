@@ -79,17 +79,35 @@ textarea:focus-visible {
 
 body[data-window-mode="main"] .hubShell,
 body[data-window-mode="main"] .resultShell,
+body[data-window-mode="main"] .subtitleShell,
+body[data-window-mode="main"] .subtitleHistoryShell,
 body[data-window-mode="toast"] .hubShell,
 body[data-window-mode="toast"] .resultShell,
+body[data-window-mode="toast"] .subtitleShell,
+body[data-window-mode="toast"] .subtitleHistoryShell,
 body[data-window-mode="hub"] .floatShell,
 body[data-window-mode="hub"] .resultShell,
+body[data-window-mode="hub"] .subtitleShell,
+body[data-window-mode="hub"] .subtitleHistoryShell,
 body[data-window-mode="result"] .floatShell,
 body[data-window-mode="result"] .hubShell,
+body[data-window-mode="result"] .subtitleShell,
+body[data-window-mode="result"] .subtitleHistoryShell,
+body[data-window-mode="subtitle"] .floatShell,
+body[data-window-mode="subtitle"] .hubShell,
+body[data-window-mode="subtitle"] .resultShell,
+body[data-window-mode="subtitle"] .subtitleHistoryShell,
+body[data-window-mode="subtitleHistory"] .floatShell,
+body[data-window-mode="subtitleHistory"] .hubShell,
+body[data-window-mode="subtitleHistory"] .resultShell,
+body[data-window-mode="subtitleHistory"] .subtitleShell,
 body[data-window-mode="main"] .statusBubble,
 body[data-window-mode="toast"] .voicePill,
 body[data-window-mode="toast"] .statusText,
 body[data-window-mode="result"] .hiddenState,
-body[data-window-mode="toast"] .hiddenState {
+body[data-window-mode="toast"] .hiddenState,
+body[data-window-mode="subtitle"] .hiddenState,
+body[data-window-mode="subtitleHistory"] .hiddenState {
   display: none;
 }
 
@@ -1192,6 +1210,95 @@ button[data-confirming="true"] {
   line-height: 1.65;
 }
 
+.modePermissionList {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.modePermissionList.isDetail {
+  margin-top: 0;
+}
+
+.modePermissionItem {
+  display: grid;
+  min-height: 38px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--lineSoft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: #d4d4d8;
+  background: rgba(255, 255, 255, 0.045);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    transform 160ms var(--motion);
+}
+
+.modePermissionItem:hover {
+  border-color: rgba(139, 92, 246, 0.42);
+  background: rgba(255, 255, 255, 0.075);
+  transform: translateY(-1px);
+}
+
+.modePermissionIcon {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 999px;
+  color: #09090b;
+  background: var(--faint);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.modePermissionItem[data-state="success"] .modePermissionIcon {
+  background: var(--green);
+}
+
+.modePermissionItem[data-state="warning"] .modePermissionIcon {
+  background: var(--busy);
+}
+
+.modePermissionItem[data-state="error"] .modePermissionIcon {
+  background: var(--error);
+}
+
+.modePermissionCopy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.modePermissionCopy strong {
+  overflow: hidden;
+  color: #f4f4f5;
+  font-size: 12px;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modePermissionCopy span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modePermissionAction {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+}
+
 .modeCardActions {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 40px;
@@ -1917,6 +2024,85 @@ textarea::placeholder {
   margin-top: 16px;
 }
 
+.permissionDialog {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  opacity: 0;
+  background: rgba(0, 0, 0, 0.52);
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+
+.permissionDialog[data-open="true"] {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.permissionDialogCard {
+  width: min(480px, 100%);
+  border: 1px solid var(--line);
+  border-radius: var(--radiusCard);
+  padding: 18px;
+  color: var(--text);
+  background: #202024;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  transform: translateY(8px) scale(0.98);
+  transition: transform 180ms var(--motion);
+}
+
+.permissionDialog[data-open="true"] .permissionDialogCard {
+  transform: translateY(0) scale(1);
+}
+
+.permissionDialogCard header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.permissionDialogEyebrow {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 780;
+}
+
+.permissionDialogCard h1 {
+  margin: 4px 0 0;
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: 820;
+  letter-spacing: 0;
+}
+
+.permissionDialogCard p {
+  margin: 14px 0 0;
+  color: #d4d4d8;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.permissionDialogCard ol {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.permissionDialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
 .settingsBlock {
   margin-top: 18px;
   padding: 16px;
@@ -2338,6 +2524,178 @@ textarea::placeholder {
   gap: 8px;
   padding: 12px 18px 16px;
   -webkit-app-region: no-drag;
+}
+
+.subtitleShell {
+  display: grid;
+  width: 100vw;
+  height: 100vh;
+  place-items: end center;
+  padding: 0 16px 18px;
+  background: transparent;
+  pointer-events: none;
+}
+
+.subtitleBubble {
+  display: inline-block;
+  max-width: min(82vw, 920px);
+  max-height: 104px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 10px 18px;
+  opacity: 0;
+  color: #ffffff;
+  background: rgba(0, 0, 0, 0.72);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+  font-size: 24px;
+  font-weight: 760;
+  line-height: 1.35;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.72);
+  transform: translateY(8px) scale(0.98);
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease;
+}
+
+.subtitleBubble[data-visible="true"] {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+#subtitleText {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow-wrap: anywhere;
+}
+
+.subtitleHistoryShell {
+  display: grid;
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  color: var(--text);
+  -webkit-app-region: drag;
+}
+
+.subtitleHistoryPanel {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.68);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.32);
+}
+
+.subtitleHistoryHeader {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 11px 14px;
+}
+
+.subtitleHistoryEyebrow {
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.subtitleHistoryHeader h1 {
+  margin: 1px 0 0;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.subtitleHistoryStatus {
+  flex: 0 0 auto;
+  max-width: 120px;
+  overflow: hidden;
+  border-radius: 999px;
+  padding: 5px 9px;
+  color: rgba(255, 255, 255, 0.76);
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 11px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitleHistoryList {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding: 10px;
+  -webkit-app-region: no-drag;
+}
+
+.subtitleHistoryEmpty {
+  display: grid;
+  min-height: 120px;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.54);
+  font-size: 13px;
+  font-weight: 650;
+  text-align: center;
+}
+
+.subtitleHistoryItem {
+  display: grid;
+  gap: 5px;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.subtitleHistoryItem time {
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.subtitleHistoryItem p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.48;
+  overflow-wrap: anywhere;
+}
+
+.subtitleHistoryActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 10px;
+  -webkit-app-region: no-drag;
+}
+
+.subtitleHistoryActions button {
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: rgba(255, 255, 255, 0.88);
+  background: rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.subtitleHistoryActions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
 }
 
 @media (max-width: 960px) {

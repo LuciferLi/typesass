@@ -169,6 +169,7 @@
                 <span>口述 <strong id="homeDictateShortcutText">Control + P</strong></span>
                 <span>翻译 <strong id="homeTranslateShortcutText">Control + T</strong></span>
                 <span>随便问 <strong id="homeAskShortcutText">Control + Space</strong></span>
+                <span>实时字幕 <strong id="homeSubtitleShortcutText">Control + Shift + S</strong></span>
               </div>
             </article>
           </section>
@@ -210,6 +211,7 @@
                 <strong id="dictateShortcutText">Control + P</strong>
               </div>
               <p>录音结束后转成可直接粘贴的文字；是否等待 AI 润色在口述设置里单独控制。</p>
+              <div class="modePermissionList" data-mode-permissions="dictate" aria-label="口述权限状态"></div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="dictate">
                   <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>
@@ -229,6 +231,7 @@
                 <strong id="translateShortcutText">Control + T</strong>
               </div>
               <p>录音结束后先转写，再翻译到翻译设置里的目标语言。</p>
+              <div class="modePermissionList" data-mode-permissions="translate" aria-label="翻译权限状态"></div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="translate">
                   <span class="buttonIcon" data-icon="translate" aria-hidden="true"></span>
@@ -248,12 +251,33 @@
                 <strong id="askShortcutText">Control + Space</strong>
               </div>
               <p>把语音问题交给 AI 回答，结果展示在 Hub 中，不自动粘贴。</p>
+              <div class="modePermissionList" data-mode-permissions="ask" aria-label="随便问权限状态"></div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="ask">
                   <span class="buttonIcon" data-icon="message" aria-hidden="true"></span>
                   <span>开始提问</span>
                 </button>
                 <button class="modeSettingsButton" type="button" data-mode-settings="ask" aria-label="随便问设置" title="随便问设置">
+                  <span data-icon="setting" aria-hidden="true"></span>
+                </button>
+              </div>
+            </article>
+            <article class="modeChoiceCard">
+              <div class="modeCardHeader">
+                <div>
+                  <span class="modeBadge">Subtitle</span>
+                  <h2>实时字幕</h2>
+                </div>
+                <strong id="subtitleShortcutText">Control + Shift + S</strong>
+              </div>
+              <p>持续监听音频输入，识别后在屏幕底部显示字幕，并在右上角保留历史。</p>
+              <div class="modePermissionList" data-mode-permissions="subtitle" aria-label="实时字幕权限状态"></div>
+              <div class="modeCardActions">
+                <button class="primaryAction" type="button" data-subtitle-toggle>
+                  <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>
+                  <span>开启字幕</span>
+                </button>
+                <button class="modeSettingsButton" type="button" data-view-jump="subtitleSettings" aria-label="实时字幕设置" title="实时字幕设置">
                   <span data-icon="setting" aria-hidden="true"></span>
                 </button>
               </div>
@@ -291,6 +315,12 @@
               <input id="askShortcutInput" type="text" readonly />
               <button type="button" data-shortcut-record="ask">录制</button>
               <button type="button" data-shortcut-reset="ask">默认</button>
+            </label>
+            <label class="shortcutCard">
+              <span>实时字幕</span>
+              <input id="subtitleShortcutInput" type="text" readonly />
+              <button type="button" data-shortcut-record="subtitle">录制</button>
+              <button type="button" data-shortcut-reset="subtitle">默认</button>
             </label>
           </div>
           <div id="shortcutValidationText" class="shortcutValidationText" data-state="success">快捷键没有冲突。</div>
@@ -356,6 +386,11 @@
           </section>
 
           <div class="settingsSection">
+            <div class="settingsSectionTitle">口述权限</div>
+            <div class="modePermissionList isDetail" data-mode-permissions="dictate" aria-label="口述权限详情"></div>
+          </div>
+
+          <div class="settingsSection">
             <div class="settingsSectionTitle">口述处理</div>
             <div class="settingsRows">
               <label class="settingsRow switchRow">
@@ -411,6 +446,11 @@
           </section>
 
           <div class="settingsSection">
+            <div class="settingsSectionTitle">翻译权限</div>
+            <div class="modePermissionList isDetail" data-mode-permissions="translate" aria-label="翻译权限详情"></div>
+          </div>
+
+          <div class="settingsSection">
             <div class="settingsSectionTitle">翻译目标</div>
             <div class="settingsRows">
               <label class="settingsRow">
@@ -460,6 +500,11 @@
             <button class="plainButton" type="button" data-view-jump="modes">返回语音模式</button>
           </section>
 
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">随便问权限</div>
+            <div class="modePermissionList isDetail" data-mode-permissions="ask" aria-label="随便问权限详情"></div>
+          </div>
+
           <div class="settingsBlock">
             <label class="wideLabel">
               <span>回答偏好</span>
@@ -472,6 +517,39 @@
               <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
               <span>保存随便问设置</span>
             </button>
+          </div>
+        </section>
+
+        <section id="subtitleSettingsView" class="hubView" data-view="subtitleSettings">
+          <section class="settingsBlock modeSettingsLead">
+            <div>
+              <div class="sectionTitle">实时字幕设置</div>
+              <p class="sectionHint">这里只影响实时字幕：麦克风、系统声音和字幕监听需要的桌面权限。</p>
+            </div>
+            <button class="plainButton" type="button" data-view-jump="modes">返回语音模式</button>
+          </section>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">实时字幕权限</div>
+            <div class="modePermissionList isDetail" data-mode-permissions="subtitle" aria-label="实时字幕权限详情"></div>
+          </div>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">音频来源</div>
+            <div class="settingsRows">
+              <label class="settingsRow">
+                <span>麦克风</span>
+                <select id="subtitleMicrophoneMirrorSelect" data-mirror-control="microphoneSelect" disabled>
+                  <option>跟随系统设置</option>
+                </select>
+              </label>
+              <label class="settingsRow">
+                <span>系统声音</span>
+                <select id="subtitleSystemAudioMirrorSelect" data-mirror-control="systemAudioSelect" disabled>
+                  <option>跟随系统设置</option>
+                </select>
+              </label>
+            </div>
           </div>
         </section>
 
@@ -522,6 +600,13 @@
                   <button id="authorizeMicrophoneButton" type="button">授权</button>
                   <button id="refreshMicrophonesButton" type="button">刷新</button>
                 </div>
+              </label>
+              <label class="settingsRow">
+                <span>系统声音</span>
+                <select id="systemAudioSelect">
+                  <option value="auto">自动检测系统音频输入</option>
+                  <option value="none">不采集系统声音</option>
+                </select>
               </label>
               <label class="settingsRow">
                 <span>历史保存</span>
@@ -595,6 +680,29 @@
       </section>
     </main>
 
+    <div id="permissionDialog" class="permissionDialog" data-open="false" role="dialog" aria-modal="true" aria-labelledby="permissionDialogTitle" aria-describedby="permissionDialogBody">
+      <section class="permissionDialogCard">
+        <header>
+          <div>
+            <div id="permissionDialogEyebrow" class="permissionDialogEyebrow">权限设置</div>
+            <h1 id="permissionDialogTitle">设置权限</h1>
+          </div>
+          <button id="permissionDialogCloseButton" class="smallIconButton" type="button" aria-label="关闭权限说明" title="关闭">
+            <span data-icon="close" aria-hidden="true"></span>
+          </button>
+        </header>
+        <p id="permissionDialogBody"></p>
+        <ol id="permissionDialogSteps"></ol>
+        <div class="permissionDialogActions">
+          <button id="permissionDialogPrimaryButton" class="primaryAction" type="button">
+            <span class="buttonIcon" data-icon="setting" aria-hidden="true"></span>
+            <span>打开设置</span>
+          </button>
+          <button id="permissionDialogSecondaryButton" class="plainButton" type="button">稍后处理</button>
+        </div>
+      </section>
+    </div>
+
     <main id="resultShell" class="resultShell" aria-label="typesass 转写结果">
       <section class="resultWindowCard" data-tauri-drag-region>
         <header class="resultWindowHeader">
@@ -615,6 +723,29 @@
           </button>
           <button id="resultOpenAccessibilityButton" class="plainButton" type="button" hidden>打开辅助功能设置</button>
         </div>
+      </section>
+    </main>
+
+    <main id="subtitleShell" class="subtitleShell" aria-label="typesass 实时字幕">
+      <div id="subtitleBubble" class="subtitleBubble" data-visible="false">
+        <span id="subtitleText"></span>
+      </div>
+    </main>
+
+    <main id="subtitleHistoryShell" class="subtitleHistoryShell" aria-label="typesass 字幕历史" data-tauri-drag-region>
+      <section class="subtitleHistoryPanel">
+        <header class="subtitleHistoryHeader" data-tauri-drag-region>
+          <div>
+            <div class="subtitleHistoryEyebrow">实时字幕</div>
+            <h1>字幕历史</h1>
+          </div>
+          <span id="subtitleHistoryStatus" class="subtitleHistoryStatus">等待字幕</span>
+        </header>
+        <div id="subtitleHistoryList" class="subtitleHistoryList"></div>
+        <footer class="subtitleHistoryActions">
+          <button id="subtitleHistoryCopyButton" type="button" disabled>复制全部</button>
+          <button id="subtitleHistoryClearButton" type="button" disabled>清空</button>
+        </footer>
       </section>
     </main>
 

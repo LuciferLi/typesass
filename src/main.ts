@@ -28,10 +28,21 @@ const DEFAULT_DICTATION_OUTPUT_LANGUAGE = "source";
 const CONFIG_STORAGE_KEY = "aiToolVoiceConfigV2";
 const LEGACY_CONFIG_STORAGE_KEY = "aiToolVoiceConfig";
 const HISTORY_STORAGE_KEY = "aiToolVoiceHistoryV1";
+const SUBTITLE_HISTORY_STORAGE_KEY = "aiToolSubtitleHistoryV1";
 const DICTIONARY_STORAGE_KEY = "aiToolDictionaryV1";
 const DIAGNOSTIC_LOG_STORAGE_KEY = "aiToolDiagnosticLogV1";
 const DEFAULT_HUB_NOTICE = "所有设置和历史都只保存在本机。";
 const MIN_RECORDING_MS = 800;
+const SUBTITLE_CHUNK_MS = 1800;
+const SUBTITLE_OVERLAP_MS = 450;
+const SUBTITLE_MIN_CHUNK_MS = 1000;
+const SUBTITLE_MAX_CHUNK_MS = 4200;
+const SUBTITLE_SILENCE_FINALIZE_MS = 1200;
+const SUBTITLE_FORCE_FINALIZE_MS = 8000;
+const SUBTITLE_HIDE_DELAY_MS = 4200;
+const SUBTITLE_DISPATCH_INTERVAL_MS = 360;
+const SUBTITLE_SOUND_LEVEL_THRESHOLD = 0.018;
+const MAX_SUBTITLE_HISTORY_ITEMS = 160;
 const HUB_DIAGNOSTICS_REFRESH_INTERVAL_MS = 4000;
 const MAX_DIAGNOSTIC_LOG_ITEMS = 160;
 const EMPTY_TRANSCRIPTION_MARKERS = [
@@ -46,6 +57,7 @@ const DEFAULT_SHORTCUTS: ShortcutConfig = {
   dictate: "ctrl+p",
   translate: "ctrl+t",
   ask: "ctrl+space",
+  subtitle: "ctrl+shift+s",
 };
 const ICON_RENDERERS = {
   book: BookOpen,
@@ -67,16 +79,20 @@ const ICON_RENDERERS = {
 } as const;
 
 type VoiceMode = "dictate" | "translate" | "ask";
+type ShortcutMode = VoiceMode | "subtitle";
 type StatusState = "idle" | "ready" | "recording" | "busy" | "error";
 type HubNoticeState = "idle" | "busy" | "success" | "error";
-type WindowMode = "main" | "hub" | "toast" | "result";
+type WindowMode = "main" | "hub" | "toast" | "result" | "subtitle" | "subtitleHistory";
 type HistoryRetention = "forever" | "30" | "7" | "never";
 type DictionaryFilter = "all" | "auto" | "manual";
 type DiagnosticState = "idle" | "success" | "warning" | "error";
 type DiagnosticLogLevel = "info" | "success" | "warning" | "error";
-type DiagnosticLogCategory = "recording" | "transcribe" | "process" | "paste" | "system";
+type DiagnosticLogCategory = "recording" | "transcribe" | "process" | "paste" | "subtitle" | "system";
+type SubtitleAudioSource = "microphone" | "system" | "mixed";
+type SubtitleOverlayState = "hidden" | "listening" | "text" | "error";
 type IconName = keyof typeof ICON_RENDERERS;
 type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "start" | "refresh";
+type PermissionKind = "apiKey" | "microphone" | "accessibility" | "shortcut" | "systemAudio";
 
 interface PendingConfirmation {
   /** 本次等待确认的动作 ID，用于区分不同危险操作。 */
@@ -90,15 +106,15 @@ interface PendingConfirmation {
 }
 
 interface ShortcutRecordingSnapshot {
-  /** 当前正在录制的语音模式。 */
-  mode: VoiceMode;
+  /** 当前正在录制快捷键的模式。 */
+  mode: ShortcutMode;
   /** 进入录制态之前输入框展示的快捷键文本。 */
   label: string;
 }
 
 interface ShortcutTriggerPayload {
-  /** 快捷键触发的语音模式。 */
-  mode: VoiceMode;
+  /** 快捷键触发的模式。 */
+  mode: ShortcutMode;
   /** 按下快捷键瞬间的前台目标 App。 */
   targetApp: string;
   /** 本次录音是否来自 Hub 主界面，需要避免影响 Hub 显示。 */
@@ -112,6 +128,8 @@ interface ShortcutConfig {
   translate: string;
   /** 随便问模式全局快捷键。 */
   ask: string;
+  /** 实时字幕监听模式全局快捷键。 */
+  subtitle: string;
 }
 
 interface VoiceConfig {
@@ -133,6 +151,8 @@ interface VoiceConfig {
   dictationOutputLanguage: string;
   /** 选定的麦克风设备 ID，default 表示系统默认设备。 */
   microphoneDeviceId: string;
+  /** 实时字幕使用的系统音频输入设备，auto 表示自动检测虚拟声卡，none 表示只采集麦克风。 */
+  systemAudioDeviceId: string;
   /** 是否播放开始和停止录音提示音。 */
   interactionSounds: boolean;
   /** 录音期间是否临时静音系统输出。 */
@@ -141,7 +161,7 @@ interface VoiceConfig {
   launchAtLogin: boolean;
   /** 是否在 Dock 中展示图标。 */
   showInDock: boolean;
-  /** 三种语音模式的快捷键配置。 */
+  /** 各语音与字幕模式的快捷键配置。 */
   shortcuts: ShortcutConfig;
   /** 所有 AI 文本处理共同遵循的本地输出偏好。 */
   personalStyle: string;
@@ -208,7 +228,7 @@ interface ProcessTextResponse {
 }
 
 interface PasteResponse {
-  /** 是否已经触发系统粘贴。 */
+  /** 是否已成功发出系统粘贴指令；macOS 不提供可靠的输入框插入回调。 */
   pasted: boolean;
   /** 自动粘贴后的状态说明。 */
   message: string;
@@ -218,6 +238,14 @@ interface PasteResponse {
   targetApp: string;
   /** 是否已经把最终输出写入系统剪贴板。 */
   clipboardWritten: boolean;
+  /** 剪贴板读回内容是否与本次输出一致。 */
+  clipboardMatchesExpected: boolean;
+  /** 是否尝试恢复用户原本的系统剪贴板。 */
+  clipboardRestoreAttempted: boolean;
+  /** 用户原本的系统剪贴板是否已恢复。 */
+  clipboardRestored: boolean;
+  /** 剪贴板恢复状态说明，不包含剪贴板正文。 */
+  clipboardRestoreMessage: string;
   /** Rust 侧触发粘贴前检测到的辅助功能授权状态。 */
   accessibilityTrusted: boolean;
   /** 本次粘贴指令的触发方式，便于区分 System Events 和 CoreGraphics 兜底。 */
@@ -228,6 +256,10 @@ interface PasteResponse {
   frontmostAfterActivate: string;
   /** 粘贴指令发出后系统前台应用。 */
   frontmostAfterPaste: string;
+  /** 是否已从目标输入框确认本次输出；快速模式下默认不做慢速回读。 */
+  insertionVerified: boolean;
+  /** 粘贴校验说明，不包含目标输入框正文。 */
+  verificationStatus: string;
   /** 发送粘贴指令前目标 App 内的系统焦点元素。 */
   focusedElementBeforePaste: string;
   /** 激活目标 App 后的系统焦点元素。 */
@@ -252,6 +284,48 @@ interface HubNoticePayload {
   state: HubNoticeState;
 }
 
+interface SubtitleOverlayPayload {
+  /** 当前要展示在底部字幕条里的文本。 */
+  text: string;
+  /** 底部字幕条是否可见。 */
+  visible: boolean;
+  /** 字幕窗口当前状态。 */
+  state: SubtitleOverlayState;
+  /** 触发本次更新的时间戳。 */
+  updatedAt: number;
+}
+
+interface SubtitleHistoryItem {
+  /** 本地字幕历史 ID。 */
+  id: string;
+  /** 固化后的字幕正文。 */
+  text: string;
+  /** 字幕固化时间戳。 */
+  createdAt: number;
+  /** 本条字幕来自麦克风、系统音频或混合音频。 */
+  source: SubtitleAudioSource;
+  /** 当前字幕片段累计耗时。 */
+  elapsedMs: number;
+  /** ASR 实际返回模型名称。 */
+  model: string;
+}
+
+interface SubtitleHistoryUpdatePayload {
+  /** 历史窗口状态文案。 */
+  status: string;
+  /** 当前监听是否开启。 */
+  listening: boolean;
+}
+
+interface SubtitleSampleChunk {
+  /** 当前分片在字幕音频流里的绝对起始采样点。 */
+  startSample: number;
+  /** 当前分片的单声道 PCM 数据。 */
+  samples: Float32Array;
+  /** 当前分片估算音量，用于静音判断。 */
+  level: number;
+}
+
 interface RuntimeDiagnostics {
   /** 当前会话内存里是否已有 Mimo Key。 */
   hasSessionApiKey: boolean;
@@ -261,12 +335,48 @@ interface RuntimeDiagnostics {
   hasEnvApiKey: boolean;
   /** macOS 辅助功能权限是否已授权。 */
   accessibilityTrusted: boolean;
-  /** Rust 侧当前注册的三种快捷键。 */
+  /** Rust 侧当前注册的各模式快捷键。 */
   shortcuts: ShortcutConfig;
   /** 当前全局快捷键是否已成功注册到系统。 */
   shortcutRegistrationReady: boolean;
   /** 最近一次全局快捷键注册结果说明。 */
   shortcutRegistrationMessage: string;
+}
+
+interface RuntimePermissionSnapshot {
+  /** 当前环境是否为 Tauri 桌面端，决定能否打开系统权限页。 */
+  isDesktopRuntime: boolean;
+  /** 当前模式能否读取到 Mimo Key。 */
+  hasApiKey: boolean;
+  /** Mimo Key 的来源或缺失说明。 */
+  apiKeyText: string;
+  /** 麦克风或输入设备检测状态。 */
+  microphoneState: DiagnosticState;
+  /** 麦克风或输入设备状态文案。 */
+  microphoneText: string;
+  /** macOS 辅助功能是否已授权。 */
+  accessibilityReady: boolean;
+  /** 全局快捷键是否已成功注册。 */
+  shortcutReady: boolean;
+  /** 全局快捷键状态文案。 */
+  shortcutText: string;
+  /** 实时字幕系统音频配置状态。 */
+  systemAudioState: DiagnosticState;
+  /** 实时字幕系统音频配置文案。 */
+  systemAudioText: string;
+}
+
+interface ModePermissionItem {
+  /** 权限类型，用于弹窗说明和跳转目标。 */
+  kind: PermissionKind;
+  /** 展示给用户的权限名称。 */
+  label: string;
+  /** 当前权限是否满足本模式运行要求。 */
+  ready: boolean;
+  /** 权限状态颜色。 */
+  state: DiagnosticState;
+  /** 当前状态说明。 */
+  description: string;
 }
 
 interface HistoryItem {
@@ -312,8 +422,8 @@ interface DiagnosticLogDraft {
   title: string;
   /** 不含转写正文的诊断说明。 */
   message: string;
-  /** 关联的语音模式。 */
-  mode?: VoiceMode;
+  /** 关联的语音或字幕模式。 */
+  mode?: ShortcutMode;
   /** 本次链路记录的目标 App。 */
   targetApp?: string;
   /** 写日志时观测到的前台 App。 */
@@ -324,6 +434,18 @@ interface DiagnosticLogDraft {
   accessibilityTrusted?: boolean;
   /** 是否已成功写入剪贴板。 */
   clipboardWritten?: boolean;
+  /** 剪贴板读回内容是否与本次输出一致。 */
+  clipboardMatchesExpected?: boolean;
+  /** 是否尝试恢复用户原本的系统剪贴板。 */
+  clipboardRestoreAttempted?: boolean;
+  /** 用户原本的系统剪贴板是否已恢复。 */
+  clipboardRestored?: boolean;
+  /** 剪贴板恢复状态说明，不包含剪贴板正文。 */
+  clipboardRestoreMessage?: string;
+  /** 是否已从目标输入框确认本次输出；快速模式下默认不做慢速回读。 */
+  insertionVerified?: boolean;
+  /** 粘贴校验说明，不包含目标输入框正文。 */
+  verificationStatus?: string;
   /** 发送粘贴指令前的系统焦点元素摘要。 */
   focusedElementBeforePaste?: string;
   /** 激活目标 App 后的系统焦点元素摘要。 */
@@ -349,9 +471,9 @@ interface TauriWindow extends Window {
   /** Tauri 运行时注入对象，浏览器预览模式不存在。 */
   __TAURI_INTERNALS__?: unknown;
   /** Rust 快捷键直达前端的处理函数。 */
-  __AIToolHandleShortcutMode?: (mode: VoiceMode, targetApp?: string, keepHubVisible?: boolean) => void;
+  __AIToolHandleShortcutMode?: (mode: ShortcutMode, targetApp?: string, keepHubVisible?: boolean) => void;
   /** 前端尚未加载完成时暂存的快捷键触发模式。 */
-  __AIToolPendingShortcutMode?: VoiceMode | ShortcutTriggerPayload;
+  __AIToolPendingShortcutMode?: ShortcutMode | ShortcutTriggerPayload;
   /** Rust 结果窗口直达前端的渲染函数。 */
   __AIToolRenderResult?: (payload: ResultWindowPayload) => void;
 }
@@ -360,6 +482,13 @@ const MODE_LABELS: Record<VoiceMode, string> = {
   dictate: "口述",
   translate: "翻译",
   ask: "随便问",
+};
+
+const SHORTCUT_MODE_LABELS: Record<ShortcutMode, string> = {
+  dictate: "口述",
+  translate: "翻译",
+  ask: "随便问",
+  subtitle: "实时字幕",
 };
 
 const MODE_START_LABELS: Record<VoiceMode, string> = {
@@ -386,6 +515,7 @@ const DIAGNOSTIC_LOG_CATEGORY_LABELS: Record<DiagnosticLogCategory, string> = {
   transcribe: "转写",
   process: "AI",
   paste: "粘贴",
+  subtitle: "字幕",
   system: "系统",
 };
 
@@ -395,12 +525,20 @@ const MODE_SETTINGS_VIEWS: Record<VoiceMode, string> = {
   ask: "askSettings",
 };
 
+const MODE_DETAIL_VIEWS: Record<ShortcutMode, string> = {
+  dictate: "dictateSettings",
+  translate: "translateSettings",
+  ask: "askSettings",
+  subtitle: "subtitleSettings",
+};
+
 const VIEW_TITLES: Record<string, { eyebrow: string; title: string }> = {
   home: { eyebrow: "说话，不要打字", title: "仪表盘" },
   modes: { eyebrow: "选择真实语音流程", title: "语音模式" },
   dictateSettings: { eyebrow: "只影响口述", title: "口述设置" },
   translateSettings: { eyebrow: "只影响翻译", title: "翻译设置" },
   askSettings: { eyebrow: "只影响随便问", title: "随便问设置" },
+  subtitleSettings: { eyebrow: "只影响实时字幕", title: "实时字幕设置" },
   shortcuts: { eyebrow: "按一次开始，再按一次结束", title: "快捷键" },
   history: { eyebrow: "只保存在本机", title: "历史记录" },
   dictionary: { eyebrow: "专有名词更准确", title: "词典" },
@@ -438,6 +576,7 @@ const postProcessDictationInput = getElement<HTMLInputElement>("postProcessDicta
 const dictationOutputLanguageRow = getElement<HTMLLabelElement>("dictationOutputLanguageRow");
 const dictationOutputLanguageSelect = getElement<HTMLSelectElement>("dictationOutputLanguageSelect");
 const microphoneSelect = getElement<HTMLSelectElement>("microphoneSelect");
+const systemAudioSelect = getElement<HTMLSelectElement>("systemAudioSelect");
 const refreshMicrophonesButton = getElement<HTMLButtonElement>("refreshMicrophonesButton");
 const interactionSoundsInput = getElement<HTMLInputElement>("interactionSoundsInput");
 const muteWhileDictatingInput = getElement<HTMLInputElement>("muteWhileDictatingInput");
@@ -450,13 +589,16 @@ const askStyleInput = getElement<HTMLTextAreaElement>("askStyleInput");
 const dictateShortcutInput = getElement<HTMLInputElement>("dictateShortcutInput");
 const translateShortcutInput = getElement<HTMLInputElement>("translateShortcutInput");
 const askShortcutInput = getElement<HTMLInputElement>("askShortcutInput");
+const subtitleShortcutInput = getElement<HTMLInputElement>("subtitleShortcutInput");
 const shortcutValidationText = getElement<HTMLElement>("shortcutValidationText");
 const dictateShortcutText = getElement<HTMLElement>("dictateShortcutText");
 const translateShortcutText = getElement<HTMLElement>("translateShortcutText");
 const askShortcutText = getElement<HTMLElement>("askShortcutText");
+const subtitleShortcutText = getElement<HTMLElement>("subtitleShortcutText");
 const homeDictateShortcutText = getElement<HTMLElement>("homeDictateShortcutText");
 const homeTranslateShortcutText = getElement<HTMLElement>("homeTranslateShortcutText");
 const homeAskShortcutText = getElement<HTMLElement>("homeAskShortcutText");
+const homeSubtitleShortcutText = getElement<HTMLElement>("homeSubtitleShortcutText");
 const saveShortcutButton = getElement<HTMLButtonElement>("saveShortcutButton");
 const clearConfigButton = getElement<HTMLButtonElement>("clearConfigButton");
 const quickStartButton = getElement<HTMLButtonElement>("quickStartButton");
@@ -511,6 +653,20 @@ const resultWindowTextarea = getElement<HTMLTextAreaElement>("resultWindowTextar
 const resultCopyButton = getElement<HTMLButtonElement>("resultCopyButton");
 const resultOpenAccessibilityButton = getElement<HTMLButtonElement>("resultOpenAccessibilityButton");
 const resultCloseButton = getElement<HTMLButtonElement>("resultCloseButton");
+const permissionDialog = getElement<HTMLElement>("permissionDialog");
+const permissionDialogEyebrow = getElement<HTMLElement>("permissionDialogEyebrow");
+const permissionDialogTitle = getElement<HTMLElement>("permissionDialogTitle");
+const permissionDialogBody = getElement<HTMLElement>("permissionDialogBody");
+const permissionDialogSteps = getElement<HTMLOListElement>("permissionDialogSteps");
+const permissionDialogPrimaryButton = getElement<HTMLButtonElement>("permissionDialogPrimaryButton");
+const permissionDialogSecondaryButton = getElement<HTMLButtonElement>("permissionDialogSecondaryButton");
+const permissionDialogCloseButton = getElement<HTMLButtonElement>("permissionDialogCloseButton");
+const subtitleBubble = getElement<HTMLElement>("subtitleBubble");
+const subtitleText = getElement<HTMLElement>("subtitleText");
+const subtitleHistoryStatus = getElement<HTMLElement>("subtitleHistoryStatus");
+const subtitleHistoryList = getElement<HTMLElement>("subtitleHistoryList");
+const subtitleHistoryCopyButton = getElement<HTMLButtonElement>("subtitleHistoryCopyButton");
+const subtitleHistoryClearButton = getElement<HTMLButtonElement>("subtitleHistoryClearButton");
 const brandLogo = getElement<HTMLImageElement>("brandLogo");
 const voiceLevelDots = Array.from(soundStage.querySelectorAll<HTMLSpanElement>("span"));
 const VOICE_DOT_FACTORS = [0.48, 0.72, 0.94, 0.66, 1, 0.78, 0.9, 0.58, 0.42];
@@ -529,11 +685,13 @@ let timerHandle: number | null = null;
 let bubbleTimerHandle: number | null = null;
 let isProcessing = false;
 let isStartingRecording = false;
+let isSubtitleListening = false;
+let isStartingSubtitleListening = false;
 let lastShortcutAt = 0;
 let activeMode: VoiceMode = "dictate";
 let historyFilter: VoiceMode | "all" = "all";
 let dictionaryFilter: DictionaryFilter = "all";
-let shortcutRecordingMode: VoiceMode | null = null;
+let shortcutRecordingMode: ShortcutMode | null = null;
 let previousSystemMuteState: boolean | null = null;
 let recordingTargetApp = "";
 let recordingKeepsHubVisible = false;
@@ -544,6 +702,33 @@ let shortcutRecordingSnapshot: ShortcutRecordingSnapshot | null = null;
 let accessibilityWatchHandle: number | null = null;
 let hubDiagnosticsRefreshHandle: number | null = null;
 let isRefreshingDiagnostics = false;
+let activePermissionDialog: { mode: ShortcutMode; kind: PermissionKind } | null = null;
+let lastPermissionSnapshot: RuntimePermissionSnapshot = createDefaultPermissionSnapshot();
+let subtitleMicStream: MediaStream | null = null;
+let subtitleSystemStream: MediaStream | null = null;
+let subtitleAudioContext: AudioContext | null = null;
+let subtitleMicSource: MediaStreamAudioSourceNode | null = null;
+let subtitleSystemSource: MediaStreamAudioSourceNode | null = null;
+let subtitleMixer: GainNode | null = null;
+let subtitleProcessor: ScriptProcessorNode | null = null;
+let subtitleSink: GainNode | null = null;
+let subtitleSampleChunks: SubtitleSampleChunk[] = [];
+let subtitleTotalSamples = 0;
+let subtitleDispatchedSampleEnd = 0;
+let subtitleSampleRate = 0;
+let subtitleDispatchTimerHandle: number | null = null;
+let subtitleUiTimerHandle: number | null = null;
+let subtitleOverlayHideTimerHandle: number | null = null;
+let subtitleInFlight = false;
+let subtitleDispatchQueued = false;
+let subtitleStartedAt = 0;
+let subtitleSegmentStartedAt = 0;
+let subtitleLastSoundAt = 0;
+let subtitleLastTextAt = 0;
+let subtitlePendingText = "";
+let subtitleLastDisplayedText = "";
+let subtitleLastModel = "";
+let subtitleCurrentSource: SubtitleAudioSource = "microphone";
 
 init();
 
@@ -560,6 +745,16 @@ function init(): void {
 
   if (windowMode === "result") {
     void initResultWindow();
+    return;
+  }
+
+  if (windowMode === "subtitle") {
+    void initSubtitleWindow();
+    return;
+  }
+
+  if (windowMode === "subtitleHistory") {
+    void initSubtitleHistoryWindow();
     return;
   }
 
@@ -628,7 +823,7 @@ function renderIcon(element: HTMLElement, iconName: IconName): void {
 /** 读取当前 WebView 的窗口模式。 */
 function getWindowMode(): WindowMode {
   const mode = new URLSearchParams(window.location.search).get("mode");
-  if (mode === "hub" || mode === "toast" || mode === "result") {
+  if (mode === "hub" || mode === "toast" || mode === "result" || mode === "subtitle" || mode === "subtitleHistory") {
     return mode;
   }
   return "main";
@@ -720,6 +915,94 @@ async function initResultWindow(): Promise<void> {
   }
 }
 
+/** 初始化底部实时字幕窗口，只负责渲染当前字幕条。 */
+async function initSubtitleWindow(): Promise<void> {
+  renderSubtitleOverlay({ text: "", visible: false, state: "hidden", updatedAt: Date.now() });
+  if (!isTauriRuntime()) {
+    return;
+  }
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<SubtitleOverlayPayload>("subtitle-message", (event) => {
+      renderSubtitleOverlay(event.payload);
+    });
+  } catch {
+    renderSubtitleOverlay({ text: "", visible: false, state: "error", updatedAt: Date.now() });
+  }
+}
+
+/** 初始化右上角字幕历史窗口，并监听主窗口的历史刷新事件。 */
+async function initSubtitleHistoryWindow(): Promise<void> {
+  bindSubtitleHistoryEvents();
+  renderSubtitleHistory("等待字幕", false);
+  window.addEventListener("storage", () => renderSubtitleHistory("历史已更新", isSubtitleListening));
+  if (!isTauriRuntime()) {
+    return;
+  }
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<SubtitleHistoryUpdatePayload>("subtitle-history-updated", (event) => {
+      renderSubtitleHistory(event.payload.status, event.payload.listening);
+    });
+  } catch {
+    subtitleHistoryStatus.textContent = "监听失败";
+  }
+}
+
+/** 渲染底部字幕条当前状态，不在这里生成任何字幕内容。 */
+function renderSubtitleOverlay(payload: SubtitleOverlayPayload): void {
+  subtitleBubble.dataset.state = payload.state;
+  subtitleBubble.dataset.visible = payload.visible ? "true" : "false";
+  subtitleText.textContent = payload.text || (payload.state === "listening" ? "等待字幕" : "");
+}
+
+/** 绑定字幕历史窗口按钮事件。 */
+function bindSubtitleHistoryEvents(): void {
+  if (subtitleHistoryCopyButton.dataset.bound === "true") {
+    return;
+  }
+  subtitleHistoryCopyButton.dataset.bound = "true";
+  subtitleHistoryClearButton.dataset.bound = "true";
+  subtitleHistoryCopyButton.addEventListener("click", () => {
+    const content = readSubtitleHistory()
+      .map((item) => item.text)
+      .join("\n");
+    if (!content.trim()) {
+      return;
+    }
+    void navigator.clipboard.writeText(content);
+    renderSubtitleHistory("已复制全部字幕", isSubtitleListening);
+  });
+  subtitleHistoryClearButton.addEventListener("click", () => {
+    writeSubtitleHistory([]);
+    renderSubtitleHistory("已清空", isSubtitleListening);
+  });
+}
+
+/** 渲染右上角字幕历史窗口。 */
+function renderSubtitleHistory(status: string, listening: boolean): void {
+  isSubtitleListening = listening;
+  const items = readSubtitleHistory();
+  subtitleHistoryStatus.textContent = listening ? status || "字幕窗口已打开" : status || "等待字幕";
+  subtitleHistoryCopyButton.disabled = !items.length;
+  subtitleHistoryClearButton.disabled = !items.length;
+  subtitleHistoryList.innerHTML = items.length
+    ? items
+        .map(
+          (item) => `
+            <article class="subtitleHistoryItem">
+              <div class="historyMeta">
+                <span>${item.source === "mixed" ? "混合音频" : item.source === "system" ? "系统音频" : "麦克风"}</span>
+                <time>${formatDateTime(item.createdAt)}</time>
+              </div>
+              <p>${escapeHtml(item.text)}</p>
+              <small>${formatDuration(item.elapsedMs)} · ${escapeHtml(item.model || "ASR")}</small>
+            </article>`,
+        )
+        .join("")
+    : '<div class="subtitleHistoryEmpty">还没有字幕。</div>';
+}
+
 /** 结果窗口初始化时从 Rust 内存恢复最近一次内容，避免首次打开时错过事件。 */
 async function restoreResultWindowPayload(): Promise<void> {
   if (!isTauriRuntime()) {
@@ -756,7 +1039,7 @@ async function bindHubStartEvent(): Promise<void> {
   }
   try {
     const { listen } = await import("@tauri-apps/api/event");
-    await listen<VoiceMode | ShortcutTriggerPayload>("hub-start-mode", (event) => {
+    await listen<ShortcutMode | ShortcutTriggerPayload>("hub-start-mode", (event) => {
       if (typeof event.payload === "string") {
         handleShortcutMode(event.payload);
         return;
@@ -837,11 +1120,20 @@ function bindHubEvents(): void {
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-shortcut-record]").forEach((button) => {
-    button.addEventListener("click", () => startShortcutRecording(normalizeMode(button.dataset.shortcutRecord)));
+    button.addEventListener("click", () => startShortcutRecording(normalizeShortcutMode(button.dataset.shortcutRecord)));
   });
   document.querySelectorAll<HTMLButtonElement>("[data-shortcut-reset]").forEach((button) => {
-    button.addEventListener("click", () => resetShortcutInput(normalizeMode(button.dataset.shortcutReset)));
+    button.addEventListener("click", () => resetShortcutInput(normalizeShortcutMode(button.dataset.shortcutReset)));
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-subtitle-toggle]").forEach((button) => {
+    button.addEventListener("click", () => void requestSubtitleMode());
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-permission-kind]").forEach((button) => {
+    button.addEventListener("click", () =>
+      openPermissionDialog(normalizeShortcutMode(button.dataset.permissionMode), normalizePermissionKind(button.dataset.permissionKind)),
+    );
+  });
+  hubShell.addEventListener("click", handleHubPermissionClick);
   quickStartButton.addEventListener("click", () => void requestFloatingMode("dictate"));
   postProcessDictationInput.addEventListener("change", () => setDictationPolishEnabled(postProcessDictationInput.checked));
   refreshStatusButton.addEventListener("click", () => void refreshHubRuntimeState());
@@ -864,12 +1156,33 @@ function bindHubEvents(): void {
   openAccessibilityButton.addEventListener("click", () => void openAccessibilitySettings());
   nextStepPrimaryButton.addEventListener("click", () => void handleNextStepAction());
   nextStepRefreshButton.addEventListener("click", () => void refreshHubRuntimeState());
+  permissionDialogPrimaryButton.addEventListener("click", () => void handlePermissionDialogPrimaryAction());
+  permissionDialogSecondaryButton.addEventListener("click", closePermissionDialog);
+  permissionDialogCloseButton.addEventListener("click", closePermissionDialog);
+  permissionDialog.addEventListener("click", (event) => {
+    if (event.target === permissionDialog) {
+      closePermissionDialog();
+    }
+  });
   dictionaryImportInput.addEventListener("change", () => void importDictionaryCsv());
   dictionaryForm.addEventListener("submit", addDictionaryWord);
   dictionarySearchInput.addEventListener("input", renderDictionary);
   historyList.addEventListener("click", handleHistoryAction);
   dictionaryList.addEventListener("click", handleDictionaryAction);
   window.addEventListener("keydown", captureShortcutKeys, true);
+}
+
+/** 处理动态渲染出的模式权限按钮点击，打开该模式自己的权限说明。 */
+function handleHubPermissionClick(event: MouseEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const button = target.closest<HTMLButtonElement>("[data-permission-kind]");
+  if (!button) {
+    return;
+  }
+  openPermissionDialog(normalizeShortcutMode(button.dataset.permissionMode), normalizePermissionKind(button.dataset.permissionKind));
 }
 
 /** 获取指定 DOM 元素，并保留准确类型。 */
@@ -908,6 +1221,22 @@ function normalizeMode(value: string | undefined): VoiceMode {
   return "dictate";
 }
 
+/** 根据字符串恢复全局快捷键模式，非法值回落到听写。 */
+function normalizeShortcutMode(value: string | undefined): ShortcutMode {
+  if (value === "subtitle") {
+    return "subtitle";
+  }
+  return normalizeMode(value);
+}
+
+/** 根据字符串恢复权限类型，非法值回落到麦克风权限。 */
+function normalizePermissionKind(value: string | undefined): PermissionKind {
+  if (value === "apiKey" || value === "accessibility" || value === "shortcut" || value === "systemAudio") {
+    return value;
+  }
+  return "microphone";
+}
+
 /** 从模式卡片进入对应设置页，模式设置不改变任何录音触发状态。 */
 function switchModeSettingsView(mode: VoiceMode): void {
   switchHubView(MODE_SETTINGS_VIEWS[mode]);
@@ -939,7 +1268,7 @@ function normalizeHubNoticeState(value: unknown): HubNoticeState {
 }
 
 /** 处理快捷键触发，并过滤按键连发造成的重复切换。 */
-function handleShortcutMode(mode: VoiceMode, targetApp = "", keepHubVisible = false): void {
+function handleShortcutMode(mode: ShortcutMode, targetApp = "", keepHubVisible = false): void {
   const now = Date.now();
   if (now - lastShortcutAt < 500) {
     addDiagnosticLog({
@@ -949,10 +1278,15 @@ function handleShortcutMode(mode: VoiceMode, targetApp = "", keepHubVisible = fa
       message: "系统已收到快捷键，但本次被防抖拦截。",
       mode,
       targetApp,
-      details: [`状态：${isRecording ? "录音中" : isProcessing ? "处理中" : "准备中"}`, `保持Hub：${keepHubVisible ? "是" : "否"}`],
+      details: [
+        `状态：${isSubtitleListening ? "字幕监听中" : isRecording ? "录音中" : isProcessing ? "处理中" : "准备中"}`,
+        `保持Hub：${keepHubVisible ? "是" : "否"}`,
+      ],
     });
     flashFloatingNudge();
-    if (isRecording) {
+    if (isSubtitleListening) {
+      void emitSubtitleHistoryUpdate("字幕监听中", true);
+    } else if (isRecording) {
       setStatus("已经在录音，说完后再按一次停止。", "recording");
     } else if (isProcessing) {
       setStatus("正在处理上一段语音，请稍等。", "busy");
@@ -969,8 +1303,27 @@ function handleShortcutMode(mode: VoiceMode, targetApp = "", keepHubVisible = fa
     message: "已收到全局快捷键，准备切换录音状态。",
     mode,
     targetApp,
-    details: [`状态：${isRecording ? "停止录音" : "开始录音"}`, `保持Hub：${keepHubVisible ? "是" : "否"}`],
+    details: [
+      `状态：${mode === "subtitle" ? (isSubtitleListening ? "停止字幕监听" : "开始字幕监听") : isRecording ? "停止录音" : "开始录音"}`,
+      `保持Hub：${keepHubVisible ? "是" : "否"}`,
+    ],
   });
+  if (mode === "subtitle") {
+    void toggleSubtitleListening();
+    return;
+  }
+  if (isSubtitleListening || isStartingSubtitleListening) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "subtitle",
+      title: "语音模式被字幕监听拦截",
+      message: "实时字幕正在监听，先退出字幕模式再开始普通语音输入。",
+      mode,
+      targetApp,
+    });
+    void emitSubtitleHistoryUpdate("字幕监听中", true);
+    return;
+  }
   void toggleRecording(mode, targetApp, keepHubVisible);
 }
 
@@ -988,6 +1341,7 @@ function loadConfigToForm(): void {
   setSelectValueWithLegacyOption(dictationOutputLanguageSelect, config.dictationOutputLanguage);
   syncDictationOutputLanguageState(config.postProcessDictation);
   microphoneSelect.value = config.microphoneDeviceId;
+  systemAudioSelect.value = config.systemAudioDeviceId;
   interactionSoundsInput.checked = config.interactionSounds;
   muteWhileDictatingInput.checked = config.muteWhileDictating;
   launchAtLoginInput.checked = config.launchAtLogin;
@@ -999,6 +1353,7 @@ function loadConfigToForm(): void {
   dictateShortcutInput.value = formatShortcutLabel(config.shortcuts.dictate);
   translateShortcutInput.value = formatShortcutLabel(config.shortcuts.translate);
   askShortcutInput.value = formatShortcutLabel(config.shortcuts.ask);
+  subtitleShortcutInput.value = formatShortcutLabel(config.shortcuts.subtitle);
   renderShortcutLabels(config.shortcuts);
   validateShortcutInputs();
 }
@@ -1039,6 +1394,7 @@ function defaultConfig(): VoiceConfig {
     postProcessDictation: true,
     dictationOutputLanguage: DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: "default",
+    systemAudioDeviceId: "auto",
     interactionSounds: true,
     muteWhileDictating: false,
     launchAtLogin: false,
@@ -1072,6 +1428,10 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
       typeof value.microphoneDeviceId === "string" && value.microphoneDeviceId.trim()
         ? value.microphoneDeviceId
         : fallback.microphoneDeviceId,
+    systemAudioDeviceId:
+      typeof value.systemAudioDeviceId === "string" && value.systemAudioDeviceId.trim()
+        ? value.systemAudioDeviceId
+        : fallback.systemAudioDeviceId,
     interactionSounds:
       typeof value.interactionSounds === "boolean" ? value.interactionSounds : fallback.interactionSounds,
     muteWhileDictating:
@@ -1093,6 +1453,7 @@ function normalizeShortcuts(value: unknown, fallback: ShortcutConfig): ShortcutC
     dictate: normalizeShortcutText(source.dictate, fallback.dictate),
     translate: normalizeShortcutText(source.translate, fallback.translate),
     ask: normalizeShortcutText(source.ask, fallback.ask),
+    subtitle: normalizeShortcutText(source.subtitle, fallback.subtitle),
   };
 }
 
@@ -1112,9 +1473,11 @@ function normalizeShortcutText(value: unknown, fallback: string): string {
     .replace(/\s+/g, "")
     .split("+")
     .filter(Boolean)
-    .map(normalizeShortcutPart)
-    .join("+");
-  return normalized || fallback;
+    .map(normalizeShortcutPart);
+  const modifiers = ["ctrl", "cmd", "alt", "shift"];
+  const orderedModifiers = modifiers.filter((modifier) => normalized.includes(modifier));
+  const keys = normalized.filter((part) => !modifiers.includes(part));
+  return [...orderedModifiers, ...keys].join("+") || fallback;
 }
 
 /** 统一快捷键片段别名，保证前端校验和 Rust 注册使用同一套语义。 */
@@ -1128,12 +1491,18 @@ function normalizeShortcutPart(part: string): string {
   if (part === "option") {
     return "alt";
   }
+  if (part.startsWith("key") && part.length === 4) {
+    return part.slice(3);
+  }
+  if (part.startsWith("digit") && part.length === 6) {
+    return part.slice(5);
+  }
   return part;
 }
 
-/** 检查三个模式是否配置了重复快捷键，避免保存后系统注册失败。 */
+/** 检查各模式是否配置了重复快捷键，避免保存后系统注册失败。 */
 function hasShortcutConflict(shortcuts: ShortcutConfig): boolean {
-  const values = [shortcuts.dictate, shortcuts.translate, shortcuts.ask].map((shortcut) =>
+  const values = [shortcuts.dictate, shortcuts.translate, shortcuts.ask, shortcuts.subtitle].map((shortcut) =>
     normalizeShortcutText(shortcut, ""),
   );
   return new Set(values).size !== values.length;
@@ -1159,6 +1528,7 @@ function readConfigFromForm(): VoiceConfig {
     postProcessDictation: postProcessDictationInput.checked,
     dictationOutputLanguage: dictationOutputLanguageSelect.value || DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: microphoneSelect.value || "default",
+    systemAudioDeviceId: systemAudioSelect.value || "auto",
     interactionSounds: interactionSoundsInput.checked,
     muteWhileDictating: muteWhileDictatingInput.checked,
     launchAtLogin: launchAtLoginInput.checked,
@@ -1167,6 +1537,7 @@ function readConfigFromForm(): VoiceConfig {
       dictate: normalizeShortcutText(dictateShortcutInput.value, DEFAULT_SHORTCUTS.dictate),
       translate: normalizeShortcutText(translateShortcutInput.value, DEFAULT_SHORTCUTS.translate),
       ask: normalizeShortcutText(askShortcutInput.value, DEFAULT_SHORTCUTS.ask),
+      subtitle: normalizeShortcutText(subtitleShortcutInput.value, DEFAULT_SHORTCUTS.subtitle),
     },
     personalStyle: personalStyleInput.value.trim(),
     dictationStyle: dictationStyleInput.value.trim(),
@@ -1313,6 +1684,7 @@ async function registerShortcutsFromConfig(config: VoiceConfig): Promise<boolean
     dictateShortcutInput.value = formatShortcutLabel(normalized.dictate);
     translateShortcutInput.value = formatShortcutLabel(normalized.translate);
     askShortcutInput.value = formatShortcutLabel(normalized.ask);
+    subtitleShortcutInput.value = formatShortcutLabel(normalized.subtitle);
     renderShortcutLabels(normalized);
     return true;
   } catch (error) {
@@ -1332,6 +1704,7 @@ async function restoreShortcutInputsFromRuntime(): Promise<void> {
     dictateShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.dictate);
     translateShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.translate);
     askShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.ask);
+    subtitleShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.subtitle);
     renderShortcutLabels(diagnostics.shortcuts);
     validateShortcutInputs();
   } catch {
@@ -1374,9 +1747,11 @@ function renderShortcutLabels(shortcuts: ShortcutConfig): void {
   dictateShortcutText.textContent = formatShortcutLabel(shortcuts.dictate);
   translateShortcutText.textContent = formatShortcutLabel(shortcuts.translate);
   askShortcutText.textContent = formatShortcutLabel(shortcuts.ask);
+  subtitleShortcutText.textContent = formatShortcutLabel(shortcuts.subtitle);
   homeDictateShortcutText.textContent = formatShortcutLabel(shortcuts.dictate);
   homeTranslateShortcutText.textContent = formatShortcutLabel(shortcuts.translate);
   homeAskShortcutText.textContent = formatShortcutLabel(shortcuts.ask);
+  homeSubtitleShortcutText.textContent = formatShortcutLabel(shortcuts.subtitle);
   updateFloatingShortcutTitle(shortcuts);
 }
 
@@ -1400,6 +1775,15 @@ async function refreshDiagnostics(): Promise<void> {
       setDiagnosticStatus(homeApiKeyStatus, "仅桌面端可检测", "warning");
       setDiagnosticStatus(homeAccessibilityStatus, "仅桌面端可检测", "warning");
       setDiagnosticStatus(homeShortcutStatus, "仅桌面端可注册", "warning");
+      lastPermissionSnapshot = {
+        ...createDefaultPermissionSnapshot(),
+        isDesktopRuntime: false,
+        microphoneState: microphoneDiagnostic.state,
+        microphoneText: microphoneDiagnostic.text,
+        systemAudioState: readSystemAudioDiagnostic(readSavedConfig()).state,
+        systemAudioText: readSystemAudioDiagnostic(readSavedConfig()).text,
+      };
+      renderModePermissions();
       updateReadinessSummary(false, microphoneDiagnostic.state, false, false, false);
       return;
     }
@@ -1430,6 +1814,20 @@ async function refreshDiagnostics(): Promise<void> {
       setDiagnosticStatus(shortcutStatus, shortcutDiagnostic.text, shortcutDiagnostic.state);
       setDiagnosticStatus(homeShortcutStatus, shortcutDiagnostic.homeText, shortcutDiagnostic.state);
       renderShortcutLabels(diagnostics.shortcuts);
+      const systemAudioDiagnostic = readSystemAudioDiagnostic(readSavedConfig());
+      lastPermissionSnapshot = {
+        isDesktopRuntime: true,
+        hasApiKey,
+        apiKeyText: keyText,
+        microphoneState: microphoneDiagnostic.state,
+        microphoneText: microphoneDiagnostic.text,
+        accessibilityReady: diagnostics.accessibilityTrusted,
+        shortcutReady: diagnostics.shortcutRegistrationReady,
+        shortcutText: shortcutDiagnostic.homeText,
+        systemAudioState: systemAudioDiagnostic.state,
+        systemAudioText: systemAudioDiagnostic.text,
+      };
+      renderModePermissions();
       updateReadinessSummary(
         hasApiKey,
         microphoneDiagnostic.state,
@@ -1444,6 +1842,15 @@ async function refreshDiagnostics(): Promise<void> {
       setDiagnosticStatus(homeApiKeyStatus, "检测失败", "error");
       setDiagnosticStatus(homeAccessibilityStatus, "检测失败", "error");
       setDiagnosticStatus(homeShortcutStatus, "检测失败", "error");
+      lastPermissionSnapshot = {
+        ...createDefaultPermissionSnapshot(),
+        isDesktopRuntime: true,
+        microphoneState: microphoneDiagnostic.state,
+        microphoneText: microphoneDiagnostic.text,
+        systemAudioState: readSystemAudioDiagnostic(readSavedConfig()).state,
+        systemAudioText: readSystemAudioDiagnostic(readSavedConfig()).text,
+      };
+      renderModePermissions();
       updateNextStepPanel("error", "重新检查运行状态", `诊断失败：${formatError(error)}`, "重新检查", "refresh", "refresh");
     }
   } finally {
@@ -1491,6 +1898,106 @@ function refreshDiagnosticsAfterVisibilityChange(): void {
 async function readRuntimeDiagnostics(): Promise<RuntimeDiagnostics> {
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<RuntimeDiagnostics>("get_runtime_diagnostics");
+}
+
+/** 创建权限快照默认值，避免诊断完成前模式卡片出现空白。 */
+function createDefaultPermissionSnapshot(): RuntimePermissionSnapshot {
+  return {
+    isDesktopRuntime: isTauriRuntime(),
+    hasApiKey: false,
+    apiKeyText: "未检测",
+    microphoneState: "warning",
+    microphoneText: "未检测",
+    accessibilityReady: false,
+    shortcutReady: false,
+    shortcutText: "未检测",
+    systemAudioState: "warning",
+    systemAudioText: "未检测",
+  };
+}
+
+/** 读取实时字幕系统声音配置状态，用于模式卡片展示而不是藏在全局设置里。 */
+function readSystemAudioDiagnostic(config: VoiceConfig): { text: string; state: DiagnosticState } {
+  if (config.systemAudioDeviceId === "none") {
+    return { text: "未采集系统声音", state: "error" };
+  }
+  if (!config.systemAudioDeviceId || config.systemAudioDeviceId === "auto") {
+    return { text: "自动检测系统声音", state: "warning" };
+  }
+  return { text: "已选择系统声音输入", state: "success" };
+}
+
+/** 按语音模式生成所需权限列表，避免所有模式共用一张全局权限表。 */
+function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
+  const microphoneReady = lastPermissionSnapshot.microphoneState === "success";
+  const permissions: ModePermissionItem[] = [
+    {
+      kind: "apiKey",
+      label: "Mimo Key",
+      ready: lastPermissionSnapshot.hasApiKey,
+      state: lastPermissionSnapshot.hasApiKey ? "success" : "error",
+      description: lastPermissionSnapshot.apiKeyText,
+    },
+    {
+      kind: "microphone",
+      label: mode === "subtitle" ? "麦克风输入" : "麦克风权限",
+      ready: microphoneReady,
+      state: lastPermissionSnapshot.microphoneState,
+      description: lastPermissionSnapshot.microphoneText,
+    },
+    {
+      kind: "shortcut",
+      label: "快捷键权限",
+      ready: lastPermissionSnapshot.shortcutReady,
+      state: lastPermissionSnapshot.shortcutReady ? "success" : "error",
+      description: lastPermissionSnapshot.shortcutText,
+    },
+  ];
+  if (mode === "dictate" || mode === "translate") {
+    permissions.push({
+      kind: "accessibility",
+      label: "自动粘贴权限",
+      ready: lastPermissionSnapshot.accessibilityReady,
+      state: lastPermissionSnapshot.accessibilityReady ? "success" : "warning",
+      description: lastPermissionSnapshot.accessibilityReady ? "已授权" : "未授权，结果会改为手动复制",
+    });
+  }
+  if (mode === "subtitle") {
+    permissions.push({
+      kind: "systemAudio",
+      label: "系统声音",
+      ready: lastPermissionSnapshot.systemAudioState !== "error",
+      state: lastPermissionSnapshot.systemAudioState,
+      description: lastPermissionSnapshot.systemAudioText,
+    });
+  }
+  return permissions;
+}
+
+/** 把各语音模式所需权限渲染到模式卡片和对应详情页。 */
+function renderModePermissions(): void {
+  if (windowMode !== "hub") {
+    return;
+  }
+  document.querySelectorAll<HTMLElement>("[data-mode-permissions]").forEach((container) => {
+    const mode = normalizeShortcutMode(container.dataset.modePermissions);
+    const permissions = readModePermissions(mode);
+    container.innerHTML = permissions
+      .map((permission) => {
+        const icon = permission.ready ? "✓" : "×";
+        const action = permission.ready ? "查看" : "设置";
+        return `
+          <button class="modePermissionItem" type="button" data-state="${permission.state}" data-permission-mode="${mode}" data-permission-kind="${permission.kind}">
+            <span class="modePermissionIcon" aria-hidden="true">${icon}</span>
+            <span class="modePermissionCopy">
+              <strong>${escapeHtml(permission.label)}</strong>
+              <span>${escapeHtml(permission.description)}</span>
+            </span>
+            <span class="modePermissionAction">${action}</span>
+          </button>`;
+      })
+      .join("");
+  });
 }
 
 /** 把 Rust 返回的快捷键注册状态转成首页和设置页诊断文案。 */
@@ -1653,6 +2160,103 @@ async function handleReadinessAction(action: ReadinessAction | string): Promise<
   }
 }
 
+/** 打开某个模式自己的权限说明弹窗。 */
+function openPermissionDialog(mode: ShortcutMode, kind: PermissionKind): void {
+  const copy = readPermissionDialogCopy(mode, kind);
+  activePermissionDialog = { mode, kind };
+  permissionDialogEyebrow.textContent = `${SHORTCUT_MODE_LABELS[mode]}权限`;
+  permissionDialogTitle.textContent = copy.title;
+  permissionDialogBody.textContent = copy.body;
+  permissionDialogSteps.innerHTML = copy.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("");
+  permissionDialogPrimaryButton.hidden = !copy.primaryLabel;
+  permissionDialogPrimaryButton.querySelector("span:last-child")!.textContent = copy.primaryLabel || "打开设置";
+  permissionDialog.dataset.open = "true";
+  permissionDialogPrimaryButton.focus();
+}
+
+/** 关闭权限说明弹窗，并清理当前权限上下文。 */
+function closePermissionDialog(): void {
+  permissionDialog.dataset.open = "false";
+  activePermissionDialog = null;
+}
+
+/** 生成不同权限的说明文案和可执行动作名称。 */
+function readPermissionDialogCopy(
+  mode: ShortcutMode,
+  kind: PermissionKind,
+): { title: string; body: string; steps: string[]; primaryLabel: string } {
+  if (kind === "apiKey") {
+    return {
+      title: "设置 Mimo Key",
+      body: `${SHORTCUT_MODE_LABELS[mode]}需要 Mimo Key 才能调用 ASR 或 AI 服务。Key 只保存在本机钥匙串或当前会话里。`,
+      steps: ["打开系统设置页的模型与识别区域。", "粘贴 Mimo Key。", "点击保存设置后重新检查权限状态。"],
+      primaryLabel: "去填写 Key",
+    };
+  }
+  if (kind === "microphone") {
+    return {
+      title: "设置麦克风权限",
+      body: `${SHORTCUT_MODE_LABELS[mode]}需要麦克风输入来采集声音。没有授权时，快捷键会提示“请设置麦克风权限”。`,
+      steps: ["在 macOS 系统设置中打开隐私与安全性。", "进入麦克风。", "允许 typesass 使用麦克风，然后回到应用重新检查。"],
+      primaryLabel: "打开麦克风权限",
+    };
+  }
+  if (kind === "accessibility") {
+    return {
+      title: "设置自动粘贴权限",
+      body: `${SHORTCUT_MODE_LABELS[mode]}完成转写后如果要自动粘贴，需要 macOS 辅助功能权限。未授权时仍会展示结果窗口，方便手动复制。`,
+      steps: ["在 macOS 系统设置中打开隐私与安全性。", "进入辅助功能。", "勾选 typesass，回到应用后会自动刷新状态。"],
+      primaryLabel: "打开辅助功能",
+    };
+  }
+  if (kind === "shortcut") {
+    return {
+      title: "设置快捷键权限",
+      body: `${SHORTCUT_MODE_LABELS[mode]}需要全局快捷键注册成功，才能在其他应用里直接启动。`,
+      steps: ["打开快捷键页。", "为当前模式录制一个未被系统占用的组合键。", "保存后重新注册快捷键。"],
+      primaryLabel: "编辑快捷键",
+    };
+  }
+  return {
+    title: "设置系统声音",
+    body: "实时字幕要识别电脑正在播放的声音，需要选择可代表系统输出的输入设备，例如 BlackHole、Loopback、Soundflower 或聚合设备。",
+    steps: ["先确认本机已安装或配置虚拟声卡/系统音频输入。", "在音频来源里选择该输入设备，或保持自动检测。", "播放带人声的音频后，再开启实时字幕验证是否出字。"],
+    primaryLabel: "打开音频来源",
+  };
+}
+
+/** 执行权限弹窗主按钮动作，尽量直达对应系统页或设置控件。 */
+async function handlePermissionDialogPrimaryAction(): Promise<void> {
+  if (!activePermissionDialog) {
+    return;
+  }
+  const { mode, kind } = activePermissionDialog;
+  closePermissionDialog();
+  if (kind === "apiKey") {
+    switchHubView("settings");
+    focusSettingControl(apiKeyInput);
+    showHubNotice("在这里填写 Mimo Key，保存后回到模式卡片检查状态。", "busy");
+    return;
+  }
+  if (kind === "microphone") {
+    await openMicrophoneSettings();
+    return;
+  }
+  if (kind === "accessibility") {
+    await openAccessibilitySettings();
+    return;
+  }
+  if (kind === "shortcut") {
+    switchHubView("shortcuts");
+    focusSettingControl(getShortcutInput(mode));
+    showHubNotice(`正在编辑${SHORTCUT_MODE_LABELS[mode]}快捷键。`, "busy");
+    return;
+  }
+  switchHubView("settings");
+  focusSettingControl(systemAudioSelect);
+  showHubNotice("实时字幕的系统声音来源在这里选择。", "busy");
+}
+
 /** 切页后把用户带到最相关的输入控件，并给一个轻量焦点动效。 */
 function focusSettingControl(control: HTMLElement): void {
   window.setTimeout(() => {
@@ -1698,6 +2302,21 @@ async function authorizeMicrophoneAccess(): Promise<void> {
   } catch (error) {
     setDiagnosticStatus(microphoneStatus, "授权失败", "error");
     showHubNotice(`麦克风授权失败：${formatError(error)}`, "error");
+  }
+}
+
+/** 打开系统麦克风权限页，并提示用户回到对应模式卡片复查状态。 */
+async function openMicrophoneSettings(): Promise<void> {
+  if (!isTauriRuntime()) {
+    showHubNotice("网页预览模式不能打开系统麦克风权限页。", "error");
+    return;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("open_microphone_settings");
+    showHubNotice("已打开麦克风权限页，允许 typesass 后回到模式卡片重新检查。", "success");
+  } catch (error) {
+    showHubNotice(`打开麦克风权限页失败：${formatError(error)}`, "error");
   }
 }
 
@@ -1850,7 +2469,7 @@ function formatShortcutLabel(shortcut: string): string {
 }
 
 /** 进入某个模式的快捷键录制状态。 */
-function startShortcutRecording(mode: VoiceMode): void {
+function startShortcutRecording(mode: ShortcutMode): void {
   restoreShortcutRecordingSnapshot();
   shortcutRecordingMode = mode;
   clearShortcutRecordingState();
@@ -1859,11 +2478,11 @@ function startShortcutRecording(mode: VoiceMode): void {
   input.value = "请按新的组合键";
   input.dataset.recording = "true";
   setShortcutValidation("按下包含 Control、Command、Option 或 Shift 的组合键；Esc 可取消。", "busy", true);
-  showHubNotice(`正在录制${MODE_LABELS[mode]}快捷键。`, "busy");
+  showHubNotice(`正在录制${SHORTCUT_MODE_LABELS[mode]}快捷键。`, "busy");
 }
 
 /** 将某个模式的快捷键恢复为默认值。 */
-function resetShortcutInput(mode: VoiceMode): void {
+function resetShortcutInput(mode: ShortcutMode): void {
   shortcutRecordingMode = null;
   shortcutRecordingSnapshot = null;
   clearShortcutRecordingState();
@@ -1871,7 +2490,7 @@ function resetShortcutInput(mode: VoiceMode): void {
   renderShortcutLabels(readConfigFromForm().shortcuts);
   const isValid = validateShortcutInputs();
   showHubNotice(
-    isValid ? `${MODE_LABELS[mode]}快捷键已恢复默认，保存后生效。` : "恢复默认后出现快捷键冲突，请调整后保存。",
+    isValid ? `${SHORTCUT_MODE_LABELS[mode]}快捷键已恢复默认，保存后生效。` : "恢复默认后出现快捷键冲突，请调整后保存。",
     isValid ? "success" : "error",
   );
 }
@@ -1901,7 +2520,7 @@ function captureShortcutKeys(event: KeyboardEvent): void {
   const isValid = validateShortcutInputs();
   showHubNotice(
     isValid
-      ? `${MODE_LABELS[mode]}快捷键已设为 ${formatShortcutLabel(shortcut)}，保存后生效。`
+      ? `${SHORTCUT_MODE_LABELS[mode]}快捷键已设为 ${formatShortcutLabel(shortcut)}，保存后生效。`
       : "这个快捷键和其它模式冲突，请重新录制后保存。",
     isValid ? "success" : "error",
   );
@@ -1912,6 +2531,7 @@ function clearShortcutRecordingState(): void {
   dictateShortcutInput.removeAttribute("data-recording");
   translateShortcutInput.removeAttribute("data-recording");
   askShortcutInput.removeAttribute("data-recording");
+  subtitleShortcutInput.removeAttribute("data-recording");
 }
 
 /** 取消当前快捷键录制并恢复进入录制态前的展示值。 */
@@ -1943,14 +2563,15 @@ function validateShortcutInputs(): boolean {
   }
 
   const shortcuts = readConfigFromForm().shortcuts;
-  const entries: Array<[VoiceMode, string]> = [
+  const entries: Array<[ShortcutMode, string]> = [
     ["dictate", shortcuts.dictate],
     ["translate", shortcuts.translate],
     ["ask", shortcuts.ask],
+    ["subtitle", shortcuts.subtitle],
   ];
   const invalidEntry = entries.find(([, shortcut]) => !isValidShortcutText(shortcut));
   if (invalidEntry) {
-    setShortcutValidation(`${MODE_LABELS[invalidEntry[0]]}快捷键不完整，请重新录制。`, "error", true);
+    setShortcutValidation(`${SHORTCUT_MODE_LABELS[invalidEntry[0]]}快捷键不完整，请重新录制。`, "error", true);
     return false;
   }
   const repeated = entries.find(([, shortcut], index) =>
@@ -2028,7 +2649,10 @@ function normalizeEventKey(key: string): string {
 }
 
 /** 读取某个模式对应的快捷键输入框。 */
-function getShortcutInput(mode: VoiceMode): HTMLInputElement {
+function getShortcutInput(mode: ShortcutMode): HTMLInputElement {
+  if (mode === "subtitle") {
+    return subtitleShortcutInput;
+  }
   if (mode === "translate") {
     return translateShortcutInput;
   }
@@ -2042,9 +2666,15 @@ function getShortcutInput(mode: VoiceMode): HTMLInputElement {
 async function populateMicrophones(): Promise<void> {
   const config = readSavedConfig();
   const currentValue = microphoneSelect.value || config.microphoneDeviceId;
+  const currentSystemAudioValue = systemAudioSelect.value || config.systemAudioDeviceId;
   microphoneSelect.innerHTML = '<option value="default">系统默认麦克风</option>';
+  systemAudioSelect.innerHTML = [
+    '<option value="auto">自动检测系统音频输入</option>',
+    '<option value="none">不采集系统声音</option>',
+  ].join("");
   if (!navigator.mediaDevices?.enumerateDevices) {
     microphoneSelect.value = "default";
+    systemAudioSelect.value = "auto";
     return;
   }
   try {
@@ -2056,12 +2686,22 @@ async function populateMicrophones(): Promise<void> {
         option.value = device.deviceId || "default";
         option.textContent = device.label || `麦克风 ${index + 1}`;
         microphoneSelect.appendChild(option);
+        if (device.deviceId) {
+          const systemOption = document.createElement("option");
+          systemOption.value = device.deviceId;
+          systemOption.textContent = device.label || `音频输入 ${index + 1}`;
+          systemAudioSelect.appendChild(systemOption);
+        }
       });
     microphoneSelect.value = Array.from(microphoneSelect.options).some((option) => option.value === currentValue)
       ? currentValue
       : "default";
+    systemAudioSelect.value = Array.from(systemAudioSelect.options).some((option) => option.value === currentSystemAudioValue)
+      ? currentSystemAudioValue
+      : "auto";
   } catch {
     microphoneSelect.value = "default";
+    systemAudioSelect.value = "auto";
   }
 }
 
@@ -2092,8 +2732,8 @@ function clearSavedConfig(button: HTMLButtonElement): void {
 
 /** 请求悬浮窗按指定模式开始或停止录音。 */
 async function requestFloatingMode(mode: VoiceMode): Promise<void> {
-  if (windowMode === "hub" && nextReadinessAction !== "start") {
-    await handleNextStepAction();
+  if (windowMode === "hub" && !isModePermissionReady(mode)) {
+    await showFirstMissingModePermission(mode);
     return;
   }
   setFloatingMode(mode);
@@ -2124,6 +2764,41 @@ async function requestFloatingMode(mode: VoiceMode): Promise<void> {
       mode,
     });
     showHubNotice(`无法唤起悬浮录音：${formatError(error)}`, "error");
+  }
+}
+
+/** 从 Hub 请求进入或退出实时字幕监听模式。 */
+async function requestSubtitleMode(): Promise<void> {
+  if (!isTauriRuntime()) {
+    showHubNotice("网页预览模式不能触发桌面字幕监听。", "error");
+    return;
+  }
+  if (windowMode === "hub" && !isModePermissionReady("subtitle")) {
+    await showFirstMissingModePermission("subtitle");
+    return;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const { emitTo } = await import("@tauri-apps/api/event");
+    await invoke("show_subtitle_windows");
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "Hub 发起实时字幕",
+      message: "用户从 Hub 切换字幕监听模式。",
+      mode: "subtitle",
+    });
+    await emitTo("main", "hub-start-mode", { mode: "subtitle", targetApp: "", keepHubVisible: false });
+    showHubNotice("实时字幕监听已切换。", "success");
+  } catch (error) {
+    addDiagnosticLog({
+      level: "error",
+      category: "subtitle",
+      title: "Hub 发起实时字幕失败",
+      message: formatError(error),
+      mode: "subtitle",
+    });
+    showHubNotice(`无法切换实时字幕：${formatError(error)}`, "error");
   }
 }
 
@@ -2172,15 +2847,11 @@ async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = 
   isStartingRecording = true;
   try {
     const config = readSavedConfig();
-    if (!(await ensureReadyForRecording())) {
+    if (!(await ensureReadyForRecording(mode))) {
       return;
     }
     recordingKeepsHubVisible = keepHubVisible;
-    recordingTargetApp = keepHubVisible
-      ? ""
-      : normalizeRecordingTargetApp(targetApp) ||
-        normalizeRecordingTargetApp(await readRecordingTargetApp()) ||
-        normalizeRecordingTargetApp(await readFrontmostApp());
+    recordingTargetApp = keepHubVisible ? "" : normalizeRecordingTargetApp(targetApp);
     addDiagnosticLog({
       level: "info",
       category: "recording",
@@ -2236,7 +2907,7 @@ async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = 
     setStatus(message, "error");
     if (isMicrophonePermissionError(error)) {
       await showHubWindow();
-      await switchHubWindowToSettings();
+      await switchHubWindowToModeDetail(mode, "microphone");
     }
   } finally {
     isStartingRecording = false;
@@ -2270,6 +2941,573 @@ function buildAudioConstraints(config: VoiceConfig): MediaTrackConstraints {
   return constraints;
 }
 
+/** 为实时字幕的系统音频输入创建录音约束，避免浏览器降噪破坏电脑播放声。 */
+function buildSystemAudioConstraints(deviceId: string): MediaTrackConstraints {
+  return {
+    deviceId: { exact: deviceId },
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  };
+}
+
+/** 切换实时字幕监听模式。 */
+async function toggleSubtitleListening(): Promise<void> {
+  if (isStartingSubtitleListening) {
+    await emitSubtitleHistoryUpdate("正在准备", false);
+    return;
+  }
+  if (isSubtitleListening) {
+    await stopSubtitleListening();
+    return;
+  }
+  await startSubtitleListening();
+}
+
+/** 开始采集音频并按固定时间片进行实时 ASR。 */
+async function startSubtitleListening(): Promise<void> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    await showSubtitleFailure("当前环境不支持音频采集。");
+    return;
+  }
+  if (isRecording || isProcessing) {
+    await showSubtitleFailure("当前正在处理普通语音输入，请完成后再开启字幕。");
+    return;
+  }
+  isStartingSubtitleListening = true;
+  try {
+    if (!(await ensureReadyForRecording("subtitle"))) {
+      return;
+    }
+    resetSubtitleRuntime();
+    await showSubtitleWindows();
+    await emitSubtitleOverlay({ text: "", visible: false, state: "listening", updatedAt: Date.now() });
+    await emitSubtitleHistoryUpdate("正在准备", false);
+    const config = readSavedConfig();
+    await setupSubtitleAudioGraph(config);
+    isSubtitleListening = true;
+    subtitleStartedAt = Date.now();
+    subtitleSegmentStartedAt = 0;
+    subtitleLastSoundAt = Date.now();
+    subtitleLastTextAt = 0;
+    startSubtitleTimers();
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "开始实时字幕",
+      message: "已进入字幕监听模式，开始按固定时间片发送 ASR。",
+      mode: "subtitle",
+      details: [
+        `麦克风：${config.microphoneDeviceId || "default"}`,
+        `系统声音：${config.systemAudioDeviceId || "auto"}`,
+        `音频来源：${formatSubtitleSource(subtitleCurrentSource)}`,
+      ],
+    });
+    await emitSubtitleHistoryUpdate("监听中", true);
+  } catch (error) {
+    stopSubtitleAudioGraph();
+    await showSubtitleFailure(`实时字幕启动失败：${formatError(error)}`);
+  } finally {
+    isStartingSubtitleListening = false;
+  }
+}
+
+/** 停止实时字幕监听，并把未固化字幕写入历史。 */
+async function stopSubtitleListening(): Promise<void> {
+  if (!isSubtitleListening && !isStartingSubtitleListening) {
+    await hideSubtitleWindows();
+    return;
+  }
+  stopSubtitleTimers();
+  if (!subtitleInFlight) {
+    await dispatchSubtitleChunkIfReady(true);
+  }
+  await finalizeSubtitleSegment("stop");
+  isSubtitleListening = false;
+  subtitleDispatchQueued = false;
+  stopSubtitleAudioGraph();
+  await emitSubtitleOverlay({ text: "", visible: false, state: "hidden", updatedAt: Date.now() });
+  await emitSubtitleHistoryUpdate("已停止", false);
+  await hideSubtitleWindows();
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "停止实时字幕",
+    message: "已退出字幕监听模式，并停止音频采集。",
+    mode: "subtitle",
+  });
+}
+
+/** 初始化实时字幕的麦克风与系统音频混音图。 */
+async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
+  subtitleMicStream = await navigator.mediaDevices.getUserMedia({ audio: buildAudioConstraints(config) });
+  const systemAudioDeviceId = await resolveSystemAudioDeviceId(config);
+  if (systemAudioDeviceId) {
+    try {
+      subtitleSystemStream = await navigator.mediaDevices.getUserMedia({
+        audio: buildSystemAudioConstraints(systemAudioDeviceId),
+      });
+    } catch (error) {
+      addDiagnosticLog({
+        level: "warning",
+        category: "subtitle",
+        title: "系统音频输入不可用",
+        message: `系统声音设备打开失败，已先使用麦克风继续字幕监听：${formatError(error)}`,
+        mode: "subtitle",
+        details: [`系统声音设备：${systemAudioDeviceId}`],
+      });
+      subtitleSystemStream = null;
+    }
+  }
+
+  subtitleAudioContext = new AudioContext();
+  subtitleSampleRate = subtitleAudioContext.sampleRate;
+  subtitleMixer = subtitleAudioContext.createGain();
+  subtitleProcessor = subtitleAudioContext.createScriptProcessor(4096, 1, 1);
+  subtitleSink = subtitleAudioContext.createGain();
+  subtitleSink.gain.value = 0;
+
+  subtitleMicSource = subtitleAudioContext.createMediaStreamSource(subtitleMicStream);
+  subtitleMicSource.connect(subtitleMixer);
+  if (subtitleSystemStream) {
+    subtitleSystemSource = subtitleAudioContext.createMediaStreamSource(subtitleSystemStream);
+    subtitleSystemSource.connect(subtitleMixer);
+    subtitleCurrentSource = "mixed";
+  } else {
+    subtitleCurrentSource = "microphone";
+  }
+
+  subtitleProcessor.onaudioprocess = collectSubtitleSamples;
+  subtitleMixer.connect(subtitleProcessor);
+  subtitleProcessor.connect(subtitleSink);
+  subtitleSink.connect(subtitleAudioContext.destination);
+}
+
+/** 自动选择可代表系统播放声音的输入设备，优先识别虚拟声卡。 */
+async function resolveSystemAudioDeviceId(config: VoiceConfig): Promise<string> {
+  const savedDeviceId = config.systemAudioDeviceId.trim();
+  if (savedDeviceId === "none") {
+    return "";
+  }
+  if (savedDeviceId && savedDeviceId !== "auto") {
+    if (savedDeviceId === config.microphoneDeviceId) {
+      return "";
+    }
+    return savedDeviceId;
+  }
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    return "";
+  }
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const microphoneDeviceId = config.microphoneDeviceId === "default" ? "" : config.microphoneDeviceId;
+  const candidate = devices
+    .filter((device) => device.kind === "audioinput" && device.deviceId && device.deviceId !== microphoneDeviceId)
+    .find((device) => isSystemAudioInputLabel(device.label));
+  return candidate?.deviceId || "";
+}
+
+/** 判断输入设备名称是否像系统音频或虚拟声卡。 */
+function isSystemAudioInputLabel(label: string): boolean {
+  const normalizedLabel = label.toLowerCase();
+  return [
+    "blackhole",
+    "loopback",
+    "soundflower",
+    "system audio",
+    "virtual",
+    "aggregate",
+    "multi-output",
+    "monitor",
+    "stereo mix",
+    "系统",
+    "电脑",
+  ].some((keyword) => normalizedLabel.includes(keyword));
+}
+
+/** 重置实时字幕运行时缓存，确保新一轮监听不带上旧音频。 */
+function resetSubtitleRuntime(): void {
+  subtitleSampleChunks = [];
+  subtitleTotalSamples = 0;
+  subtitleDispatchedSampleEnd = 0;
+  subtitleSampleRate = 0;
+  subtitleInFlight = false;
+  subtitleDispatchQueued = false;
+  subtitlePendingText = "";
+  subtitleLastDisplayedText = "";
+  subtitleLastModel = "";
+  subtitleCurrentSource = "microphone";
+}
+
+/** 收集实时字幕音频样本，来源可能是麦克风或麦克风加系统声音混音。 */
+function collectSubtitleSamples(event: AudioProcessingEvent): void {
+  if (!isSubtitleListening && !isStartingSubtitleListening) {
+    return;
+  }
+  const input = event.inputBuffer.getChannelData(0);
+  const level = readAudioLevel(input);
+  if (level >= SUBTITLE_SOUND_LEVEL_THRESHOLD) {
+    subtitleLastSoundAt = Date.now();
+  }
+  const sampleCopy = new Float32Array(input.length);
+  sampleCopy.set(input);
+  subtitleSampleChunks.push({
+    startSample: subtitleTotalSamples,
+    samples: sampleCopy,
+    level,
+  });
+  subtitleTotalSamples += sampleCopy.length;
+  trimSubtitleSampleBuffer();
+}
+
+/** 裁剪实时字幕音频缓存，保留重叠区和最近一段上下文即可。 */
+function trimSubtitleSampleBuffer(): void {
+  if (!subtitleSampleRate || !subtitleSampleChunks.length) {
+    return;
+  }
+  const overlapSamples = Math.floor((SUBTITLE_OVERLAP_MS / 1000) * subtitleSampleRate);
+  const recentSamples = Math.floor(30 * subtitleSampleRate);
+  const retainFrom = Math.max(0, Math.min(subtitleDispatchedSampleEnd - overlapSamples * 2, subtitleTotalSamples - recentSamples));
+  while (subtitleSampleChunks.length) {
+    const first = subtitleSampleChunks[0];
+    if (first.startSample + first.samples.length >= retainFrom) {
+      return;
+    }
+    subtitleSampleChunks.shift();
+  }
+}
+
+/** 启动字幕切片和固化检查定时器。 */
+function startSubtitleTimers(): void {
+  stopSubtitleTimers();
+  subtitleDispatchTimerHandle = window.setInterval(() => {
+    void dispatchSubtitleChunkIfReady(false);
+  }, SUBTITLE_DISPATCH_INTERVAL_MS);
+  subtitleUiTimerHandle = window.setInterval(() => {
+    void runSubtitleHousekeeping();
+  }, 500);
+}
+
+/** 停止字幕切片和固化检查定时器。 */
+function stopSubtitleTimers(): void {
+  if (subtitleDispatchTimerHandle !== null) {
+    window.clearInterval(subtitleDispatchTimerHandle);
+    subtitleDispatchTimerHandle = null;
+  }
+  if (subtitleUiTimerHandle !== null) {
+    window.clearInterval(subtitleUiTimerHandle);
+    subtitleUiTimerHandle = null;
+  }
+  if (subtitleOverlayHideTimerHandle !== null) {
+    window.clearTimeout(subtitleOverlayHideTimerHandle);
+    subtitleOverlayHideTimerHandle = null;
+  }
+}
+
+/** 在达到固定时间片后发送 ASR，请求并发时只保留下一次发送机会。 */
+async function dispatchSubtitleChunkIfReady(force: boolean): Promise<void> {
+  if ((!isSubtitleListening && !force) || !subtitleSampleRate || !subtitleSampleChunks.length) {
+    return;
+  }
+  if (subtitleInFlight) {
+    subtitleDispatchQueued = true;
+    return;
+  }
+  const chunkSamples = Math.floor((SUBTITLE_CHUNK_MS / 1000) * subtitleSampleRate);
+  const minChunkSamples = Math.floor((SUBTITLE_MIN_CHUNK_MS / 1000) * subtitleSampleRate);
+  const maxChunkSamples = Math.floor((SUBTITLE_MAX_CHUNK_MS / 1000) * subtitleSampleRate);
+  const pendingSamples = subtitleTotalSamples - subtitleDispatchedSampleEnd;
+  if (!force && pendingSamples < chunkSamples) {
+    return;
+  }
+  const endSample = subtitleTotalSamples;
+  const overlapSamples = Math.floor((SUBTITLE_OVERLAP_MS / 1000) * subtitleSampleRate);
+  const startSample = Math.max(0, endSample - maxChunkSamples, subtitleDispatchedSampleEnd - overlapSamples);
+  if (endSample - startSample < minChunkSamples) {
+    return;
+  }
+  const samples = sliceSubtitleSamples(startSample, endSample);
+  subtitleDispatchedSampleEnd = endSample;
+  const level = readAudioLevel(samples);
+  if (level < SUBTITLE_SOUND_LEVEL_THRESHOLD && Date.now() - subtitleLastSoundAt >= SUBTITLE_SILENCE_FINALIZE_MS) {
+    await finalizeSubtitleSegment("silence");
+    return;
+  }
+
+  subtitleInFlight = true;
+  try {
+    await transcribeSubtitleSamples(samples, level);
+  } finally {
+    subtitleInFlight = false;
+    if (subtitleDispatchQueued && isSubtitleListening) {
+      subtitleDispatchQueued = false;
+      void dispatchSubtitleChunkIfReady(false);
+    }
+  }
+}
+
+/** 从实时字幕采样缓存里截取指定绝对采样范围。 */
+function sliceSubtitleSamples(startSample: number, endSample: number): Float32Array {
+  const samples = new Float32Array(endSample - startSample);
+  let offset = 0;
+  for (const chunk of subtitleSampleChunks) {
+    const chunkStart = chunk.startSample;
+    const chunkEnd = chunk.startSample + chunk.samples.length;
+    if (chunkEnd <= startSample || chunkStart >= endSample) {
+      continue;
+    }
+    const sourceStart = Math.max(0, startSample - chunkStart);
+    const sourceEnd = Math.min(chunk.samples.length, endSample - chunkStart);
+    samples.set(chunk.samples.subarray(sourceStart, sourceEnd), offset);
+    offset += sourceEnd - sourceStart;
+  }
+  return samples;
+}
+
+/** 把字幕音频片段发送给 Mimo ASR，并处理返回文本。 */
+async function transcribeSubtitleSamples(samples: Float32Array, level: number): Promise<void> {
+  const config = readSavedConfig();
+  const audioBlob = new Blob([encodeWav(samples, subtitleSampleRate)], { type: "audio/wav" });
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "发送字幕切片",
+    message: "正在把实时字幕音频片段发送给 ASR。",
+    mode: "subtitle",
+    details: [`音频大小：${formatBytes(audioBlob.size)}`, `音量：${level.toFixed(3)}`],
+  });
+  try {
+    const response = await callTranscribe({
+      apiKey: "",
+      baseUrl: config.baseUrl,
+      asrModel: config.asrModel,
+      language: config.language,
+      contentType: "audio/wav",
+      audioBase64: await blobToBase64(audioBlob),
+    });
+    const text = normalizeSubtitleText(response.text);
+    subtitleLastModel = response.model;
+    if (!isMeaningfulTranscription(text)) {
+      addDiagnosticLog({
+        level: "warning",
+        category: "subtitle",
+        title: "字幕切片未返回文字",
+        message: "ASR 已返回，但本片段没有可展示字幕。",
+        mode: "subtitle",
+        elapsedMs: response.elapsedMs,
+      });
+      return;
+    }
+    await handleSubtitleText(text, response);
+  } catch (error) {
+    addDiagnosticLog({
+      level: "error",
+      category: "subtitle",
+      title: "字幕转写失败",
+      message: formatError(error),
+      mode: "subtitle",
+    });
+    await emitSubtitleHistoryUpdate("转写失败", true);
+  }
+}
+
+/** 处理 ASR 返回的字幕文本，刷新底部字幕条并合并到当前待固化片段。 */
+async function handleSubtitleText(text: string, response: TranscribeResponse): Promise<void> {
+  const normalizedText = normalizeSubtitleText(text);
+  if (!normalizedText) {
+    return;
+  }
+  subtitlePendingText = mergeSubtitleText(subtitlePendingText, normalizedText);
+  if (!subtitleSegmentStartedAt) {
+    subtitleSegmentStartedAt = Date.now();
+  }
+  subtitleLastTextAt = Date.now();
+  subtitleLastDisplayedText = normalizedText;
+  await emitSubtitleOverlay({ text: normalizedText, visible: true, state: "text", updatedAt: subtitleLastTextAt });
+  scheduleSubtitleOverlayHide();
+  await emitSubtitleHistoryUpdate(`识别中 · ${formatDuration(response.elapsedMs)}`, true);
+  addDiagnosticLog({
+    level: "success",
+    category: "subtitle",
+    title: "字幕已返回",
+    message: "ASR 已返回可展示字幕。",
+    mode: "subtitle",
+    elapsedMs: response.elapsedMs,
+    details: [`字数：${countTextUnits(normalizedText)}`, `模型：${response.model}`],
+  });
+  if (Date.now() - subtitleSegmentStartedAt >= SUBTITLE_FORCE_FINALIZE_MS) {
+    await finalizeSubtitleSegment("force");
+  }
+}
+
+/** 处理字幕隐藏和停顿固化，不会因为短暂停顿退出监听。 */
+async function runSubtitleHousekeeping(): Promise<void> {
+  if (!isSubtitleListening) {
+    return;
+  }
+  const now = Date.now();
+  if (subtitlePendingText && subtitleLastSoundAt && now - subtitleLastSoundAt >= SUBTITLE_SILENCE_FINALIZE_MS) {
+    await finalizeSubtitleSegment("silence");
+  }
+  if (subtitlePendingText && subtitleSegmentStartedAt && now - subtitleSegmentStartedAt >= SUBTITLE_FORCE_FINALIZE_MS) {
+    await finalizeSubtitleSegment("force");
+  }
+  if (subtitleLastDisplayedText && subtitleLastTextAt && now - subtitleLastTextAt >= SUBTITLE_HIDE_DELAY_MS) {
+    subtitleLastDisplayedText = "";
+    await emitSubtitleOverlay({ text: "", visible: false, state: "hidden", updatedAt: now });
+  }
+}
+
+/** 为底部字幕条安排自动隐藏，视觉隐藏不影响监听和历史。 */
+function scheduleSubtitleOverlayHide(): void {
+  if (subtitleOverlayHideTimerHandle !== null) {
+    window.clearTimeout(subtitleOverlayHideTimerHandle);
+  }
+  subtitleOverlayHideTimerHandle = window.setTimeout(() => {
+    subtitleLastDisplayedText = "";
+    void emitSubtitleOverlay({ text: "", visible: false, state: "hidden", updatedAt: Date.now() });
+  }, SUBTITLE_HIDE_DELAY_MS);
+}
+
+/** 将当前字幕片段固化到右上角历史。 */
+async function finalizeSubtitleSegment(reason: "silence" | "force" | "stop"): Promise<void> {
+  const text = normalizeSubtitleText(subtitlePendingText);
+  if (!isMeaningfulTranscription(text)) {
+    subtitlePendingText = "";
+    subtitleSegmentStartedAt = 0;
+    return;
+  }
+  const createdAt = Date.now();
+  const historyItem: SubtitleHistoryItem = {
+    id: createId(),
+    text,
+    createdAt,
+    source: subtitleCurrentSource,
+    elapsedMs: subtitleSegmentStartedAt ? createdAt - subtitleSegmentStartedAt : 0,
+    model: subtitleLastModel || readSavedConfig().asrModel,
+  };
+  saveSubtitleHistory(historyItem);
+  subtitlePendingText = "";
+  subtitleSegmentStartedAt = 0;
+  await emitSubtitleHistoryUpdate(reason === "stop" ? "已停止" : "已记录", isSubtitleListening);
+}
+
+/** 规范化字幕文本，去掉 ASR 容易返回的多余空白。 */
+function normalizeSubtitleText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** 合并带重叠区的字幕片段，尽量避免历史里出现重复文字。 */
+function mergeSubtitleText(previous: string, next: string): string {
+  const left = normalizeSubtitleText(previous);
+  const right = normalizeSubtitleText(next);
+  if (!left) {
+    return right;
+  }
+  if (!right || left.includes(right)) {
+    return left;
+  }
+  if (right.includes(left)) {
+    return right;
+  }
+  const maxOverlap = Math.min(left.length, right.length, 32);
+  for (let length = maxOverlap; length >= 2; length -= 1) {
+    if (left.slice(-length) === right.slice(0, length)) {
+      return `${left}${right.slice(length)}`;
+    }
+  }
+  return `${left} ${right}`;
+}
+
+/** 停止实时字幕音频图并释放两个输入流。 */
+function stopSubtitleAudioGraph(): void {
+  subtitleProcessor?.disconnect();
+  subtitleProcessor && (subtitleProcessor.onaudioprocess = null);
+  subtitleMicSource?.disconnect();
+  subtitleSystemSource?.disconnect();
+  subtitleMixer?.disconnect();
+  subtitleSink?.disconnect();
+  subtitleMicStream?.getTracks().forEach((track) => track.stop());
+  subtitleSystemStream?.getTracks().forEach((track) => track.stop());
+  if (subtitleAudioContext) {
+    void subtitleAudioContext.close();
+  }
+  subtitleMicStream = null;
+  subtitleSystemStream = null;
+  subtitleAudioContext = null;
+  subtitleMicSource = null;
+  subtitleSystemSource = null;
+  subtitleMixer = null;
+  subtitleProcessor = null;
+  subtitleSink = null;
+}
+
+/** 向字幕窗口发送失败状态，并复用顶部错误提示做明显反馈。 */
+async function showSubtitleFailure(message: string): Promise<void> {
+  addDiagnosticLog({
+    level: "error",
+    category: "subtitle",
+    title: "实时字幕不可用",
+    message,
+    mode: "subtitle",
+  });
+  await emitSubtitleHistoryUpdate("启动失败", false);
+  await emitSubtitleOverlay({ text: "", visible: false, state: "error", updatedAt: Date.now() });
+  showLocalErrorBubble(message);
+}
+
+/** 显示实时字幕相关窗口。 */
+async function showSubtitleWindows(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("show_subtitle_windows");
+}
+
+/** 隐藏实时字幕相关窗口。 */
+async function hideSubtitleWindows(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("hide_subtitle_windows");
+}
+
+/** 向底部字幕窗口发送当前字幕内容。 */
+async function emitSubtitleOverlay(payload: SubtitleOverlayPayload): Promise<void> {
+  if (windowMode === "subtitle") {
+    renderSubtitleOverlay(payload);
+  }
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const { emitTo } = await import("@tauri-apps/api/event");
+  await emitTo("subtitle", "subtitle-message", payload);
+}
+
+/** 通知字幕历史窗口刷新本地历史。 */
+async function emitSubtitleHistoryUpdate(status: string, listening: boolean): Promise<void> {
+  if (windowMode === "subtitleHistory") {
+    renderSubtitleHistory(status, listening);
+  }
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const { emitTo } = await import("@tauri-apps/api/event");
+  await emitTo("subtitleHistory", "subtitle-history-updated", { status, listening });
+}
+
+/** 根据字幕来源生成历史窗口可读标签。 */
+function formatSubtitleSource(source: SubtitleAudioSource): string {
+  if (source === "mixed") {
+    return "麦克风+系统声音";
+  }
+  if (source === "system") {
+    return "系统声音";
+  }
+  return "麦克风";
+}
+
 /** 临时切换系统输出静音，并返回切换前状态。 */
 async function setSystemOutputMuted(muted: boolean): Promise<boolean | null> {
   if (!isTauriRuntime()) {
@@ -2283,19 +3521,32 @@ async function setSystemOutputMuted(muted: boolean): Promise<boolean | null> {
   }
 }
 
-/** 录音前检查桌面端必要配置，避免用户说完后才发现无法转写。 */
-async function ensureReadyForRecording(): Promise<boolean> {
+/** 录音或字幕前按模式检查必要权限，避免快捷键触发后才静默失败。 */
+async function ensureReadyForRecording(mode: ShortcutMode): Promise<boolean> {
   if (!isTauriRuntime()) {
     return true;
   }
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const diagnostics = await invoke<RuntimeDiagnostics>("get_runtime_diagnostics");
+    const diagnostics = await readRuntimeDiagnostics();
+    const microphoneDiagnostic = await readMicrophoneDiagnostic();
     if (!diagnostics.hasSessionApiKey && !diagnostics.hasKeychainApiKey && !diagnostics.hasEnvApiKey) {
-      setStatus("请先在设置里填写 Mimo API Key 并保存。", "error");
-      await showHubWindow();
-      await switchHubWindowToSettings();
-      window.setTimeout(() => void hideFloatingWindow(), 1800);
+      await showRequiredModePermission(mode, "apiKey", `请设置${SHORTCUT_MODE_LABELS[mode]}的 Mimo Key。`);
+      return false;
+    }
+    if (!diagnostics.shortcutRegistrationReady) {
+      await showRequiredModePermission(mode, "shortcut", `请设置${SHORTCUT_MODE_LABELS[mode]}的快捷键权限。`);
+      return false;
+    }
+    if (microphoneDiagnostic.state !== "success") {
+      await showRequiredModePermission(mode, "microphone", `请设置${SHORTCUT_MODE_LABELS[mode]}的麦克风权限。`);
+      return false;
+    }
+    if ((mode === "dictate" || mode === "translate") && !diagnostics.accessibilityTrusted) {
+      await showRequiredModePermission(mode, "accessibility", `请设置${SHORTCUT_MODE_LABELS[mode]}的自动粘贴权限。`);
+      return false;
+    }
+    if (mode === "subtitle" && readSavedConfig().systemAudioDeviceId === "none") {
+      await showRequiredModePermission(mode, "systemAudio", "请设置实时字幕的系统声音来源。");
       return false;
     }
     return true;
@@ -2305,10 +3556,38 @@ async function ensureReadyForRecording(): Promise<boolean> {
   }
 }
 
-/** 请求 Hub 切换到设置页，用于权限或配置缺失时减少用户操作。 */
-async function switchHubWindowToSettings(): Promise<void> {
+/** 缺少模式权限时展示明确提示，并把 Hub 带到对应模式详情。 */
+async function showRequiredModePermission(mode: ShortcutMode, kind: PermissionKind, message: string): Promise<void> {
   if (windowMode === "hub") {
-    switchHubView("settings");
+    switchHubView(MODE_DETAIL_VIEWS[mode]);
+    openPermissionDialog(mode, kind);
+    showHubNotice(message, "error");
+    return;
+  }
+  setStatus(message, "error");
+  await showHubWindow();
+  await switchHubWindowToModeDetail(mode, kind);
+  window.setTimeout(() => void hideFloatingWindow(), 1800);
+}
+
+/** Hub 中点击模式启动但权限不足时，打开第一项缺失权限说明。 */
+async function showFirstMissingModePermission(mode: ShortcutMode): Promise<void> {
+  const missingPermission = readModePermissions(mode).find((permission) => !permission.ready);
+  if (!missingPermission) {
+    return;
+  }
+  await showRequiredModePermission(
+    mode,
+    missingPermission.kind,
+    `请设置${SHORTCUT_MODE_LABELS[mode]}的${missingPermission.label}。`,
+  );
+}
+
+/** 请求 Hub 切换到指定模式详情页，用于快捷键权限缺失时减少用户寻找路径。 */
+async function switchHubWindowToModeDetail(mode: ShortcutMode, kind: PermissionKind): Promise<void> {
+  if (windowMode === "hub") {
+    switchHubView(MODE_DETAIL_VIEWS[mode]);
+    openPermissionDialog(mode, kind);
     return;
   }
   if (!isTauriRuntime()) {
@@ -2316,7 +3595,7 @@ async function switchHubWindowToSettings(): Promise<void> {
   }
   try {
     const { emitTo } = await import("@tauri-apps/api/event");
-    await emitTo("hub", "hub-switch-view", "settings");
+    await emitTo("hub", "hub-switch-view", MODE_DETAIL_VIEWS[mode]);
   } catch {
     // Hub 已经打开时，事件失败不影响错误提示本身。
   }
@@ -2850,19 +4129,6 @@ async function readFrontmostApp(): Promise<string> {
   }
 }
 
-/** 读取 Rust 侧保存的录音目标 App，重启后首次录音也尽量保住自动粘贴目标。 */
-async function readRecordingTargetApp(): Promise<string> {
-  if (!isTauriRuntime()) {
-    return "";
-  }
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<string>("get_recording_target_app");
-  } catch {
-    return "";
-  }
-}
-
 /** 清理 typesass 自身窗口名，避免把悬浮窗当成最终粘贴目标。 */
 function normalizeRecordingTargetApp(appName: string): string {
   const normalizedAppName = appName.trim();
@@ -2931,7 +4197,7 @@ async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
       level: "info",
       category: "paste",
       title: "开始自动粘贴",
-      message: "正在写入剪贴板并请求系统粘贴到目标输入框。",
+      message: "正在临时写入剪贴板，请求系统粘贴后会恢复原剪贴板。",
       targetApp,
       details: [`输出字数：${countTextUnits(text)}`],
     });
@@ -2946,12 +4212,18 @@ async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
       pasteMethod: response.pasteMethod,
       accessibilityTrusted: response.accessibilityTrusted,
       clipboardWritten: response.clipboardWritten,
+      clipboardMatchesExpected: response.clipboardMatchesExpected,
+      clipboardRestoreAttempted: response.clipboardRestoreAttempted,
+      clipboardRestored: response.clipboardRestored,
+      clipboardRestoreMessage: response.clipboardRestoreMessage,
+      insertionVerified: response.insertionVerified,
+      verificationStatus: response.verificationStatus,
       focusedElementBeforePaste: response.focusedElementBeforePaste,
       focusedElementAfterActivate: response.focusedElementAfterActivate,
       focusedElementAfterPaste: response.focusedElementAfterPaste,
       details: [
         `发送前：${response.frontmostBeforePaste || "未知"}`,
-        `激活后：${response.frontmostAfterActivate || "未知"}`,
+        "前台切换：未执行",
         `发送后：${response.frontmostAfterPaste || "未知"}`,
       ],
     });
@@ -3022,7 +4294,7 @@ function renderResultWindow(payload: ResultWindowPayload): void {
   }
   const text = payload.text.trim();
   resultWindowTextarea.value = text;
-  resultReason.textContent = payload.reason || "自动粘贴没有完成，结果已写入剪贴板。";
+  resultReason.textContent = payload.reason || "自动粘贴没有完成，结果未覆盖原剪贴板。";
   resultReason.dataset.state = payload.requiresAccessibility ? "warning" : "idle";
   resultCopyButton.disabled = !text;
   resultOpenAccessibilityButton.disabled = false;
@@ -3161,18 +4433,29 @@ function updateActionButtonIcon(button: HTMLButtonElement, iconName: IconName): 
 
 /** 根据准备状态同步所有开始按钮，避免未就绪时误唤起悬浮条再报错。 */
 function syncStartActionButtons(): void {
-  const isReady = nextReadinessAction === "start";
-  const sharedLabel = isReady ? MODE_START_LABELS.dictate : "继续配置";
-  const sharedIcon = isReady ? "play" : "setting";
-  updateActionButtonLabel(quickStartButton, sharedLabel);
-  updateActionButtonIcon(quickStartButton, sharedIcon);
-  quickStartButton.title = isReady ? sharedLabel : "继续完成必要配置";
+  const isDictateReady = isModePermissionReady("dictate");
+  const quickLabel = isDictateReady ? MODE_START_LABELS.dictate : "继续配置";
+  updateActionButtonLabel(quickStartButton, quickLabel);
+  updateActionButtonIcon(quickStartButton, isDictateReady ? "play" : "setting");
+  quickStartButton.title = isDictateReady ? quickLabel : "继续完成口述需要的权限";
   document.querySelectorAll<HTMLButtonElement>("[data-mode-start]").forEach((button) => {
     const mode = normalizeMode(button.dataset.modeStart);
+    const isReady = isModePermissionReady(mode);
     updateActionButtonLabel(button, isReady ? MODE_START_LABELS[mode] : "继续配置");
     updateActionButtonIcon(button, isReady ? MODE_ACTION_ICONS[mode] : "setting");
-    button.title = isReady ? MODE_START_LABELS[mode] : "继续完成必要配置";
+    button.title = isReady ? MODE_START_LABELS[mode] : `继续完成${MODE_LABELS[mode]}需要的权限`;
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-subtitle-toggle]").forEach((button) => {
+    const isReady = isModePermissionReady("subtitle");
+    updateActionButtonLabel(button, isReady ? "开启字幕" : "继续配置");
+    updateActionButtonIcon(button, isReady ? "microphone" : "setting");
+    button.title = isReady ? "开启实时字幕" : "继续完成实时字幕需要的权限";
+  });
+}
+
+/** 判断某个模式自己的权限是否满足启动条件。 */
+function isModePermissionReady(mode: ShortcutMode): boolean {
+  return readModePermissions(mode).every((permission) => permission.ready);
 }
 
 /** 渲染 Hub 中所有本地数据。 */
@@ -3185,6 +4468,7 @@ function renderHub(): void {
   renderHistory();
   renderDictionary();
   renderDiagnosticLog();
+  renderModePermissions();
   const latest = readHistory()[0];
   updateRecentResult(latest || null);
 }
@@ -3368,7 +4652,7 @@ function renderDiagnosticLogItem(item: DiagnosticLogItem): string {
 function buildDiagnosticLogDetails(item: DiagnosticLogItem): string[] {
   const details: string[] = [];
   if (item.mode) {
-    details.push(`模式：${MODE_LABELS[item.mode]}`);
+    details.push(`模式：${SHORTCUT_MODE_LABELS[item.mode]}`);
   }
   if (item.targetApp) {
     details.push(`目标：${item.targetApp}`);
@@ -3383,13 +4667,28 @@ function buildDiagnosticLogDetails(item: DiagnosticLogItem): string[] {
     details.push(`辅助功能：${item.accessibilityTrusted ? "已授权" : "未授权"}`);
   }
   if (typeof item.clipboardWritten === "boolean") {
-    details.push(`剪贴板：${item.clipboardWritten ? "已写入" : "未写入"}`);
+    details.push(`临时剪贴板：${item.clipboardWritten ? "已写入" : "未写入"}`);
+  }
+  if (typeof item.clipboardMatchesExpected === "boolean") {
+    details.push(`临时剪贴板校验：${item.clipboardMatchesExpected ? "一致" : "不一致"}`);
+  }
+  if (typeof item.clipboardRestoreAttempted === "boolean") {
+    details.push(`原剪贴板恢复：${item.clipboardRestored ? "已恢复" : item.clipboardRestoreAttempted ? "恢复失败" : "未改动"}`);
+  }
+  if (item.clipboardRestoreMessage) {
+    details.push(`恢复说明：${item.clipboardRestoreMessage}`);
+  }
+  if (typeof item.insertionVerified === "boolean") {
+    details.push(`插入校验：${item.insertionVerified ? "已确认" : "快速模式未回读"}`);
+  }
+  if (item.verificationStatus) {
+    details.push(`校验说明：${item.verificationStatus}`);
   }
   if (item.focusedElementBeforePaste) {
     details.push(`焦点发送前：${item.focusedElementBeforePaste}`);
   }
   if (item.focusedElementAfterActivate) {
-    details.push(`焦点激活后：${item.focusedElementAfterActivate}`);
+    details.push(`焦点发送方式：${item.focusedElementAfterActivate}`);
   }
   if (item.focusedElementAfterPaste) {
     details.push(`焦点发送后：${item.focusedElementAfterPaste}`);
@@ -3413,6 +4712,7 @@ function addDiagnosticLog(draft: DiagnosticLogDraft): void {
     focusedElementBeforePaste: normalizeOptionalText(draft.focusedElementBeforePaste),
     focusedElementAfterActivate: normalizeOptionalText(draft.focusedElementAfterActivate),
     focusedElementAfterPaste: normalizeOptionalText(draft.focusedElementAfterPaste),
+    verificationStatus: normalizeOptionalText(draft.verificationStatus),
     details: (draft.details || []).map((detail) => detail.trim()).filter(Boolean),
   };
   const logs = [item, ...readDiagnosticLogs()].slice(0, MAX_DIAGNOSTIC_LOG_ITEMS);
@@ -3459,6 +4759,15 @@ function normalizeDiagnosticLogItem(value: Partial<DiagnosticLogItem>): Diagnost
     accessibilityTrusted:
       typeof value.accessibilityTrusted === "boolean" ? value.accessibilityTrusted : undefined,
     clipboardWritten: typeof value.clipboardWritten === "boolean" ? value.clipboardWritten : undefined,
+    clipboardMatchesExpected:
+      typeof value.clipboardMatchesExpected === "boolean" ? value.clipboardMatchesExpected : undefined,
+    clipboardRestoreAttempted:
+      typeof value.clipboardRestoreAttempted === "boolean" ? value.clipboardRestoreAttempted : undefined,
+    clipboardRestored: typeof value.clipboardRestored === "boolean" ? value.clipboardRestored : undefined,
+    clipboardRestoreMessage:
+      typeof value.clipboardRestoreMessage === "string" ? value.clipboardRestoreMessage : undefined,
+    insertionVerified: typeof value.insertionVerified === "boolean" ? value.insertionVerified : undefined,
+    verificationStatus: normalizeOptionalText(value.verificationStatus),
     elapsedMs: typeof value.elapsedMs === "number" ? value.elapsedMs : undefined,
     details: Array.isArray(value.details)
       ? value.details.filter((detail): detail is string => typeof detail === "string" && Boolean(detail.trim()))
@@ -3483,8 +4792,8 @@ function normalizeDiagnosticLogCategory(value: unknown): DiagnosticLogCategory {
 }
 
 /** 规范化可选语音模式，非法值直接不展示。 */
-function normalizeOptionalMode(value: unknown): VoiceMode | undefined {
-  if (value === "dictate" || value === "translate" || value === "ask") {
+function normalizeOptionalMode(value: unknown): ShortcutMode | undefined {
+  if (value === "dictate" || value === "translate" || value === "ask" || value === "subtitle") {
     return value;
   }
   return undefined;
@@ -3639,6 +4948,79 @@ function saveHistory(item: HistoryItem): HistoryItem {
 /** 写入历史记录。 */
 function writeHistory(history: HistoryItem[]): void {
   localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history));
+}
+
+/** 读取本地字幕历史，异常时返回空数组。 */
+function readSubtitleHistory(): SubtitleHistoryItem[] {
+  const raw = localStorage.getItem(SUBTITLE_HISTORY_STORAGE_KEY);
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<SubtitleHistoryItem>[];
+    const items = parsed
+      .map(normalizeSubtitleHistoryItem)
+      .filter((item): item is SubtitleHistoryItem => Boolean(item))
+      .sort((left, right) => right.createdAt - left.createdAt);
+    return applySubtitleHistoryRetention(items);
+  } catch {
+    return [];
+  }
+}
+
+/** 对字幕历史记录做类型兜底。 */
+function normalizeSubtitleHistoryItem(value: Partial<SubtitleHistoryItem>): SubtitleHistoryItem | null {
+  if (typeof value.id !== "string" || typeof value.text !== "string" || !value.text.trim()) {
+    return null;
+  }
+  return {
+    id: value.id,
+    text: value.text,
+    createdAt: typeof value.createdAt === "number" ? value.createdAt : Date.now(),
+    source: normalizeSubtitleAudioSource(value.source),
+    elapsedMs: typeof value.elapsedMs === "number" ? value.elapsedMs : 0,
+    model: typeof value.model === "string" ? value.model : "",
+  };
+}
+
+/** 规范化字幕音频来源，避免旧数据破坏渲染。 */
+function normalizeSubtitleAudioSource(value: unknown): SubtitleAudioSource {
+  if (value === "system" || value === "mixed") {
+    return value;
+  }
+  return "microphone";
+}
+
+/** 按通用历史保留策略过滤字幕历史。 */
+function applySubtitleHistoryRetention(items: SubtitleHistoryItem[]): SubtitleHistoryItem[] {
+  const retention = readSavedConfig().historyRetention;
+  if (retention === "never") {
+    return [];
+  }
+  if (retention === "forever") {
+    return items;
+  }
+  const days = Number(retention);
+  const threshold = Date.now() - days * 24 * 60 * 60 * 1000;
+  return items.filter((item) => item.createdAt >= threshold);
+}
+
+/** 保存一条字幕历史，并过滤短时间内完全相同的重复记录。 */
+function saveSubtitleHistory(item: SubtitleHistoryItem): SubtitleHistoryItem {
+  if (readSavedConfig().historyRetention === "never") {
+    return item;
+  }
+  const latest = readSubtitleHistory()[0];
+  if (latest && normalizeSubtitleText(latest.text) === normalizeSubtitleText(item.text) && item.createdAt - latest.createdAt < 3000) {
+    return item;
+  }
+  writeSubtitleHistory([item, ...readSubtitleHistory()]);
+  return item;
+}
+
+/** 写入本地字幕历史。 */
+function writeSubtitleHistory(items: SubtitleHistoryItem[]): void {
+  localStorage.setItem(SUBTITLE_HISTORY_STORAGE_KEY, JSON.stringify(items.slice(0, MAX_SUBTITLE_HISTORY_ITEMS)));
 }
 
 /** 渲染最近结果。 */

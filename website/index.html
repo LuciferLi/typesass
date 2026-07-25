@@ -423,6 +423,42 @@
         object-position: top center;
       }
 
+      .shortcutPreviewMask {
+        position: absolute;
+        z-index: 6;
+        display: grid;
+        gap: 6px;
+        border: 1px solid rgba(16, 185, 129, 0.28);
+        border-radius: 16px;
+        padding: 12px 13px;
+        background:
+          linear-gradient(135deg, rgba(16, 185, 129, 0.13), transparent),
+          rgba(8, 10, 12, 0.94);
+        color: #8df5cf;
+        box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+        backdrop-filter: blur(14px);
+        pointer-events: none;
+      }
+
+      .shortcutPreviewMask strong {
+        color: #d7fff0;
+        font-size: 12px;
+        line-height: 1.2;
+      }
+
+      .shortcutPreviewMask span {
+        color: rgba(141, 245, 207, 0.78);
+        font-size: 10px;
+        font-weight: 800;
+        line-height: 1.2;
+      }
+
+      .screenFrame .shortcutPreviewMask {
+        top: 118px;
+        right: 26px;
+        width: 158px;
+      }
+
       .pillDemo {
         position: absolute;
         top: 108px;
@@ -1294,6 +1330,12 @@
         object-position: top center;
       }
 
+      .screenshotShell .shortcutPreviewMask {
+        top: 22%;
+        right: 7%;
+        width: min(26%, 190px);
+      }
+
       .modeGrid {
         display: grid;
         grid-template-columns: 280px minmax(0, 1fr);
@@ -2020,7 +2062,7 @@
             <div class="eyebrow"><i aria-hidden="true"></i>桌面端 AI 语音输入工具</div>
             <h1 class="heroTitle">typesass <span>让任何输入框听懂你说的话。</span></h1>
             <p class="heroCopy">
-              typesass 是一个常驻桌面的 AI 语音输入工具：按 Ctrl+P 录音，
+              typesass 是一个常驻桌面的 AI 语音输入工具：按你设置的快捷键录音，
               用 Mimo 语音识别转成文字，再让 AI 总结、润色、翻译或回答，最后把结果写回当前输入框。
               它把隐私、速度和可控性放在第一位，密钥保存在系统安全存储中，历史和词典默认只留在本机。
             </p>
@@ -2030,8 +2072,8 @@
             </div>
             <div class="heroStats" aria-label="产品亮点">
               <div class="statTile">
-                <span>默认口述快捷键</span>
-                <strong>Ctrl+P</strong>
+                <span>快捷键策略</span>
+                <strong>可自定义</strong>
               </div>
               <div class="statTile">
                 <span>核心闭环</span>
@@ -2117,7 +2159,7 @@
                 <div class="terminalLines">
                   <div class="terminalLine">
                     <strong>触发</strong>
-                    <span>Ctrl+P 口述，Ctrl+T 翻译，Ctrl+Space 随便问。</span>
+                    <span>口述、翻译、随便问都可以配置自己的触发方式。</span>
                   </div>
                   <div class="terminalLine">
                     <strong>采集</strong>
@@ -2154,9 +2196,9 @@
 
             <div class="capabilityGrid" aria-label="typesass 核心功能">
               <article class="capabilityCard isActive reveal">
-                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkKeyboard"></use></svg></span><span class="capabilityTag">Ctrl+P</span></div>
+                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkKeyboard"></use></svg></span><span class="capabilityTag">可配置</span></div>
                 <strong>快捷键口述</strong>
-                <p>后台驻留，按 Ctrl+P 开始和停止录音，不需要切换应用。</p>
+                <p>后台驻留，按你设置的快捷键开始和停止录音，不需要切换应用。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
@@ -2327,7 +2369,7 @@
                 </div>
                 <div class="modeCaption">
                   <strong id="modeCaptionTitle">口述模式</strong>
-                  <span id="modeShortcut">Ctrl+P</span>
+                  <span id="modeShortcut">快捷键可配置</span>
                 </div>
               </article>
             </div>
@@ -2462,7 +2504,7 @@
             <article class="ctaPanel reveal">
               <div class="ctaContent">
                 <div class="sectionKicker">开始使用</div>
-                <h2 class="sectionTitle">按下 Ctrl+P，把说出来的话变成可发送文本。</h2>
+                <h2 class="sectionTitle">按下你设置的快捷键，把说出来的话变成可发送文本。</h2>
                 <p class="sectionCopy">
                   typesass 的核心不是多开一个聊天窗口，而是让语音直接进入你正在使用的输入框。
                   从口述到总结、润色、翻译、问答和粘贴，整个链路都围绕“少打字、少复制、少切换”。
@@ -2601,19 +2643,19 @@
       const modeData = {
         dictate: {
           title: "口述模式",
-          shortcut: "Ctrl+P",
+          shortcut: "快捷键可配置",
           image: "./assets/modesView.png",
           alt: "typesass 语音模式设置截图",
         },
         translate: {
           title: "翻译模式",
-          shortcut: "Ctrl+T",
+          shortcut: "快捷键可配置",
           image: "./assets/modesView.png",
           alt: "typesass 翻译模式设置截图",
         },
         ask: {
           title: "随便问模式",
-          shortcut: "Ctrl+Space",
+          shortcut: "快捷键可配置",
           image: "./assets/historyView.png",
           alt: "typesass 历史结果截图",
         },
@@ -2624,7 +2666,7 @@
       const modeCaptionTitle = document.querySelector("#modeCaptionTitle");
       const modeShortcut = document.querySelector("#modeShortcut");
 
-      // 切换三种语音模式的截图、标题和快捷键标签。
+      // 切换三种语音模式的截图、标题和配置提示。
       modeButtons.forEach((button) => {
         button.addEventListener("click", () => {
           const mode = button.dataset.mode;

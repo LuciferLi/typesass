@@ -1,15 +1,27 @@
 use std::env;
 use std::fs;
+#[cfg(not(target_os = "macos"))]
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(target_os = "macos"))]
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, LogicalPosition, Manager, Position, State};
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size, State};
+
+#[cfg(target_os = "macos")]
+use objc2::rc::{autoreleasepool, Retained};
+#[cfg(target_os = "macos")]
+use objc2::runtime::ProtocolObject;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPasteboardWriting};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSArray, NSData, NSString};
 
 const DEFAULT_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
 const DEFAULT_ASR_MODEL: &str = "mimo-v2.5-asr";
@@ -17,6 +29,7 @@ const DEFAULT_TEXT_MODEL: &str = "mimo-v2.5";
 const DEFAULT_DICTATE_SHORTCUT: &str = "ctrl+p";
 const DEFAULT_TRANSLATE_SHORTCUT: &str = "ctrl+t";
 const DEFAULT_ASK_SHORTCUT: &str = "ctrl+space";
+const DEFAULT_SUBTITLE_SHORTCUT: &str = "ctrl+shift+s";
 const LOGIN_AGENT_LABEL: &str = "asia.aijob.aitool.login";
 const KEYCHAIN_SERVICE: &str = "asia.aijob.aitool";
 const KEYCHAIN_ACCOUNT: &str = "mimo-api-key";
@@ -26,6 +39,17 @@ const TOAST_WINDOW_WIDTH: f64 = 460.0;
 const TOAST_WINDOW_TOP: f64 = 42.0;
 const RESULT_WINDOW_WIDTH: f64 = 520.0;
 const RESULT_WINDOW_TOP: f64 = 76.0;
+const SUBTITLE_WINDOW_WIDTH: f64 = 1000.0;
+const SUBTITLE_WINDOW_HEIGHT: f64 = 170.0;
+const SUBTITLE_WINDOW_BOTTOM: f64 = 54.0;
+const SUBTITLE_HISTORY_WINDOW_WIDTH: f64 = 360.0;
+const SUBTITLE_HISTORY_WINDOW_HEIGHT: f64 = 460.0;
+const SUBTITLE_HISTORY_WINDOW_TOP: f64 = 72.0;
+const SUBTITLE_HISTORY_WINDOW_RIGHT: f64 = 28.0;
+const CLIPBOARD_VERIFY_INITIAL_DELAY_MS: u64 = 30;
+const CLIPBOARD_VERIFY_RETRY_STEP_MS: u64 = 80;
+const CLIPBOARD_RESTORE_DELAY_MS: u64 = 80;
+const PASTE_DIAGNOSTIC_SETTLE_DELAY_MS: u64 = 30;
 
 /// 运行期间保存的敏感配置，只放内存，不写入本地文件。
 #[derive(Default)]
@@ -36,7 +60,7 @@ struct RuntimeSecrets {
 
 /// 运行期间保存的全局快捷键映射。
 struct RuntimeShortcuts {
-    /// 三种模式当前实际注册的快捷键。
+    /// 各模式当前实际注册的快捷键。
     profile: Mutex<ShortcutProfile>,
     /// 最近一次系统快捷键注册结果，用于设置页展示真实诊断。
     registration_status: Mutex<ShortcutRegistrationStatus>,
@@ -51,34 +75,23 @@ impl Default for RuntimeShortcuts {
     }
 }
 
-/// 运行期间保存最近一次外部前台 App，Hub 前台时用于恢复真实粘贴目标。
-#[derive(Default)]
-struct RuntimeFocus {
-    /// 最近一次非 typesass 的前台应用名称。
-    last_external_app: Mutex<String>,
-}
-
 /// 全局快捷键触发录音时的窗口和目标 App 决策。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VoiceTriggerContext {
-    /// 本次录音结束后允许恢复的目标 App，Hub 前台触发时必须为空。
+    /// 本次录音触发时观测到的外部 App，仅用于日志展示。
     target_app: String,
     /// 是否需要展示顶部悬浮胶囊。
     show_floating_window: bool,
     /// 是否必须保持 Hub 主界面不受录音影响。
     keep_hub_visible: bool,
-    /// 是否需要把焦点恢复给目标 App。
-    restore_target_focus: bool,
 }
 
-/// 自动粘贴前的目标 App 与窗口隐藏决策。
+/// 自动粘贴前的当前焦点 App 与主界面保留决策。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasteTargetDecision {
-    /// 本次粘贴应恢复的目标 App。
+    /// 本次粘贴时系统当前前台 App；只用于日志和是否允许发送粘贴。
     target_app: String,
-    /// 是否需要激活目标 App。
-    should_activate_target: bool,
-    /// 是否允许隐藏 Hub 以避免粘贴回 typesass。
+    /// 是否允许隐藏 Hub；默认保留，避免粘贴时主界面被收起。
     should_hide_hub: bool,
 }
 
@@ -86,7 +99,7 @@ struct PasteTargetDecision {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShortcutRegistrationStatus {
-    /// 三种模式快捷键是否已成功注册到系统。
+    /// 各模式快捷键是否已成功注册到系统。
     ready: bool,
     /// 最近一次注册结果说明；失败时包含系统返回原因。
     message: String,
@@ -108,7 +121,7 @@ struct RuntimeResult {
     payload: Mutex<Option<ResultWindowPayload>>,
 }
 
-/// 前端提交的三种语音模式快捷键。
+/// 前端提交的全局模式快捷键。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShortcutProfile {
@@ -118,6 +131,8 @@ struct ShortcutProfile {
     translate: String,
     /// 随便问模式快捷键。
     ask: String,
+    /// 实时字幕监听模式快捷键。
+    subtitle: String,
 }
 
 impl Default for ShortcutProfile {
@@ -126,6 +141,7 @@ impl Default for ShortcutProfile {
             dictate: DEFAULT_DICTATE_SHORTCUT.to_string(),
             translate: DEFAULT_TRANSLATE_SHORTCUT.to_string(),
             ask: DEFAULT_ASK_SHORTCUT.to_string(),
+            subtitle: DEFAULT_SUBTITLE_SHORTCUT.to_string(),
         }
     }
 }
@@ -212,7 +228,7 @@ struct ProcessTextResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PasteResponse {
-    /// 是否成功触发系统粘贴。
+    /// 是否已成功发出系统粘贴指令；macOS 不提供可靠的目标输入框插入回调。
     pasted: bool,
     /// 给前端展示的执行说明。
     message: String,
@@ -222,6 +238,14 @@ struct PasteResponse {
     target_app: String,
     /// 是否已成功写入系统剪贴板。
     clipboard_written: bool,
+    /// 剪贴板读回内容是否与本次输出一致。
+    clipboard_matches_expected: bool,
+    /// 是否尝试恢复用户原本的系统剪贴板。
+    clipboard_restore_attempted: bool,
+    /// 用户原本的系统剪贴板是否已恢复。
+    clipboard_restored: bool,
+    /// 剪贴板恢复状态说明，不包含剪贴板正文。
+    clipboard_restore_message: String,
     /// 触发粘贴前检测到的辅助功能授权状态。
     accessibility_trusted: bool,
     /// 本次粘贴指令实际使用的触发方式。
@@ -232,6 +256,10 @@ struct PasteResponse {
     frontmost_after_activate: String,
     /// 发送粘贴指令后的系统前台应用。
     frontmost_after_paste: String,
+    /// 是否已从目标输入框文本中确认本次输出。
+    insertion_verified: bool,
+    /// 粘贴校验的说明，不包含目标输入框正文。
+    verification_status: String,
     /// 发送粘贴指令前目标 App 内的系统焦点元素。
     focused_element_before_paste: String,
     /// 激活目标 App 后的系统焦点元素。
@@ -247,6 +275,40 @@ struct PasteTriggerResult {
     accessibility_ready: bool,
     /// 实际使用的系统粘贴触发方式。
     method: String,
+}
+
+/// 系统剪贴板中单个数据类型的二进制快照。
+#[derive(Debug, Clone)]
+struct ClipboardRepresentationSnapshot {
+    /// macOS Pasteboard 数据类型名称。
+    type_name: String,
+    /// 对应数据类型的原始二进制内容。
+    data: Vec<u8>,
+}
+
+/// 系统剪贴板中单个条目的快照，保留文件、图片、富文本等多类型数据。
+#[derive(Debug, Clone)]
+struct ClipboardItemSnapshot {
+    /// 当前条目下可恢复的数据表示列表。
+    representations: Vec<ClipboardRepresentationSnapshot>,
+}
+
+/// 系统剪贴板完整快照，用于自动粘贴后恢复用户原本剪切或复制的内容。
+#[derive(Debug, Clone)]
+struct ClipboardSnapshot {
+    /// 剪贴板条目列表；为空代表原剪贴板为空。
+    items: Vec<ClipboardItemSnapshot>,
+}
+
+/// 自动粘贴结束后的原剪贴板恢复状态。
+#[derive(Debug, Clone)]
+struct ClipboardRestoreStatus {
+    /// 是否执行过恢复动作。
+    attempted: bool,
+    /// 恢复动作是否成功。
+    restored: bool,
+    /// 面向诊断日志的恢复说明。
+    message: String,
 }
 
 /// 返回给前端的桌面运行状态诊断。
@@ -295,7 +357,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(RuntimeSecrets::default())
         .manage(RuntimeShortcuts::default())
-        .manage(RuntimeFocus::default())
         .manage(RuntimeResult::default())
         .setup(|app| {
             #[cfg(desktop)]
@@ -349,23 +410,23 @@ pub fn run() {
             hide_toast_window,
             show_result_window,
             hide_result_window,
+            show_subtitle_windows,
+            hide_subtitle_windows,
             get_last_result_window_payload,
             register_shortcuts,
             get_runtime_diagnostics,
             open_accessibility_settings,
+            open_microphone_settings,
             set_login_launch,
             get_login_launch,
             set_dock_visible,
             get_frontmost_app,
-            get_recording_target_app,
-            activate_app,
             set_system_output_muted
         ])
         .build(tauri::generate_context!())
         .expect("启动 typesass 失败")
         .run(|app, event| {
             if let tauri::RunEvent::Reopen { .. } = event {
-                remember_current_external_app(app);
                 let _ = present_window(app, "hub", false);
             }
         });
@@ -478,7 +539,6 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
 /// 打开 Hub 并切到指定页面，供托盘菜单复用。
 #[cfg(desktop)]
 fn present_hub_view(app: &AppHandle, view: &str) {
-    remember_current_external_app(app);
     let _ = present_window(app, "hub", false);
     emit_hub_event(app.clone(), "hub-switch-view", view.to_string());
 }
@@ -492,93 +552,34 @@ fn emit_hub_event(app: AppHandle, event: &'static str, payload: String) {
     });
 }
 
-/// 记住当前非 typesass 前台 App，避免 Hub 抢焦点后丢失自动粘贴目标。
-fn remember_current_external_app(app: &AppHandle) -> String {
-    get_frontmost_app()
-        .map(|app_name| remember_external_app(app, &app_name))
-        .unwrap_or_default()
-}
-
-/// 读取当前外部目标 App；如果当前前台是 typesass，则回退到最近一次外部 App。
-fn read_external_target_app(app: &AppHandle) -> String {
-    let current_app = get_frontmost_app().unwrap_or_default();
-    let normalized_current_app = normalize_target_app_name(&current_app);
-    if !normalized_current_app.is_empty() {
-        return remember_external_app(app, &normalized_current_app);
-    }
-    read_last_external_app(app)
-}
-
-/// 写入最近一次外部 App 名称，空值或 typesass 自身不会覆盖旧目标。
-fn remember_external_app(app: &AppHandle, app_name: &str) -> String {
-    let normalized_app_name = normalize_target_app_name(app_name);
-    if normalized_app_name.is_empty() {
-        return String::new();
-    }
-    let focus_state = app.state::<RuntimeFocus>();
-    if let Ok(mut last_external_app) = focus_state.last_external_app.lock() {
-        *last_external_app = normalized_app_name.clone();
-    }
-    normalized_app_name
-}
-
-/// 读取最近一次外部 App 名称，状态锁异常时回退为空，避免中断主链路。
-fn read_last_external_app(app: &AppHandle) -> String {
-    let focus_state = app.state::<RuntimeFocus>();
-    focus_state
-        .last_external_app
-        .lock()
-        .map(|app_name| normalize_target_app_name(&app_name))
-        .unwrap_or_default()
-}
-
-/// 根据当前前台 App 计算快捷键录音行为；Hub 前台时不复用历史外部目标。
-fn resolve_voice_trigger_context(
-    frontmost_app: &str,
-    _last_external_app: &str,
-) -> VoiceTriggerContext {
+/// 根据当前前台 App 计算快捷键录音行为；不主动恢复目标 App，避免录音流程切换焦点。
+fn resolve_voice_trigger_context(frontmost_app: &str) -> VoiceTriggerContext {
     let normalized_frontmost_app = normalize_target_app_name(frontmost_app);
     if normalized_frontmost_app.is_empty() {
         return VoiceTriggerContext {
             target_app: String::new(),
             show_floating_window: false,
             keep_hub_visible: true,
-            restore_target_focus: false,
         };
     }
     VoiceTriggerContext {
         target_app: normalized_frontmost_app,
         show_floating_window: true,
         keep_hub_visible: false,
-        restore_target_focus: true,
     }
 }
 
-/// 根据请求目标和当前前台 App 计算粘贴行为；无目标且 typesass 前台时不隐藏 Hub。
-fn resolve_paste_target(
-    requested_target_app: &str,
-    frontmost_app: &str,
-    _last_external_app: &str,
-) -> PasteTargetDecision {
-    let normalized_requested_app = normalize_target_app_name(requested_target_app);
-    if !normalized_requested_app.is_empty() {
-        return PasteTargetDecision {
-            target_app: normalized_requested_app,
-            should_activate_target: true,
-            should_hide_hub: true,
-        };
-    }
+/// 根据当前前台 App 计算粘贴行为；请求目标只用于兼容旧调用，不参与恢复或激活。
+fn resolve_paste_target(_requested_target_app: &str, frontmost_app: &str) -> PasteTargetDecision {
     let normalized_frontmost_app = normalize_target_app_name(frontmost_app);
     if !normalized_frontmost_app.is_empty() {
         return PasteTargetDecision {
             target_app: normalized_frontmost_app,
-            should_activate_target: true,
-            should_hide_hub: true,
+            should_hide_hub: false,
         };
     }
     PasteTargetDecision {
         target_app: String::new(),
-        should_activate_target: false,
         should_hide_hub: false,
     }
 }
@@ -631,16 +632,41 @@ fn emit_hub_notice(app: &AppHandle, message: &str, state: &str) {
 /// 根据全局快捷键字符串判断目标模式，并通知悬浮窗开始或停止。
 fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
     let mode = shortcut_to_mode(&app, &shortcut);
+    if mode == "subtitle" {
+        trigger_subtitle_mode(app);
+        return;
+    }
     trigger_voice_mode(app, &mode);
+}
+
+/// 按实时字幕快捷键进入或退出字幕监听模式，不展示普通录音胶囊。
+fn trigger_subtitle_mode(app: tauri::AppHandle) {
+    if let Some(result) = app.get_webview_window("result") {
+        let _ = result.hide();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(120));
+        if let Some(window) = app.get_webview_window("main") {
+            let script = r#"if (window.__AIToolHandleShortcutMode) {
+                    window.__AIToolHandleShortcutMode("subtitle", "", false);
+                } else {
+                    window.__AIToolPendingShortcutMode = { mode: "subtitle", targetApp: "", keepHubVisible: false };
+                }"#;
+            let _ = window.eval(script);
+        }
+    });
 }
 
 /// 按指定模式通知悬浮录音条开始或停止。
 fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
-    let frontmost_app = get_frontmost_app().unwrap_or_default();
-    let mut context = resolve_voice_trigger_context(&frontmost_app, &read_last_external_app(&app));
-    if !context.target_app.is_empty() {
-        context.target_app = remember_external_app(&app, &context.target_app);
+    if mode.trim().is_empty() {
+        return;
     }
+    let frontmost_app = get_frontmost_app().unwrap_or_default();
+    let context = resolve_voice_trigger_context(&frontmost_app);
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
     }
@@ -648,9 +674,6 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
         let _ = present_window(&app, "main", true);
     } else if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
-    }
-    if context.restore_target_focus && !context.target_app.is_empty() {
-        let _ = activate_macos_app(&context.target_app);
     }
     let mode = mode.to_string();
     let target_app = context.target_app;
@@ -688,8 +711,12 @@ fn shortcut_to_mode(app: &tauri::AppHandle, shortcut: &str) -> String {
         "translate".to_string()
     } else if normalized == normalize_shortcut(&profile.ask) {
         "ask".to_string()
-    } else {
+    } else if normalized == normalize_shortcut(&profile.subtitle) {
+        "subtitle".to_string()
+    } else if normalized == normalize_shortcut(&profile.dictate) {
         "dictate".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -797,6 +824,12 @@ fn open_accessibility_settings() -> Result<(), String> {
     open_accessibility_preferences()
 }
 
+/// 打开 macOS 麦克风权限设置，用于授予语音采集权限。
+#[tauri::command]
+fn open_microphone_settings() -> Result<(), String> {
+    open_microphone_preferences()
+}
+
 /// 读取当前运行时保存的快捷键，用于新配置注册失败后恢复旧快捷键。
 fn read_shortcut_runtime_profile(state: &RuntimeShortcuts) -> Result<ShortcutProfile, String> {
     state
@@ -861,6 +894,7 @@ fn register_shortcut_profile(
         profile.dictate.as_str(),
         profile.translate.as_str(),
         profile.ask.as_str(),
+        profile.subtitle.as_str(),
     ] {
         let normalized = normalize_shortcut(shortcut);
         if seen.insert(normalized) {
@@ -892,12 +926,18 @@ fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfil
         dictate: normalize_shortcut_or_default(&profile.dictate, DEFAULT_DICTATE_SHORTCUT),
         translate: normalize_shortcut_or_default(&profile.translate, DEFAULT_TRANSLATE_SHORTCUT),
         ask: normalize_shortcut_or_default(&profile.ask, DEFAULT_ASK_SHORTCUT),
+        subtitle: normalize_shortcut_or_default(&profile.subtitle, DEFAULT_SUBTITLE_SHORTCUT),
     };
     let mut seen = std::collections::HashSet::new();
-    for shortcut in [&normalized.dictate, &normalized.translate, &normalized.ask] {
+    for shortcut in [
+        &normalized.dictate,
+        &normalized.translate,
+        &normalized.ask,
+        &normalized.subtitle,
+    ] {
         let key = normalize_shortcut(shortcut);
         if !seen.insert(key) {
-            return Err("三个模式不能使用同一个快捷键".to_string());
+            return Err("四个模式不能使用同一个快捷键".to_string());
         }
     }
     Ok(normalized)
@@ -915,24 +955,69 @@ fn normalize_shortcut_or_default(value: &str, fallback: &str) -> String {
 
 /// 统一快捷键大小写和修饰键别名，便于前后端比较。
 fn normalize_shortcut(value: &str) -> String {
-    value
+    let mut has_ctrl = false;
+    let mut has_cmd = false;
+    let mut has_alt = false;
+    let mut has_shift = false;
+    let mut keys = Vec::new();
+    for part in value
         .trim()
         .to_ascii_lowercase()
         .replace(' ', "")
-        .replace("control+", "ctrl+")
-        .replace("command+", "cmd+")
-        .replace("meta+", "cmd+")
-        .replace("option+", "alt+")
+        .split('+')
+        .filter(|part| !part.is_empty())
+    {
+        match normalize_shortcut_part(part).as_str() {
+            "ctrl" => has_ctrl = true,
+            "cmd" => has_cmd = true,
+            "alt" => has_alt = true,
+            "shift" => has_shift = true,
+            key => keys.push(key.to_string()),
+        }
+    }
+    let mut parts = Vec::new();
+    if has_ctrl {
+        parts.push("ctrl".to_string());
+    }
+    if has_cmd {
+        parts.push("cmd".to_string());
+    }
+    if has_alt {
+        parts.push("alt".to_string());
+    }
+    if has_shift {
+        parts.push("shift".to_string());
+    }
+    parts.extend(keys);
+    parts.join("+")
+}
+
+/// 规范化单个快捷键片段，兼容 Tauri 回调里可能出现的 KeyS / Digit1 等名称。
+fn normalize_shortcut_part(part: &str) -> String {
+    let normalized = match part {
+        "control" => "ctrl".to_string(),
+        "command" | "meta" => "cmd".to_string(),
+        "option" => "alt".to_string(),
+        other => other.to_string(),
+    };
+    if let Some(key) = normalized.strip_prefix("key") {
+        if key.len() == 1 {
+            return key.to_string();
+        }
+    }
+    if let Some(key) = normalized.strip_prefix("digit") {
+        if key.len() == 1 {
+            return key.to_string();
+        }
+    }
+    normalized
 }
 
 /// 显示胶囊悬浮条，供前端在需要时主动唤起。
 #[tauri::command]
 fn show_main_window(app: tauri::AppHandle) -> Result<String, String> {
     let frontmost_app = get_frontmost_app().unwrap_or_default();
-    let mut context = resolve_voice_trigger_context(&frontmost_app, &read_last_external_app(&app));
-    if !context.target_app.is_empty() {
-        context.target_app = remember_external_app(&app, &context.target_app);
-    }
+    let context = resolve_voice_trigger_context(&frontmost_app);
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
     }
@@ -940,9 +1025,6 @@ fn show_main_window(app: tauri::AppHandle) -> Result<String, String> {
         present_window(&app, "main", true)?;
     } else if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
-    }
-    if context.restore_target_focus && !context.target_app.is_empty() {
-        let _ = activate_macos_app(&context.target_app);
     }
     Ok(context.target_app)
 }
@@ -961,7 +1043,6 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
 /// 显示 Hub 主窗口，用于查看历史、词典和设置。
 #[tauri::command]
 fn show_hub_window(app: tauri::AppHandle) -> Result<(), String> {
-    remember_current_external_app(&app);
     present_window(&app, "hub", false)
 }
 
@@ -1103,6 +1184,48 @@ fn hide_result_window(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|error| format!("隐藏结果窗口失败：{}", error))
 }
 
+/// 显示实时字幕底部窗口和右上角历史窗口。
+#[tauri::command]
+fn show_subtitle_windows(app: tauri::AppHandle) -> Result<(), String> {
+    let subtitle = app
+        .get_webview_window("subtitle")
+        .ok_or_else(|| "未找到实时字幕窗口".to_string())?;
+    position_subtitle_window(&app, &subtitle)?;
+    subtitle
+        .set_always_on_top(true)
+        .map_err(|error| format!("设置实时字幕置顶失败：{}", error))?;
+    subtitle
+        .show()
+        .map_err(|error| format!("显示实时字幕窗口失败：{}", error))?;
+
+    let history = app
+        .get_webview_window("subtitleHistory")
+        .ok_or_else(|| "未找到字幕历史窗口".to_string())?;
+    position_subtitle_history_window(&app, &history)?;
+    history
+        .set_always_on_top(true)
+        .map_err(|error| format!("设置字幕历史置顶失败：{}", error))?;
+    history
+        .show()
+        .map_err(|error| format!("显示字幕历史窗口失败：{}", error))
+}
+
+/// 隐藏实时字幕相关窗口，应用继续在后台等待快捷键。
+#[tauri::command]
+fn hide_subtitle_windows(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(subtitle) = app.get_webview_window("subtitle") {
+        subtitle
+            .hide()
+            .map_err(|error| format!("隐藏实时字幕窗口失败：{}", error))?;
+    }
+    if let Some(history) = app.get_webview_window("subtitleHistory") {
+        history
+            .hide()
+            .map_err(|error| format!("隐藏字幕历史窗口失败：{}", error))?;
+    }
+    Ok(())
+}
+
 /// 读取最近一次结果窗口内容，供结果窗口初始化时恢复状态。
 #[tauri::command]
 fn get_last_result_window_payload(
@@ -1163,22 +1286,6 @@ fn get_frontmost_app() -> Result<String, String> {
     }
 }
 
-/// 读取本次录音应恢复的目标 App；当前前台是 typesass 时回退到最近一次外部 App。
-#[tauri::command]
-fn get_recording_target_app(app: tauri::AppHandle) -> Result<String, String> {
-    Ok(read_external_target_app(&app))
-}
-
-/// 激活指定 macOS App，用于转写完成前回到录音触发时的目标输入应用。
-#[tauri::command]
-fn activate_app(app_name: String) -> Result<(), String> {
-    let normalized_app_name = normalize_target_app_name(&app_name);
-    if normalized_app_name.is_empty() {
-        return Ok(());
-    }
-    activate_macos_app(&normalized_app_name)
-}
-
 /// 过滤 typesass 自身窗口，避免把录音浮窗当作自动粘贴目标。
 fn normalize_target_app_name(app_name: &str) -> String {
     let normalized_app_name = app_name.trim();
@@ -1192,34 +1299,52 @@ fn normalize_target_app_name(app_name: &str) -> String {
     normalized_app_name.to_string()
 }
 
-/// 判断当前前台 App 是否仍是自动粘贴目标，避免前台被系统设置等窗口抢走。
-fn is_frontmost_target(frontmost_app: &str, target_app: &str) -> bool {
-    let normalized_target_app = normalize_target_app_name(target_app);
-    !normalized_target_app.is_empty()
-        && normalize_target_app_name(frontmost_app) == normalized_target_app
+/// 自动粘贴的主链路只确认系统粘贴指令是否发出，不等待目标输入框的慢速回读。
+fn should_mark_paste_command_as_sent(
+    accessibility_ready: bool,
+    final_target_ready: bool,
+    insertion_verified: bool,
+) -> bool {
+    let _ = (final_target_ready, insertion_verified);
+    accessibility_ready
 }
 
-/// 当前台在发送粘贴后变成非目标 App 时，允许补救一次，避免粘贴事件落到系统设置。
-fn should_retry_paste_for_target(target_app: &str, frontmost_after_paste: &str) -> bool {
-    let normalized_target_app = normalize_target_app_name(target_app);
-    !normalized_target_app.is_empty()
-        && !is_frontmost_target(frontmost_after_paste, &normalized_target_app)
+/// 根据是否有原剪贴板快照与恢复结果，生成统一的诊断状态。
+fn build_clipboard_restore_status<T, E: ToString>(
+    snapshot: Option<T>,
+    restore_result: Result<(), E>,
+) -> ClipboardRestoreStatus {
+    if snapshot.is_none() {
+        return ClipboardRestoreStatus {
+            attempted: false,
+            restored: false,
+            message: "未获取原剪贴板快照，未执行恢复。".to_string(),
+        };
+    }
+    match restore_result {
+        Ok(()) => ClipboardRestoreStatus {
+            attempted: true,
+            restored: true,
+            message: "已恢复用户原剪贴板。".to_string(),
+        },
+        Err(error) => ClipboardRestoreStatus {
+            attempted: true,
+            restored: false,
+            message: format!(
+                "恢复用户原剪贴板失败：{}",
+                trim_error_message(&error.to_string())
+            ),
+        },
+    }
 }
 
-/// 激活 macOS 目标 App；非 macOS 平台保留空实现以便编译通过。
-fn activate_macos_app(app_name: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        run_osascript(&format!(
-            r#"tell application "{}" to activate"#,
-            apple_script_escape(app_name)
-        ))?;
+/// 生成未触发剪贴板恢复的诊断状态，用于没有实际写入临时剪贴板的路径。
+fn clipboard_restore_not_attempted(reason: &str) -> ClipboardRestoreStatus {
+    ClipboardRestoreStatus {
+        attempted: false,
+        restored: false,
+        message: reason.to_string(),
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = app_name;
-    }
-    Ok(())
 }
 
 /// 设置系统输出静音状态，并返回设置前的静音状态。
@@ -1364,11 +1489,6 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// 转义 AppleScript 双引号和反斜杠，避免 App 名称破坏脚本。
-fn apple_script_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 /// 把错误提示窗口定位到主屏幕顶部偏下的位置。
 fn position_toast_window(
     app: &tauri::AppHandle,
@@ -1378,25 +1498,207 @@ fn position_toast_window(
         .map_err(|error| error.replace("定位窗口", "定位错误提示"))
 }
 
-/// 把指定窗口定位到主屏幕顶部居中的位置。
+/// 把实时字幕承载窗口定位到当前工作屏幕底部安全区域上方。
+fn position_subtitle_window(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    let work_area = preferred_window_work_area(app)?;
+    let work_width = work_area.width;
+    let work_height = work_area.height;
+    let width = SUBTITLE_WINDOW_WIDTH.min((work_width - 48.0).max(360.0));
+    let x = work_area.x + (work_width - width) / 2.0;
+    let y = work_area.y + work_height - SUBTITLE_WINDOW_HEIGHT - SUBTITLE_WINDOW_BOTTOM;
+    window
+        .set_size(Size::Logical(LogicalSize::new(
+            width,
+            SUBTITLE_WINDOW_HEIGHT,
+        )))
+        .map_err(|error| format!("设置实时字幕窗口尺寸失败：{}", error))?;
+    window
+        .set_position(Position::Logical(LogicalPosition::new(x, y)))
+        .map_err(|error| format!("定位实时字幕窗口失败：{}", error))
+}
+
+/// 把字幕历史窗口定位到当前工作屏幕右上方。
+fn position_subtitle_history_window(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    let work_area = preferred_window_work_area(app)?;
+    let x = work_area.x + work_area.width
+        - SUBTITLE_HISTORY_WINDOW_WIDTH
+        - SUBTITLE_HISTORY_WINDOW_RIGHT;
+    let y = work_area.y + SUBTITLE_HISTORY_WINDOW_TOP;
+    window
+        .set_size(Size::Logical(LogicalSize::new(
+            SUBTITLE_HISTORY_WINDOW_WIDTH,
+            SUBTITLE_HISTORY_WINDOW_HEIGHT,
+        )))
+        .map_err(|error| format!("设置字幕历史窗口尺寸失败：{}", error))?;
+    window
+        .set_position(Position::Logical(LogicalPosition::new(x, y)))
+        .map_err(|error| format!("定位字幕历史窗口失败：{}", error))
+}
+
+/// 把指定窗口定位到当前工作屏幕顶部居中的位置。
 fn position_top_center_window(
     app: &tauri::AppHandle,
     window: &tauri::WebviewWindow,
     width: f64,
     top: f64,
 ) -> Result<(), String> {
-    let monitor = app
+    let work_area = preferred_window_work_area(app)?;
+    let position = top_center_position_in_work_area(work_area, width, top);
+    window
+        .set_position(Position::Logical(LogicalPosition::new(
+            position.x, position.y,
+        )))
+        .map_err(|error| format!("定位窗口失败：{}", error))
+}
+
+/// 逻辑坐标点，用于在多屏工作区之间选择目标屏幕。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenPoint {
+    x: f64,
+    y: f64,
+}
+
+/// 屏幕可用工作区的逻辑坐标，已经扣除菜单栏和 Dock 占用区域。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScreenWorkArea {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// 优先选择当前前台窗口所在屏幕；取不到时用鼠标所在屏幕，最后回到主屏幕。
+fn preferred_window_work_area(app: &tauri::AppHandle) -> Result<ScreenWorkArea, String> {
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| format!("读取屏幕信息失败：{}", error))?;
+    let work_areas = monitors
+        .iter()
+        .map(work_area_from_monitor)
+        .collect::<Vec<_>>();
+    if let Some(area) = select_work_area_for_anchor(&work_areas, read_frontmost_window_center()) {
+        return Ok(area);
+    }
+    if let Ok(cursor_position) = app.cursor_position() {
+        if let Ok(Some(monitor)) = app.monitor_from_point(cursor_position.x, cursor_position.y) {
+            return Ok(work_area_from_monitor(&monitor));
+        }
+    }
+    if let Some(monitor) = app
         .primary_monitor()
-        .map_err(|error| format!("读取屏幕信息失败：{}", error))?
-        .ok_or_else(|| "没有可用屏幕".to_string())?;
+        .map_err(|error| format!("读取主屏幕失败：{}", error))?
+    {
+        return Ok(work_area_from_monitor(&monitor));
+    }
+    work_areas
+        .first()
+        .copied()
+        .ok_or_else(|| "没有可用屏幕".to_string())
+}
+
+/// 把 Tauri 屏幕工作区转换为逻辑坐标，便于统一窗口定位。
+fn work_area_from_monitor(monitor: &tauri::Monitor) -> ScreenWorkArea {
     let scale_factor = monitor.scale_factor();
     let work_area = monitor.work_area();
-    let x = work_area.position.x as f64 / scale_factor
-        + (work_area.size.width as f64 / scale_factor - width) / 2.0;
-    let y = work_area.position.y as f64 / scale_factor + top;
-    window
-        .set_position(Position::Logical(LogicalPosition::new(x, y)))
-        .map_err(|error| format!("定位窗口失败：{}", error))
+    ScreenWorkArea {
+        x: work_area.position.x as f64 / scale_factor,
+        y: work_area.position.y as f64 / scale_factor,
+        width: work_area.size.width as f64 / scale_factor,
+        height: work_area.size.height as f64 / scale_factor,
+    }
+}
+
+/// 根据前台窗口中心点选择屏幕工作区；没有命中时取距离最近的工作区。
+fn select_work_area_for_anchor(
+    work_areas: &[ScreenWorkArea],
+    anchor: Option<ScreenPoint>,
+) -> Option<ScreenWorkArea> {
+    let anchor = anchor?;
+    work_areas
+        .iter()
+        .copied()
+        .find(|area| point_in_work_area(anchor, *area))
+        .or_else(|| {
+            work_areas.iter().copied().min_by(|left, right| {
+                distance_to_work_area(anchor, *left)
+                    .total_cmp(&distance_to_work_area(anchor, *right))
+            })
+        })
+}
+
+/// 判断逻辑坐标点是否落在指定屏幕工作区内。
+fn point_in_work_area(point: ScreenPoint, area: ScreenWorkArea) -> bool {
+    point.x >= area.x
+        && point.x <= area.x + area.width
+        && point.y >= area.y
+        && point.y <= area.y + area.height
+}
+
+/// 计算点到工作区中心点的平方距离，避免浮点开根号。
+fn distance_to_work_area(point: ScreenPoint, area: ScreenWorkArea) -> f64 {
+    let center_x = area.x + area.width / 2.0;
+    let center_y = area.y + area.height / 2.0;
+    (point.x - center_x).powi(2) + (point.y - center_y).powi(2)
+}
+
+/// 计算窗口在目标工作区顶部居中的逻辑坐标。
+fn top_center_position_in_work_area(
+    work_area: ScreenWorkArea,
+    width: f64,
+    top: f64,
+) -> ScreenPoint {
+    ScreenPoint {
+        x: work_area.x + (work_area.width - width) / 2.0,
+        y: work_area.y + top,
+    }
+}
+
+/// 读取当前前台 App 的窗口中心点，让浮窗跟随用户正在工作的屏幕。
+fn read_frontmost_window_center() -> Option<ScreenPoint> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"
+tell application "System Events"
+    set frontProcesses to application processes whose frontmost is true
+    if (count of frontProcesses) is 0 then return ""
+    set frontProcess to item 1 of frontProcesses
+    if not (exists window 1 of frontProcess) then return ""
+    set windowPosition to position of window 1 of frontProcess
+    set windowSize to size of window 1 of frontProcess
+    set centerX to (item 1 of windowPosition) + ((item 1 of windowSize) / 2)
+    set centerY to (item 2 of windowPosition) + ((item 2 of windowSize) / 2)
+    return (centerX as text) & "," & (centerY as text)
+end tell
+"#;
+        let output = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return parse_screen_point(&String::from_utf8_lossy(&output.stdout));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 解析 AppleScript 返回的 `x,y` 坐标。
+fn parse_screen_point(value: &str) -> Option<ScreenPoint> {
+    let (x, y) = value.trim().split_once(',')?;
+    Some(ScreenPoint {
+        x: x.trim().parse().ok()?,
+        y: y.trim().parse().ok()?,
+    })
 }
 
 /// 接收前端音频数据，调用小米 Mimo 语音识别模型并返回纯文本结果。
@@ -1689,56 +1991,121 @@ async fn paste_text(
     }
 
     let frontmost_before_paste = get_frontmost_app().unwrap_or_default();
-    let paste_target = resolve_paste_target(
-        &target_app,
-        &frontmost_before_paste,
-        &read_last_external_app(&app),
-    );
-    let normalized_target_app = if !paste_target.target_app.is_empty() {
-        remember_external_app(&app, &paste_target.target_app)
-    } else {
-        String::new()
-    };
-    write_clipboard_text(normalized_text)?;
-    let clipboard_written = true;
+    let paste_target = resolve_paste_target(&target_app, &frontmost_before_paste);
+    let normalized_target_app = paste_target.target_app;
     let accessibility_trusted = is_accessibility_trusted();
     if normalized_target_app.is_empty() {
+        let clipboard_restore_status =
+            clipboard_restore_not_attempted("未写入临时剪贴板，避免覆盖用户原剪贴板。");
         return Ok(PasteResponse {
             pasted: false,
-            message: "已写入剪贴板；当前没有可恢复的目标输入框，已保持 typesass 界面不变。"
-                .to_string(),
+            message: "当前焦点不在外部输入目标上；已保持原剪贴板不变。".to_string(),
             requires_accessibility: false,
             target_app: normalized_target_app,
-            clipboard_written,
+            clipboard_written: false,
+            clipboard_matches_expected: false,
+            clipboard_restore_attempted: clipboard_restore_status.attempted,
+            clipboard_restored: clipboard_restore_status.restored,
+            clipboard_restore_message: clipboard_restore_status.message,
             accessibility_trusted,
             paste_method: "notSent".to_string(),
             frontmost_before_paste,
             frontmost_after_activate: String::new(),
             frontmost_after_paste: String::new(),
+            insertion_verified: false,
+            verification_status: "没有可恢复的目标输入框".to_string(),
             focused_element_before_paste: String::new(),
             focused_element_after_activate: String::new(),
             focused_element_after_paste: String::new(),
         });
     }
     if !accessibility_trusted {
+        let clipboard_restore_status =
+            clipboard_restore_not_attempted("辅助功能未授权，未写入临时剪贴板。");
         return Ok(PasteResponse {
             pasted: false,
-            message: "已写入剪贴板；自动粘贴需要先给 typesass 开启辅助功能权限。".to_string(),
+            message: "自动粘贴需要先给 typesass 开启辅助功能权限；已保持原剪贴板不变。".to_string(),
             requires_accessibility: true,
             target_app: normalized_target_app,
-            clipboard_written,
+            clipboard_written: false,
+            clipboard_matches_expected: false,
+            clipboard_restore_attempted: clipboard_restore_status.attempted,
+            clipboard_restored: clipboard_restore_status.restored,
+            clipboard_restore_message: clipboard_restore_status.message,
             accessibility_trusted,
             paste_method: "notSent".to_string(),
             frontmost_before_paste,
             frontmost_after_activate: String::new(),
             frontmost_after_paste: String::new(),
+            insertion_verified: false,
+            verification_status: "辅助功能未授权，无法发送系统粘贴".to_string(),
             focused_element_before_paste: String::new(),
             focused_element_after_activate: String::new(),
             focused_element_after_paste: String::new(),
         });
     }
 
-    let focused_element_before_paste = read_focused_element_summary(&normalized_target_app);
+    let clipboard_snapshot = match capture_clipboard_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let clipboard_restore_status = clipboard_restore_not_attempted(&format!(
+                "备份用户原剪贴板失败：{}",
+                trim_error_message(&error)
+            ));
+            return Ok(PasteResponse {
+                pasted: false,
+                message: "无法备份原剪贴板，已停止自动粘贴，避免覆盖你的剪贴板内容。".to_string(),
+                requires_accessibility: false,
+                target_app: normalized_target_app,
+                clipboard_written: false,
+                clipboard_matches_expected: false,
+                clipboard_restore_attempted: clipboard_restore_status.attempted,
+                clipboard_restored: clipboard_restore_status.restored,
+                clipboard_restore_message: clipboard_restore_status.message,
+                accessibility_trusted,
+                paste_method: "notSent".to_string(),
+                frontmost_before_paste,
+                frontmost_after_activate: String::new(),
+                frontmost_after_paste: String::new(),
+                insertion_verified: false,
+                verification_status: "原剪贴板备份失败，未写入临时剪贴板".to_string(),
+                focused_element_before_paste: String::new(),
+                focused_element_after_activate: String::new(),
+                focused_element_after_paste: String::new(),
+            });
+        }
+    };
+    let clipboard_matches_expected = write_clipboard_text_verified(normalized_text)?;
+    let clipboard_written = clipboard_matches_expected;
+    if !clipboard_matches_expected {
+        let clipboard_restore_status = build_clipboard_restore_status(
+            Some(()),
+            restore_clipboard_snapshot(&clipboard_snapshot),
+        );
+        return Ok(PasteResponse {
+            pasted: false,
+            message: "写入临时剪贴板后读回内容不一致，已停止自动粘贴并恢复原剪贴板。".to_string(),
+            requires_accessibility: false,
+            target_app: normalized_target_app,
+            clipboard_written,
+            clipboard_matches_expected,
+            clipboard_restore_attempted: clipboard_restore_status.attempted,
+            clipboard_restored: clipboard_restore_status.restored,
+            clipboard_restore_message: clipboard_restore_status.message,
+            accessibility_trusted,
+            paste_method: "notSent".to_string(),
+            frontmost_before_paste,
+            frontmost_after_activate: String::new(),
+            frontmost_after_paste: String::new(),
+            insertion_verified: false,
+            verification_status: "临时剪贴板读回不一致".to_string(),
+            focused_element_before_paste: String::new(),
+            focused_element_after_activate: String::new(),
+            focused_element_after_paste: String::new(),
+        });
+    }
+
+    let focused_element_before_paste = "快速粘贴模式：发送前未读取焦点，避免阻塞粘贴。".to_string();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -1750,74 +2117,67 @@ async fn paste_text(
             let _ = window.hide();
         }
     }
-    if paste_target.should_activate_target && !normalized_target_app.is_empty() {
-        let _ = activate_macos_app(&normalized_target_app);
-    }
-    thread::sleep(Duration::from_millis(620));
-    let frontmost_after_activate = get_frontmost_app().unwrap_or_default();
-    let focused_element_after_activate = read_focused_element_summary(&normalized_target_app);
+    let frontmost_after_activate = String::new();
+    let focused_element_after_activate =
+        "直接粘贴模式：未激活目标 App，直接向当前焦点发送粘贴。".to_string();
     let paste_result = match trigger_system_paste() {
         Ok(value) => value,
         Err(error) => {
+            let clipboard_restore_status = build_clipboard_restore_status(
+                Some(()),
+                restore_clipboard_snapshot(&clipboard_snapshot),
+            );
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
             }
-            return Err(error);
+            return Err(format!("{}；{}", error, clipboard_restore_status.message));
         }
     };
     let mut paste_methods = vec![paste_result.method.clone()];
-    thread::sleep(Duration::from_millis(160));
-    let mut frontmost_after_paste = get_frontmost_app().unwrap_or_default();
-    let mut focused_element_after_paste = read_focused_element_summary(&normalized_target_app);
+    thread::sleep(Duration::from_millis(CLIPBOARD_RESTORE_DELAY_MS));
+    let clipboard_restore_status =
+        build_clipboard_restore_status(Some(()), restore_clipboard_snapshot(&clipboard_snapshot));
+    thread::sleep(Duration::from_millis(PASTE_DIAGNOSTIC_SETTLE_DELAY_MS));
+    let frontmost_after_paste = get_frontmost_app().unwrap_or_default();
+    let focused_element_after_paste =
+        "直接粘贴模式：发送后未读取输入框正文，避免拖慢主链路。".to_string();
+    let insertion_verified = false;
+    paste_methods.push("直接向当前焦点发送，不激活目标 App".to_string());
 
-    if should_retry_paste_for_target(&normalized_target_app, &frontmost_after_paste) {
-        paste_methods.push(format!(
-            "前台被{}抢占，恢复目标后重试",
-            frontmost_after_paste
-        ));
-        let _ = activate_macos_app(&normalized_target_app);
-        thread::sleep(Duration::from_millis(760));
-        if is_frontmost_target(
-            &get_frontmost_app().unwrap_or_default(),
-            &normalized_target_app,
-        ) {
-            match trigger_system_paste() {
-                Ok(retry_result) => paste_methods.push(format!("重试：{}", retry_result.method)),
-                Err(error) => {
-                    paste_methods.push(format!("重试失败：{}", trim_error_message(&error)))
-                }
-            }
-            thread::sleep(Duration::from_millis(160));
-            frontmost_after_paste = get_frontmost_app().unwrap_or_default();
-            focused_element_after_paste = read_focused_element_summary(&normalized_target_app);
-        } else {
-            paste_methods.push("重试跳过：目标 App 未能回到前台".to_string());
-        }
-    }
+    let verification_status = format!(
+        "已发出一次系统粘贴指令；{}；为保证速度未读取目标输入框，macOS 不提供可靠成功回调。",
+        clipboard_restore_status.message
+    );
     let paste_method = paste_methods.join(" -> ");
-    let final_target_ready = is_frontmost_target(&frontmost_after_paste, &normalized_target_app);
+    let pasted = should_mark_paste_command_as_sent(paste_result.accessibility_ready, true, false);
 
     Ok(PasteResponse {
-        pasted: paste_result.accessibility_ready,
-        message: if final_target_ready {
+        pasted,
+        message: if clipboard_restore_status.restored {
             format!(
-                "已向 {} 发送粘贴指令；是否插入取决于目标输入框焦点。",
+                "已向当前焦点发送一次粘贴指令，并已恢复原剪贴板。当前前台：{}。",
                 normalized_target_app
             )
         } else {
             format!(
-                "已向 {} 发送粘贴指令，但当前前台是 {}；如果未插入，请重新聚焦输入框。",
-                normalized_target_app, frontmost_after_paste
+                "已向当前焦点发送一次粘贴指令，但原剪贴板恢复失败，请留意当前剪贴板内容。当前前台：{}。",
+                normalized_target_app
             )
         },
         requires_accessibility: false,
         target_app: normalized_target_app,
         clipboard_written,
+        clipboard_matches_expected,
+        clipboard_restore_attempted: clipboard_restore_status.attempted,
+        clipboard_restored: clipboard_restore_status.restored,
+        clipboard_restore_message: clipboard_restore_status.message,
         accessibility_trusted,
         paste_method,
         frontmost_before_paste,
         frontmost_after_activate,
         frontmost_after_paste,
+        insertion_verified,
+        verification_status,
         focused_element_before_paste,
         focused_element_after_activate,
         focused_element_after_paste,
@@ -1988,7 +2348,99 @@ fn trim_error_message(message: &str) -> String {
     message.chars().take(MAX_ERROR_LENGTH).collect()
 }
 
-/// 通过 macOS pbcopy 写入剪贴板，避免把剪贴板内容经由前端暴露。
+/// 获取 macOS 文本剪贴板类型。
+#[cfg(target_os = "macos")]
+fn pasteboard_string_type() -> &'static objc2_app_kit::NSPasteboardType {
+    unsafe { NSPasteboardTypeString }
+}
+
+/// 捕获系统剪贴板完整快照，自动粘贴后用于恢复用户原本剪切或复制的内容。
+#[cfg(target_os = "macos")]
+fn capture_clipboard_snapshot() -> Result<ClipboardSnapshot, String> {
+    autoreleasepool(|_| {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let Some(items) = pasteboard.pasteboardItems() else {
+            return Ok(ClipboardSnapshot { items: Vec::new() });
+        };
+        let mut snapshot_items = Vec::new();
+        for item in items.to_vec() {
+            let mut representations = Vec::new();
+            for pasteboard_type in item.types().to_vec() {
+                if let Some(data) = item.dataForType(&pasteboard_type) {
+                    representations.push(ClipboardRepresentationSnapshot {
+                        type_name: pasteboard_type.to_string(),
+                        data: data.to_vec(),
+                    });
+                }
+            }
+            if !representations.is_empty() {
+                snapshot_items.push(ClipboardItemSnapshot { representations });
+            }
+        }
+        Ok(ClipboardSnapshot {
+            items: snapshot_items,
+        })
+    })
+}
+
+/// 非 macOS 平台当前没有自动粘贴能力，因此不需要捕获系统剪贴板。
+#[cfg(not(target_os = "macos"))]
+fn capture_clipboard_snapshot() -> Result<ClipboardSnapshot, String> {
+    Ok(ClipboardSnapshot { items: Vec::new() })
+}
+
+/// 将系统剪贴板恢复为自动粘贴前的完整快照。
+#[cfg(target_os = "macos")]
+fn restore_clipboard_snapshot(snapshot: &ClipboardSnapshot) -> Result<(), String> {
+    autoreleasepool(|_| {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        if snapshot.items.is_empty() {
+            return Ok(());
+        }
+        let mut pasteboard_items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
+            Vec::new();
+        for snapshot_item in &snapshot.items {
+            let item = NSPasteboardItem::new();
+            for representation in &snapshot_item.representations {
+                let pasteboard_type = NSString::from_str(&representation.type_name);
+                let data = NSData::with_bytes(&representation.data);
+                if !item.setData_forType(&data, &pasteboard_type) {
+                    return Err(format!("恢复剪贴板类型 {} 失败", representation.type_name));
+                }
+            }
+            pasteboard_items.push(ProtocolObject::from_retained(item));
+        }
+        let objects = NSArray::from_retained_slice(&pasteboard_items);
+        if !pasteboard.writeObjects(&objects) {
+            return Err("写回原剪贴板快照失败".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// 非 macOS 平台当前没有自动粘贴能力，因此不执行剪贴板恢复。
+#[cfg(not(target_os = "macos"))]
+fn restore_clipboard_snapshot(_snapshot: &ClipboardSnapshot) -> Result<(), String> {
+    Ok(())
+}
+
+/// 通过系统剪贴板 API 写入临时文本，避免把剪贴板内容经由前端暴露。
+#[cfg(target_os = "macos")]
+fn write_clipboard_text(text: &str) -> Result<(), String> {
+    autoreleasepool(|_| {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let value = NSString::from_str(text);
+        if !pasteboard.setString_forType(&value, pasteboard_string_type()) {
+            return Err("写入剪贴板失败：Pasteboard 拒绝写入文本".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// 非 macOS 平台通过 pbcopy 写入文本，主要用于保留编译兼容。
+#[cfg(not(target_os = "macos"))]
 fn write_clipboard_text(text: &str) -> Result<(), String> {
     let mut child = Command::new("pbcopy")
         .stdin(Stdio::piped())
@@ -2011,16 +2463,52 @@ fn write_clipboard_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 通过 macOS pbpaste 读取剪贴板文本，用于托盘菜单快速加入本地词典。
+/// 写入剪贴板后多次读回确认，避免 macOS 剪贴板短暂延迟导致误判。
+fn write_clipboard_text_verified(text: &str) -> Result<bool, String> {
+    for attempt in 0_u64..3 {
+        write_clipboard_text(text)?;
+        thread::sleep(Duration::from_millis(
+            CLIPBOARD_VERIFY_INITIAL_DELAY_MS + attempt * CLIPBOARD_VERIFY_RETRY_STEP_MS,
+        ));
+        if read_clipboard_text_raw()
+            .map(|clipboard_text| clipboard_text_matches_output(&clipboard_text, text))
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 判断剪贴板文本是否匹配本次输出，兼容系统工具可能追加的末尾换行。
+fn clipboard_text_matches_output(clipboard_text: &str, output_text: &str) -> bool {
+    clipboard_text == output_text
+        || clipboard_text.trim_end_matches(|character| character == '\n' || character == '\r')
+            == output_text
+}
+
+/// 通过 macOS pbpaste 读取剪贴板原文，用于确认 pbcopy 写入是否真的生效。
 #[cfg(target_os = "macos")]
-fn read_clipboard_text() -> Result<String, String> {
+fn read_clipboard_text_raw() -> Result<String, String> {
     let output = Command::new("pbpaste")
         .output()
         .map_err(|error| format!("读取剪贴板失败：{}", error))?;
     if !output.status.success() {
         return Err("读取剪贴板失败：pbpaste 执行失败".to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// 通过 macOS pbpaste 读取剪贴板文本，用于托盘菜单快速加入本地词典。
+#[cfg(target_os = "macos")]
+fn read_clipboard_text() -> Result<String, String> {
+    Ok(read_clipboard_text_raw()?.trim().to_string())
+}
+
+/// 非 macOS 桌面端暂不支持读取剪贴板原文。
+#[cfg(not(target_os = "macos"))]
+fn read_clipboard_text_raw() -> Result<String, String> {
+    Err("当前系统暂不支持读取剪贴板".to_string())
 }
 
 /// 非 macOS 桌面端暂不支持通过托盘读取剪贴板。
@@ -2046,57 +2534,6 @@ fn split_dictionary_words(text: &str) -> Vec<String> {
     .take(20)
     .map(ToString::to_string)
     .collect()
-}
-
-/// 读取目标 App 当前辅助功能焦点摘要，用于定位 App 前台但输入框未聚焦的问题。
-#[cfg(target_os = "macos")]
-fn read_focused_element_summary(app_name: &str) -> String {
-    let normalized_app_name = normalize_target_app_name(app_name);
-    if normalized_app_name.is_empty() {
-        return String::new();
-    }
-    let script = format!(
-        r#"
-tell application "System Events"
-    if not (exists process "{app_name}") then return ""
-    tell process "{app_name}"
-        try
-            set focusedElement to value of attribute "AXFocusedUIElement"
-            set roleText to ""
-            set subroleText to ""
-            set titleText to ""
-            set descriptionText to ""
-            try
-                set roleText to value of attribute "AXRole" of focusedElement as text
-            end try
-            try
-                set subroleText to value of attribute "AXSubrole" of focusedElement as text
-            end try
-            try
-                set titleText to value of attribute "AXTitle" of focusedElement as text
-            end try
-            try
-                set descriptionText to value of attribute "AXDescription" of focusedElement as text
-            end try
-            return roleText & " / " & subroleText & " / " & titleText & " / " & descriptionText
-        on error errorMessage
-            return "读取焦点失败：" & errorMessage
-        end try
-    end tell
-end tell
-"#,
-        app_name = apple_script_escape(&normalized_app_name)
-    );
-    run_osascript(&script)
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// 非 macOS 暂不提供系统焦点诊断。
-#[cfg(not(target_os = "macos"))]
-fn read_focused_element_summary(app_name: &str) -> String {
-    let _ = app_name;
-    String::new()
 }
 
 /// 触发系统级 Cmd+V；优先使用更接近物理按键的 CoreGraphics，再回退到 AppleScript。
@@ -2181,6 +2618,22 @@ fn open_accessibility_preferences() -> Result<(), String> {
     Err("当前版本只支持在 macOS 打开辅助功能设置".to_string())
 }
 
+/// 打开 macOS 麦克风隐私设置页。
+#[cfg(target_os = "macos")]
+fn open_microphone_preferences() -> Result<(), String> {
+    Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        .spawn()
+        .map_err(|error| format!("打开麦克风设置失败：{}", error))?;
+    Ok(())
+}
+
+/// 非 macOS 平台暂不支持打开对应麦克风权限页。
+#[cfg(not(target_os = "macos"))]
+fn open_microphone_preferences() -> Result<(), String> {
+    Err("当前版本只支持在 macOS 打开麦克风设置".to_string())
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -2193,40 +2646,150 @@ mod tests {
 
     #[test]
     fn hub_frontmost_shortcut_keeps_hub_and_does_not_reuse_previous_external_target() {
-        let decision = resolve_voice_trigger_context("typesass", "ChatGPT");
+        let decision = resolve_voice_trigger_context("typesass");
 
         assert_eq!(decision.target_app, "");
         assert!(!decision.show_floating_window);
         assert!(decision.keep_hub_visible);
-        assert!(!decision.restore_target_focus);
     }
 
     #[test]
-    fn external_frontmost_shortcut_uses_current_app_as_paste_target() {
-        let decision = resolve_voice_trigger_context("ChatGPT", "TextEdit");
+    fn external_frontmost_shortcut_keeps_current_focus_without_reactivation() {
+        let decision = resolve_voice_trigger_context("ChatGPT");
 
         assert_eq!(decision.target_app, "ChatGPT");
         assert!(decision.show_floating_window);
         assert!(!decision.keep_hub_visible);
-        assert!(decision.restore_target_focus);
     }
 
     #[test]
-    fn paste_without_explicit_target_does_not_fallback_to_last_external_when_typesass_is_frontmost()
-    {
-        let decision = resolve_paste_target("", "typesass", "ChatGPT");
+    fn paste_without_explicit_target_stops_when_typesass_is_frontmost() {
+        let decision = resolve_paste_target("", "typesass");
 
         assert_eq!(decision.target_app, "");
-        assert!(!decision.should_activate_target);
         assert!(!decision.should_hide_hub);
     }
 
     #[test]
-    fn paste_with_explicit_target_can_hide_hub_and_activate_target() {
-        let decision = resolve_paste_target("ChatGPT", "typesass", "TextEdit");
+    fn paste_with_explicit_target_uses_current_focus_without_reactivation() {
+        let decision = resolve_paste_target("ChatGPT", "TextEdit");
 
-        assert_eq!(decision.target_app, "ChatGPT");
-        assert!(decision.should_activate_target);
-        assert!(decision.should_hide_hub);
+        assert_eq!(decision.target_app, "TextEdit");
+        assert!(!decision.should_hide_hub);
+    }
+
+    #[test]
+    fn paste_ignores_explicit_target_when_current_focus_is_typesass() {
+        let decision = resolve_paste_target("ChatGPT", "typesass");
+
+        assert_eq!(decision.target_app, "");
+        assert!(!decision.should_hide_hub);
+    }
+
+    #[test]
+    fn floating_window_position_uses_screen_containing_focused_window_anchor() {
+        let primary = ScreenWorkArea {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        let secondary = ScreenWorkArea {
+            x: 1440.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+
+        let area = select_work_area_for_anchor(
+            &[primary, secondary],
+            Some(ScreenPoint {
+                x: 2100.0,
+                y: 420.0,
+            }),
+        )
+        .expect("应该能根据前台窗口中心点选择屏幕");
+        let position = top_center_position_in_work_area(area, 280.0, 18.0);
+
+        assert_eq!(area, secondary);
+        assert_eq!(position.x, 2260.0);
+        assert_eq!(position.y, 18.0);
+    }
+
+    #[test]
+    fn paste_timing_keeps_primary_path_responsive() {
+        assert!(PASTE_DIAGNOSTIC_SETTLE_DELAY_MS <= 120);
+        assert!(CLIPBOARD_VERIFY_INITIAL_DELAY_MS <= 50);
+    }
+
+    #[test]
+    fn paste_result_treats_single_command_as_sent_without_frontmost_callback() {
+        assert!(should_mark_paste_command_as_sent(true, false, false));
+    }
+
+    #[test]
+    fn clipboard_restore_status_marks_original_clipboard_restored() {
+        let status = build_clipboard_restore_status(Some(()), Result::<(), String>::Ok(()));
+
+        assert!(status.attempted);
+        assert!(status.restored);
+        assert_eq!(status.message, "已恢复用户原剪贴板。");
+    }
+
+    #[test]
+    fn clipboard_restore_status_reports_missing_snapshot() {
+        let status =
+            build_clipboard_restore_status::<&str, String>(None, Result::<(), String>::Ok(()));
+
+        assert!(!status.attempted);
+        assert!(!status.restored);
+    }
+
+    #[test]
+    fn clipboard_match_accepts_system_trailing_newline() {
+        assert!(clipboard_text_matches_output(
+            "不行了，还是不行啊！\n",
+            "不行了，还是不行啊！"
+        ));
+    }
+
+    #[test]
+    fn clipboard_match_rejects_old_clipboard_content() {
+        assert!(!clipboard_text_matches_output(
+            "旧内容",
+            "不行了，还是不行啊！"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "会临时读写系统剪贴板，只在自动粘贴排查时手动运行"]
+    fn verified_clipboard_write_round_trips_with_system_clipboard() {
+        struct ClipboardRestore {
+            snapshot: Option<ClipboardSnapshot>,
+        }
+
+        impl Drop for ClipboardRestore {
+            fn drop(&mut self) {
+                if let Some(snapshot) = self.snapshot.as_ref() {
+                    let _ = restore_clipboard_snapshot(snapshot);
+                }
+            }
+        }
+
+        let _restore = ClipboardRestore {
+            snapshot: capture_clipboard_snapshot().ok(),
+        };
+        let marker = format!("typesass-clipboard-roundtrip-{}", std::process::id());
+
+        assert!(
+            write_clipboard_text_verified(&marker).expect("系统剪贴板写入流程不应报错"),
+            "系统剪贴板写入后没有读回本次测试标记"
+        );
+        let readback = read_clipboard_text_raw().expect("系统剪贴板应该可以读取");
+        assert!(
+            clipboard_text_matches_output(&readback, &marker),
+            "系统剪贴板读回内容没有匹配本次测试标记"
+        );
     }
 }
