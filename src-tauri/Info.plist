@@ -4,5 +4,9 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>typesass 需要使用麦克风录制语音并转换成文字。</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>typesass 需要录制屏幕与系统音频，用于实时字幕识别电脑正在播放的声音。</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>typesass 需要捕获其他应用正在播放的声音，用于实时字幕识别电脑系统音频。</string>
 </dict>
 </plist>

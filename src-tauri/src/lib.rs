@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size, State};
@@ -121,6 +122,13 @@ struct RuntimeResult {
     payload: Mutex<Option<ResultWindowPayload>>,
 }
 
+/// 运行期间保存最近一段原生系统音频字幕结果，避免长耗时命令阻塞 WebView。
+#[derive(Default)]
+struct RuntimeSubtitleTranscribe {
+    /// 最近一次原生字幕转写任务的完成结果；前端按片段序号轮询并消费。
+    payload: Mutex<Option<ProcessTapTranscribeOutcome>>,
+}
+
 /// 前端提交的全局模式快捷键。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,6 +182,98 @@ struct TranscribeResponse {
     elapsed_ms: u128,
     /// 实际返回的模型名称。
     model: String,
+}
+
+/// 前端请求原生系统音频片段的参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTapCaptureRequest {
+    /// 本次采集的目标音频进程名称、Bundle ID 或 PID；为空时由 helper 自动选择活跃进程。
+    target_keyword: String,
+    /// 单个字幕切片采集时长，毫秒。
+    duration_ms: u64,
+}
+
+/// 原生系统音频片段采集结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTapCaptureResponse {
+    /// WAV 音频 base64 内容，不包含 data URL 头。
+    audio_base64: String,
+    /// 音频 MIME 类型，固定为 ASR 可识别的 WAV。
+    content_type: String,
+    /// 采集到的音频字节数。
+    bytes: u64,
+    /// helper 输出的采集摘要，用于诊断日志展示目标进程和采样帧数。
+    summary: String,
+    /// 本地采集和文件读取总耗时。
+    elapsed_ms: u128,
+}
+
+/// 前端请求原生系统音频并直接转写的参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTapTranscribeRequest {
+    /// 前端字幕片段序号，用于事件回传后按片段归因日志。
+    chunk_index: u64,
+    /// 本次采集的目标音频进程名称、Bundle ID 或 PID；为空时由 helper 自动选择活跃进程。
+    target_keyword: String,
+    /// 单个字幕切片采集时长，毫秒。
+    duration_ms: u64,
+    /// 可选的请求密钥；为空时读取会话密钥、钥匙串或环境变量。
+    api_key: String,
+    /// OpenAI 兼容接口地址。
+    base_url: String,
+    /// 语音识别模型名称。
+    asr_model: String,
+    /// 语音识别语言，auto 表示自动识别。
+    language: String,
+}
+
+/// 原生系统音频直接转写结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTapTranscribeResponse {
+    /// 前端字幕片段序号，用于事件回传后按片段归因日志。
+    chunk_index: u64,
+    /// 转写后的文字。
+    text: String,
+    /// 实际返回的模型名称。
+    model: String,
+    /// ASR 请求耗时，毫秒。
+    elapsed_ms: u128,
+    /// 本地采集和文件读取总耗时，毫秒。
+    capture_elapsed_ms: u128,
+    /// 采集到的音频字节数。
+    bytes: u64,
+    /// helper 输出的采集摘要，用于诊断日志展示目标进程和采样帧数。
+    summary: String,
+}
+
+/// 原生系统音频后台转写任务完成结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTapTranscribeOutcome {
+    /// 前端字幕片段序号，用于轮询时过滤旧结果。
+    chunk_index: u64,
+    /// 任务是否成功。
+    ok: bool,
+    /// 成功时的转写结果。
+    response: Option<ProcessTapTranscribeResponse>,
+    /// 失败时的错误原因。
+    error: Option<String>,
+}
+
+/// 原生系统音频采集后的内存音频片段。
+struct ProcessTapCapturedAudio {
+    /// WAV 音频二进制内容。
+    audio: Vec<u8>,
+    /// 音频 MIME 类型，固定为 ASR 可识别的 WAV。
+    content_type: String,
+    /// helper 输出的采集摘要，用于诊断日志展示目标进程和采样帧数。
+    summary: String,
+    /// 本地采集和文件读取总耗时。
+    elapsed_ms: u128,
 }
 
 /// AI 文本处理模式。
@@ -358,6 +458,7 @@ pub fn run() {
         .manage(RuntimeSecrets::default())
         .manage(RuntimeShortcuts::default())
         .manage(RuntimeResult::default())
+        .manage(RuntimeSubtitleTranscribe::default())
         .setup(|app| {
             #[cfg(desktop)]
             {
@@ -397,6 +498,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             transcribe_audio,
+            capture_process_tap_audio,
+            capture_process_tap_transcribe,
+            start_process_tap_transcribe_task,
+            take_process_tap_transcribe_outcome,
             process_text,
             paste_text,
             set_session_api_key,
@@ -412,6 +517,7 @@ pub fn run() {
             hide_result_window,
             show_subtitle_windows,
             hide_subtitle_windows,
+            toggle_subtitle_mode,
             get_last_result_window_payload,
             register_shortcuts,
             get_runtime_diagnostics,
@@ -639,7 +745,7 @@ fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
     trigger_voice_mode(app, &mode);
 }
 
-/// 按实时字幕快捷键进入或退出字幕监听模式，不展示普通录音胶囊。
+/// 按实时字幕快捷键进入或退出字幕监听模式，交给可见 Hub WebView 采集音频。
 fn trigger_subtitle_mode(app: tauri::AppHandle) {
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
@@ -647,16 +753,15 @@ fn trigger_subtitle_mode(app: tauri::AppHandle) {
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
     }
+    let _ = present_window(&app, "hub", false);
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(120));
-        if let Some(window) = app.get_webview_window("main") {
-            let script = r#"if (window.__AIToolHandleShortcutMode) {
-                    window.__AIToolHandleShortcutMode("subtitle", "", false);
-                } else {
-                    window.__AIToolPendingShortcutMode = { mode: "subtitle", targetApp: "", keepHubVisible: false };
-                }"#;
-            let _ = window.eval(script);
-        }
+        thread::sleep(Duration::from_millis(180));
+        let payload = json!({
+            "mode": "subtitle",
+            "targetApp": "",
+            "keepHubVisible": true
+        });
+        let _ = app.emit_to("hub", "hub-start-mode", payload);
     });
 }
 
@@ -1226,6 +1331,13 @@ fn hide_subtitle_windows(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 从 Hub 主窗口切换实时字幕模式，复用可见 Hub WebView 内的音频采集链路。
+#[tauri::command]
+fn toggle_subtitle_mode(app: tauri::AppHandle) -> Result<(), String> {
+    trigger_subtitle_mode(app);
+    Ok(())
+}
+
 /// 读取最近一次结果窗口内容，供结果窗口初始化时恢复状态。
 #[tauri::command]
 fn get_last_result_window_payload(
@@ -1735,7 +1847,8 @@ async fn transcribe_audio(
         body["asr_options"] = json!({ "language": request.language.trim() });
     }
 
-    let response_json = send_chat_completion(&base_url, &api_key, &body, None).await?;
+    let response_json =
+        send_chat_completion(&base_url, &api_key, &body, Some(Duration::from_secs(25))).await?;
 
     Ok(TranscribeResponse {
         text: response_json
@@ -1750,6 +1863,278 @@ async fn transcribe_audio(
             .unwrap_or(asr_model)
             .to_string(),
     })
+}
+
+/// 调用打包的 Core Audio Process Tap helper 采集一段系统播放声音。
+#[tauri::command]
+async fn capture_process_tap_audio(
+    request: ProcessTapCaptureRequest,
+) -> Result<ProcessTapCaptureResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || capture_process_tap_audio_blocking(request))
+        .await
+        .map_err(|error| format!("系统音频采集任务失败：{}", error))?
+}
+
+/// 调用打包的 Core Audio Process Tap helper 采集系统播放声音，并在 Rust 端直接转写。
+#[tauri::command]
+async fn capture_process_tap_transcribe(
+    app: AppHandle,
+    secrets: State<'_, RuntimeSecrets>,
+    request: ProcessTapTranscribeRequest,
+) -> Result<ProcessTapTranscribeResponse, String> {
+    let api_key = resolve_api_key(&request.api_key, &secrets)?;
+    let response = run_process_tap_transcribe(request, api_key).await?;
+    let _ = app.emit("subtitle-native-transcribe-result", response.clone());
+    Ok(response)
+}
+
+/// 启动原生系统音频后台转写任务，结果由前端用短命令轮询消费。
+#[tauri::command]
+async fn start_process_tap_transcribe_task(
+    app: AppHandle,
+    secrets: State<'_, RuntimeSecrets>,
+    request: ProcessTapTranscribeRequest,
+) -> Result<(), String> {
+    let chunk_index = request.chunk_index;
+    let api_key = resolve_api_key(&request.api_key, &secrets)?;
+    let subtitle_state = app.state::<RuntimeSubtitleTranscribe>();
+    {
+        let mut payload = subtitle_state
+            .payload
+            .lock()
+            .map_err(|_| "写入实时字幕任务状态失败：状态锁已损坏".to_string())?;
+        *payload = None;
+    }
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome = match run_process_tap_transcribe(request, api_key).await {
+            Ok(response) => ProcessTapTranscribeOutcome {
+                chunk_index,
+                ok: true,
+                response: Some(response),
+                error: None,
+            },
+            Err(error) => ProcessTapTranscribeOutcome {
+                chunk_index,
+                ok: false,
+                response: None,
+                error: Some(error),
+            },
+        };
+        let subtitle_state = app_for_task.state::<RuntimeSubtitleTranscribe>();
+        let lock_result = subtitle_state.payload.lock();
+        if let Ok(mut payload) = lock_result {
+            *payload = Some(outcome.clone());
+        }
+        deliver_process_tap_transcribe_outcome(&app_for_task, &outcome);
+    });
+    Ok(())
+}
+
+/// 通过已验证可用的 WebView eval 桥把原生字幕结果交给 Hub。
+fn deliver_process_tap_transcribe_outcome(app: &AppHandle, outcome: &ProcessTapTranscribeOutcome) {
+    let Ok(payload_json) = serde_json::to_string(outcome) else {
+        return;
+    };
+    for label in ["main", "hub"] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.eval(&format!(
+                "if (window.__AIToolHandleNativeSubtitleOutcome) window.__AIToolHandleNativeSubtitleOutcome({});",
+                payload_json
+            ));
+        }
+    }
+}
+
+/// 消费指定片段的原生系统音频后台转写结果。
+#[tauri::command]
+fn take_process_tap_transcribe_outcome(
+    state: State<'_, RuntimeSubtitleTranscribe>,
+    chunk_index: u64,
+) -> Result<Option<ProcessTapTranscribeOutcome>, String> {
+    let mut payload = state
+        .payload
+        .lock()
+        .map_err(|_| "读取实时字幕任务状态失败：状态锁已损坏".to_string())?;
+    if payload
+        .as_ref()
+        .map(|item| item.chunk_index == chunk_index)
+        .unwrap_or(false)
+    {
+        return Ok(payload.take());
+    }
+    Ok(None)
+}
+
+/// 执行一次原生系统音频采集并直接请求 Mimo ASR。
+async fn run_process_tap_transcribe(
+    request: ProcessTapTranscribeRequest,
+    api_key: String,
+) -> Result<ProcessTapTranscribeResponse, String> {
+    let chunk_index = request.chunk_index;
+    if api_key.trim().is_empty() {
+        return Err(
+            "请先在设置里保存 Mimo API Key，或用 MIMO_API_KEY 环境变量启动应用".to_string(),
+        );
+    }
+
+    let base_url = normalize_base_url(&request.base_url);
+    let asr_model = normalize_asr_model(&request.asr_model).to_string();
+    let language = request.language.trim().to_string();
+    let capture_request = ProcessTapCaptureRequest {
+        target_keyword: request.target_keyword,
+        duration_ms: request.duration_ms,
+    };
+    let captured = tauri::async_runtime::spawn_blocking(move || {
+        capture_process_tap_audio_bytes(capture_request)
+    })
+    .await
+    .map_err(|error| format!("系统音频采集任务失败：{}", error))??;
+    let started_at = Instant::now();
+    let mut body = json!({
+        "model": asr_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": format!(
+                                "data:{};base64,{}",
+                                captured.content_type,
+                                base64::engine::general_purpose::STANDARD.encode(&captured.audio)
+                            )
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+    if language != "auto" {
+        body["asr_options"] = json!({ "language": language });
+    }
+
+    let response_json =
+        send_chat_completion(&base_url, &api_key, &body, Some(Duration::from_secs(25))).await?;
+
+    Ok(ProcessTapTranscribeResponse {
+        chunk_index,
+        text: response_json
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        model: response_json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&asr_model)
+            .to_string(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+        capture_elapsed_ms: captured.elapsed_ms,
+        bytes: captured.audio.len() as u64,
+        summary: captured.summary,
+    })
+}
+
+/// 同步执行系统音频 helper，避免阻塞 Tauri 异步运行时。
+fn capture_process_tap_audio_blocking(
+    request: ProcessTapCaptureRequest,
+) -> Result<ProcessTapCaptureResponse, String> {
+    let captured = capture_process_tap_audio_bytes(request)?;
+    Ok(ProcessTapCaptureResponse {
+        audio_base64: base64::engine::general_purpose::STANDARD.encode(&captured.audio),
+        content_type: captured.content_type,
+        bytes: captured.audio.len() as u64,
+        summary: captured.summary,
+        elapsed_ms: captured.elapsed_ms,
+    })
+}
+
+/// 同步执行系统音频 helper 并返回内存中的 WAV 数据。
+fn capture_process_tap_audio_bytes(
+    request: ProcessTapCaptureRequest,
+) -> Result<ProcessTapCapturedAudio, String> {
+    let started_at = Instant::now();
+    let helper = resolve_process_tap_helper_path()?;
+    let duration_ms = request.duration_ms.clamp(800, 8_000);
+    let duration_seconds = format!("{:.3}", duration_ms as f64 / 1000.0);
+    let target_keyword = if request.target_keyword.trim().is_empty() {
+        "active"
+    } else {
+        request.target_keyword.trim()
+    };
+    let output_path = env::temp_dir().join(format!(
+        "typesass-process-tap-{}-{}.wav",
+        std::process::id(),
+        started_at.elapsed().as_nanos()
+    ));
+    let output = Command::new(&helper)
+        .arg(&output_path)
+        .arg(duration_seconds)
+        .arg(target_keyword)
+        .output()
+        .map_err(|error| format!("启动系统音频采集器失败：{}", error))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let _ = fs::remove_file(&output_path);
+        return Err(format!(
+            "系统音频采集失败：{}{}",
+            stdout,
+            if stderr.is_empty() {
+                "".to_string()
+            } else {
+                format!("；{}", stderr)
+            }
+        ));
+    }
+    let audio =
+        fs::read(&output_path).map_err(|error| format!("读取系统音频片段失败：{}", error))?;
+    let _ = fs::remove_file(&output_path);
+    if audio.len() <= 4_096 {
+        return Err(format!("系统音频片段为空：{}", stdout));
+    }
+    Ok(ProcessTapCapturedAudio {
+        audio,
+        content_type: "audio/wav".to_string(),
+        summary: stdout,
+        elapsed_ms: started_at.elapsed().as_millis(),
+    })
+}
+
+/// 查找随 Tauri 打包或开发环境生成的 Core Audio Process Tap helper。
+fn resolve_process_tap_helper_path() -> Result<PathBuf, String> {
+    let current_exe =
+        env::current_exe().map_err(|error| format!("读取当前程序路径失败：{}", error))?;
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| "当前程序路径没有父目录".to_string())?;
+    let helper_names = process_tap_helper_names();
+    let mut candidates = Vec::new();
+    for name in &helper_names {
+        candidates.push(exe_dir.join(name));
+        candidates.push(exe_dir.join("../Resources").join(name));
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries")
+                .join(name),
+        );
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| "未找到系统音频采集器，请重新打包 typesass。".to_string())
+}
+
+/// 当前平台可能出现的 helper 文件名。
+fn process_tap_helper_names() -> Vec<String> {
+    let mut names = vec!["typesass-process-tap".to_string()];
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    names.push("typesass-process-tap-aarch64-apple-darwin".to_string());
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    names.push("typesass-process-tap-x86_64-apple-darwin".to_string());
+    names
 }
 
 /// 接收 ASR 原文并按模式执行听写整理、翻译或问答。

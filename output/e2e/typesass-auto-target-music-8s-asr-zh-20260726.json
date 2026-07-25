@@ -1,0 +1,19 @@
+{
+  "status": 200,
+  "elapsedMs": 1268,
+  "model": "mimo-v2.5-asr",
+  "text": "仿佛还是昨天，可是昨天已非常遥远。",
+  "usage": {
+    "completion_tokens": 11,
+    "prompt_tokens": 72,
+    "total_tokens": 83,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+      "audio_tokens": 50,
+      "cached_tokens": 4
+    },
+    "seconds": 8
+  }
+}

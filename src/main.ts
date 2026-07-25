@@ -34,6 +34,7 @@ const DIAGNOSTIC_LOG_STORAGE_KEY = "aiToolDiagnosticLogV1";
 const DEFAULT_HUB_NOTICE = "所有设置和历史都只保存在本机。";
 const MIN_RECORDING_MS = 800;
 const SUBTITLE_CHUNK_MS = 1800;
+const SUBTITLE_NATIVE_CHUNK_MS = 8000;
 const SUBTITLE_OVERLAP_MS = 450;
 const SUBTITLE_MIN_CHUNK_MS = 1000;
 const SUBTITLE_MAX_CHUNK_MS = 4200;
@@ -42,6 +43,10 @@ const SUBTITLE_FORCE_FINALIZE_MS = 8000;
 const SUBTITLE_HIDE_DELAY_MS = 4200;
 const SUBTITLE_DISPATCH_INTERVAL_MS = 360;
 const SUBTITLE_SOUND_LEVEL_THRESHOLD = 0.018;
+const SUBTITLE_AUDIO_SETUP_TIMEOUT_MS = 8000;
+const SUBTITLE_STARTUP_STEP_TIMEOUT_MS = 10000;
+const SUBTITLE_NATIVE_CAPTURE_TIMEOUT_MS = SUBTITLE_NATIVE_CHUNK_MS + 5000;
+const NATIVE_SYSTEM_AUDIO_DEVICE_ID = "native-process-tap";
 const MAX_SUBTITLE_HISTORY_ITEMS = 160;
 const HUB_DIAGNOSTICS_REFRESH_INTERVAL_MS = 4000;
 const MAX_DIAGNOSTIC_LOG_ITEMS = 160;
@@ -132,6 +137,15 @@ interface ShortcutConfig {
   subtitle: string;
 }
 
+interface SubtitleRecorderChunk {
+  /** 实时字幕录音片段序号，用于诊断日志定位连续切片。 */
+  index: number;
+  /** 当前片段完整音频 Blob。 */
+  blob: Blob;
+  /** 浏览器录音器产出的原始音频格式。 */
+  mimeType: string;
+}
+
 interface VoiceConfig {
   /** OpenAI 兼容接口地址。 */
   baseUrl: string;
@@ -195,6 +209,47 @@ interface TranscribeResponse {
   elapsedMs: number;
   /** 实际返回的模型名称。 */
   model: string;
+}
+
+interface ProcessTapCaptureResponse {
+  /** WAV 音频 base64 内容，不包含 data URL 头。 */
+  audioBase64: string;
+  /** 音频 MIME 类型。 */
+  contentType: string;
+  /** 采集到的音频字节数。 */
+  bytes: number;
+  /** 原生 helper 输出的目标进程、帧数和采样率摘要。 */
+  summary: string;
+  /** 本地采集总耗时。 */
+  elapsedMs: number;
+}
+
+interface ProcessTapTranscribeResponse {
+  /** 字幕片段序号。 */
+  chunkIndex: number;
+  /** 转写后的文字。 */
+  text: string;
+  /** 实际返回的模型名称。 */
+  model: string;
+  /** ASR 请求耗时。 */
+  elapsedMs: number;
+  /** 本地采集总耗时。 */
+  captureElapsedMs: number;
+  /** 采集到的音频字节数。 */
+  bytes: number;
+  /** 原生 helper 输出的目标进程、帧数和采样率摘要。 */
+  summary: string;
+}
+
+interface ProcessTapTranscribeOutcome {
+  /** 字幕片段序号。 */
+  chunkIndex: number;
+  /** 任务是否成功。 */
+  ok: boolean;
+  /** 成功时的转写结果。 */
+  response?: ProcessTapTranscribeResponse;
+  /** 失败时的错误原因。 */
+  error?: string;
 }
 
 interface ProcessTextRequest {
@@ -472,6 +527,8 @@ interface TauriWindow extends Window {
   __TAURI_INTERNALS__?: unknown;
   /** Rust 快捷键直达前端的处理函数。 */
   __AIToolHandleShortcutMode?: (mode: ShortcutMode, targetApp?: string, keepHubVisible?: boolean) => void;
+  /** Rust 原生字幕后台任务完成后的处理函数。 */
+  __AIToolHandleNativeSubtitleOutcome?: (payload: ProcessTapTranscribeOutcome) => void;
   /** 前端尚未加载完成时暂存的快捷键触发模式。 */
   __AIToolPendingShortcutMode?: ShortcutMode | ShortcutTriggerPayload;
   /** Rust 结果窗口直达前端的渲染函数。 */
@@ -712,6 +769,14 @@ let subtitleSystemSource: MediaStreamAudioSourceNode | null = null;
 let subtitleMixer: GainNode | null = null;
 let subtitleProcessor: ScriptProcessorNode | null = null;
 let subtitleSink: GainNode | null = null;
+let subtitleMediaRecorder: MediaRecorder | null = null;
+let subtitleRecorderMimeType = "";
+let subtitleRecorderChunkIndex = 0;
+let subtitleRecorderStopTimerHandle: number | null = null;
+let subtitlePendingRecorderChunk: SubtitleRecorderChunk | null = null;
+let isSubtitleUsingNativeSystemAudio = false;
+let subtitleNativeChunkInFlight = false;
+let subtitleNativeChunkTimeoutHandle: number | null = null;
 let subtitleSampleChunks: SubtitleSampleChunk[] = [];
 let subtitleTotalSamples = 0;
 let subtitleDispatchedSampleEnd = 0;
@@ -831,6 +896,9 @@ function getWindowMode(): WindowMode {
 
 /** 初始化悬浮录音条窗口。 */
 function initFloatingWindow(): void {
+  (window as TauriWindow).__AIToolHandleNativeSubtitleOutcome = (payload) => {
+    void handleSubtitleNativeTranscribeOutcome(payload);
+  };
   runtimeBadge.textContent = isTauriRuntime() ? "悬浮模式" : "网页预览";
   recordButton.title = "开始录音";
   recordButton.setAttribute("aria-label", "开始录音");
@@ -844,8 +912,12 @@ function initFloatingWindow(): void {
 
 /** 初始化 Hub 管理窗口。 */
 function initHubWindow(): void {
+  (window as TauriWindow).__AIToolHandleNativeSubtitleOutcome = (payload) => {
+    void handleSubtitleNativeTranscribeOutcome(payload);
+  };
   bindHubEvents();
   void bindHubControlEvents();
+  void bindSubtitleNativeEvents();
   void populateMicrophones();
   void syncDesktopPreferences(readSavedConfig());
   renderHub();
@@ -853,6 +925,21 @@ function initHubWindow(): void {
   startHubDiagnosticsRefresh();
   window.addEventListener("storage", renderHub);
   window.addEventListener("beforeunload", stopHubDiagnosticsRefresh);
+}
+
+/** 监听 Rust 端原生系统音频转写完成事件，避免长耗时 invoke 卡住实时字幕循环。 */
+async function bindSubtitleNativeEvents(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<ProcessTapTranscribeResponse>("subtitle-native-transcribe-result", (event) => {
+      void handleSubtitleNativeTranscribeResult(event.payload);
+    });
+  } catch (error) {
+    showHubNotice(`实时字幕事件监听失败：${formatError(error)}`, "error");
+  }
 }
 
 /** 监听其它窗口要求 Hub 切换页面的事件。 */
@@ -1394,7 +1481,7 @@ function defaultConfig(): VoiceConfig {
     postProcessDictation: true,
     dictationOutputLanguage: DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: "default",
-    systemAudioDeviceId: "auto",
+    systemAudioDeviceId: NATIVE_SYSTEM_AUDIO_DEVICE_ID,
     interactionSounds: true,
     muteWhileDictating: false,
     launchAtLogin: false,
@@ -1429,7 +1516,7 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
         ? value.microphoneDeviceId
         : fallback.microphoneDeviceId,
     systemAudioDeviceId:
-      typeof value.systemAudioDeviceId === "string" && value.systemAudioDeviceId.trim()
+      typeof value.systemAudioDeviceId === "string" && value.systemAudioDeviceId.trim() && value.systemAudioDeviceId !== "auto"
         ? value.systemAudioDeviceId
         : fallback.systemAudioDeviceId,
     interactionSounds:
@@ -1921,10 +2008,22 @@ function readSystemAudioDiagnostic(config: VoiceConfig): { text: string; state: 
   if (config.systemAudioDeviceId === "none") {
     return { text: "未采集系统声音", state: "error" };
   }
+  if (config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID) {
+    return { text: "原生系统音频捕获", state: "success" };
+  }
   if (!config.systemAudioDeviceId || config.systemAudioDeviceId === "auto") {
-    return { text: "自动检测系统声音", state: "warning" };
+    return { text: "需要选择系统声音输入", state: "warning" };
   }
   return { text: "已选择系统声音输入", state: "success" };
+}
+
+/** 读取指定模式自己的快捷键权限文案，避免模式卡片复用口述快捷键状态。 */
+function readModeShortcutPermissionText(mode: ShortcutMode): string {
+  if (!lastPermissionSnapshot.shortcutReady) {
+    return lastPermissionSnapshot.shortcutText;
+  }
+  const shortcut = readSavedConfig().shortcuts[mode] || DEFAULT_SHORTCUTS[mode];
+  return `已注册 ${formatShortcutLabel(shortcut)}`;
 }
 
 /** 按语音模式生成所需权限列表，避免所有模式共用一张全局权限表。 */
@@ -1950,7 +2049,7 @@ function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
       label: "快捷键权限",
       ready: lastPermissionSnapshot.shortcutReady,
       state: lastPermissionSnapshot.shortcutReady ? "success" : "error",
-      description: lastPermissionSnapshot.shortcutText,
+      description: readModeShortcutPermissionText(mode),
     },
   ];
   if (mode === "dictate" || mode === "translate") {
@@ -1966,7 +2065,7 @@ function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
     permissions.push({
       kind: "systemAudio",
       label: "系统声音",
-      ready: lastPermissionSnapshot.systemAudioState !== "error",
+      ready: lastPermissionSnapshot.systemAudioState === "success",
       state: lastPermissionSnapshot.systemAudioState,
       description: lastPermissionSnapshot.systemAudioText,
     });
@@ -2219,8 +2318,12 @@ function readPermissionDialogCopy(
   }
   return {
     title: "设置系统声音",
-    body: "实时字幕要识别电脑正在播放的声音，需要选择可代表系统输出的输入设备，例如 BlackHole、Loopback、Soundflower 或聚合设备。",
-    steps: ["先确认本机已安装或配置虚拟声卡/系统音频输入。", "在音频来源里选择该输入设备，或保持自动检测。", "播放带人声的音频后，再开启实时字幕验证是否出字。"],
+    body: "实时字幕要识别电脑正在播放的声音，需要允许原生系统音频捕获，或选择可代表系统输出的输入设备作为兜底。",
+    steps: [
+      "优先使用“原生系统音频捕获”，macOS 弹出捕获其他应用音频权限时请允许 typesass。",
+      "如果原生捕获不可用，再配置 BlackHole、Loopback、Soundflower 或聚合设备作为系统声音输入。",
+      "播放带人声的音频后，再开启实时字幕验证是否出字。",
+    ],
     primaryLabel: "打开音频来源",
   };
 }
@@ -2669,6 +2772,7 @@ async function populateMicrophones(): Promise<void> {
   const currentSystemAudioValue = systemAudioSelect.value || config.systemAudioDeviceId;
   microphoneSelect.innerHTML = '<option value="default">系统默认麦克风</option>';
   systemAudioSelect.innerHTML = [
+    '<option value="native-process-tap">推荐：原生系统音频捕获</option>',
     '<option value="auto">自动检测系统音频输入</option>',
     '<option value="none">不采集系统声音</option>',
   ].join("");
@@ -2689,7 +2793,10 @@ async function populateMicrophones(): Promise<void> {
         if (device.deviceId) {
           const systemOption = document.createElement("option");
           systemOption.value = device.deviceId;
-          systemOption.textContent = device.label || `音频输入 ${index + 1}`;
+          const systemAudioLabel = device.label || `音频输入 ${index + 1}`;
+          systemOption.textContent = isSystemAudioInputLabel(systemAudioLabel)
+            ? `推荐：${systemAudioLabel}`
+            : systemAudioLabel;
           systemAudioSelect.appendChild(systemOption);
         }
       });
@@ -2778,9 +2885,6 @@ async function requestSubtitleMode(): Promise<void> {
     return;
   }
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const { emitTo } = await import("@tauri-apps/api/event");
-    await invoke("show_subtitle_windows");
     addDiagnosticLog({
       level: "info",
       category: "subtitle",
@@ -2788,7 +2892,7 @@ async function requestSubtitleMode(): Promise<void> {
       message: "用户从 Hub 切换字幕监听模式。",
       mode: "subtitle",
     });
-    await emitTo("main", "hub-start-mode", { mode: "subtitle", targetApp: "", keepHubVisible: false });
+    await toggleSubtitleListening();
     showHubNotice("实时字幕监听已切换。", "success");
   } catch (error) {
     addDiagnosticLog({
@@ -2976,21 +3080,39 @@ async function startSubtitleListening(): Promise<void> {
   }
   isStartingSubtitleListening = true;
   try {
-    if (!(await ensureReadyForRecording("subtitle"))) {
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "准备实时字幕",
+      message: "已进入实时字幕启动流程，开始检查权限和音频输入。",
+      mode: "subtitle",
+    });
+    const permissionReady = await runSubtitleStartupStep(
+      ensureReadyForRecording("subtitle"),
+      "权限检查",
+      "实时字幕权限检查长时间无响应。",
+    );
+    if (!permissionReady) {
+      addDiagnosticLog({
+        level: "warning",
+        category: "subtitle",
+        title: "实时字幕权限检查未通过",
+        message: "启动流程已被模式权限门禁拦截，请按弹窗提示补齐权限或配置。",
+        mode: "subtitle",
+      });
       return;
     }
     resetSubtitleRuntime();
-    await showSubtitleWindows();
-    await emitSubtitleOverlay({ text: "", visible: false, state: "listening", updatedAt: Date.now() });
-    await emitSubtitleHistoryUpdate("正在准备", false);
     const config = readSavedConfig();
-    await setupSubtitleAudioGraph(config);
+    await runSubtitleStartupStep(setupSubtitleAudioGraph(config), "录音器初始化", "实时字幕音频输入长时间无响应。");
     isSubtitleListening = true;
     subtitleStartedAt = Date.now();
     subtitleSegmentStartedAt = 0;
     subtitleLastSoundAt = Date.now();
     subtitleLastTextAt = 0;
     startSubtitleTimers();
+    void showSubtitleWindowsWithDiagnostics();
+    await emitSubtitleOverlay({ text: "", visible: false, state: "listening", updatedAt: Date.now() });
     addDiagnosticLog({
       level: "info",
       category: "subtitle",
@@ -3012,6 +3134,71 @@ async function startSubtitleListening(): Promise<void> {
   }
 }
 
+/**
+ * 为实时字幕启动关键步骤增加超时诊断，避免界面一直停留在“正在准备”。
+ * 流程：执行传入步骤；若超时先抛出带步骤名的错误；成功后写入步骤完成日志。
+ * 参数：operation 为要等待的异步步骤；stepName 为诊断展示名称；timeoutMessage 为超时提示。
+ * 返回：异步步骤的原始返回值。
+ * 异常：步骤失败或超时都会抛出 Error，由外层统一展示到字幕历史。
+ */
+async function runSubtitleStartupStep<T>(operation: Promise<T>, stepName: string, timeoutMessage: string): Promise<T> {
+  let timer: number | null = null;
+  try {
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: `实时字幕${stepName}开始`,
+      message: `${stepName}开始执行。`,
+      mode: "subtitle",
+    });
+    const result = await Promise.race<T>([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = window.setTimeout(() => {
+          reject(new Error(timeoutMessage));
+        }, SUBTITLE_STARTUP_STEP_TIMEOUT_MS);
+      }),
+    ]);
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: `实时字幕${stepName}完成`,
+      message: `${stepName}已完成，继续启动实时字幕。`,
+      mode: "subtitle",
+    });
+    return result;
+  } finally {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * 为关键异步操作增加前端侧超时保护。
+ * 流程：并行等待原始 Promise 和定时器；原始 Promise 先返回则清理定时器；定时器先触发则抛出指定错误。
+ * 参数：operation 为待保护的异步操作；timeoutMs 为超时时间；timeoutMessage 为超时错误文案。
+ * 返回：原始异步操作的返回值。
+ * 异常：原始操作失败或超时都会向调用方抛出 Error。
+ */
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timer: number | null = null;
+  try {
+    return await Promise.race<T>([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = window.setTimeout(() => {
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+    }
+  }
+}
+
 /** 停止实时字幕监听，并把未固化字幕写入历史。 */
 async function stopSubtitleListening(): Promise<void> {
   if (!isSubtitleListening && !isStartingSubtitleListening) {
@@ -3019,9 +3206,6 @@ async function stopSubtitleListening(): Promise<void> {
     return;
   }
   stopSubtitleTimers();
-  if (!subtitleInFlight) {
-    await dispatchSubtitleChunkIfReady(true);
-  }
   await finalizeSubtitleSegment("stop");
   isSubtitleListening = false;
   subtitleDispatchQueued = false;
@@ -3038,15 +3222,81 @@ async function stopSubtitleListening(): Promise<void> {
   });
 }
 
-/** 初始化实时字幕的麦克风与系统音频混音图。 */
+/** 初始化实时字幕的麦克风与系统音频录音器。 */
 async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
-  subtitleMicStream = await navigator.mediaDevices.getUserMedia({ audio: buildAudioConstraints(config) });
+  isSubtitleUsingNativeSystemAudio = config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID;
+  if (isSubtitleUsingNativeSystemAudio) {
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "实时字幕使用原生系统音频",
+      message: "已选择 Core Audio Process Tap，将跳过麦克风输入并直接采集当前正在发声的系统应用。",
+      mode: "subtitle",
+    });
+    subtitleCurrentSource = "system";
+    subtitleRecorderChunkIndex = 0;
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "实时字幕开始创建录音器",
+      message: "音频输入已准备，开始创建原生系统音频切片。",
+      mode: "subtitle",
+      details: [`音频来源：${formatSubtitleSource(subtitleCurrentSource)}`],
+    });
+    startSubtitleRecorderSegment();
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "实时字幕录音器就绪",
+      message: "原生系统音频采集已就绪，按独立小段录制并发送 ASR。",
+      mode: "subtitle",
+      details: [`音频来源：${formatSubtitleSource(subtitleCurrentSource)}`],
+    });
+    return;
+  }
+
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕开始申请麦克风",
+    message: "准备打开实时字幕麦克风输入。",
+    mode: "subtitle",
+    details: [`麦克风：${config.microphoneDeviceId || "default"}`],
+  });
+  subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风");
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕麦克风已打开",
+    message: "麦克风输入已返回，继续解析系统声音输入。",
+    mode: "subtitle",
+    details: [`轨道数：${subtitleMicStream.getAudioTracks().length}`],
+  });
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕解析系统声音",
+    message: "开始根据设置解析系统声音输入设备。",
+    mode: "subtitle",
+    details: [`系统声音设置：${config.systemAudioDeviceId || "auto"}`],
+  });
   const systemAudioDeviceId = await resolveSystemAudioDeviceId(config);
   if (systemAudioDeviceId) {
     try {
-      subtitleSystemStream = await navigator.mediaDevices.getUserMedia({
-        audio: buildSystemAudioConstraints(systemAudioDeviceId),
+      addDiagnosticLog({
+        level: "info",
+        category: "subtitle",
+        title: "实时字幕开始申请系统声音",
+        message: "已找到系统声音候选设备，准备打开系统声音输入。",
+        mode: "subtitle",
+        details: [`系统声音设备：${systemAudioDeviceId}`],
       });
+      subtitleSystemStream = await requestSubtitleAudioStream(
+        {
+          audio: buildSystemAudioConstraints(systemAudioDeviceId),
+        },
+        "系统声音",
+      );
     } catch (error) {
       addDiagnosticLog({
         level: "warning",
@@ -3058,29 +3308,447 @@ async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
       });
       subtitleSystemStream = null;
     }
-  }
-
-  subtitleAudioContext = new AudioContext();
-  subtitleSampleRate = subtitleAudioContext.sampleRate;
-  subtitleMixer = subtitleAudioContext.createGain();
-  subtitleProcessor = subtitleAudioContext.createScriptProcessor(4096, 1, 1);
-  subtitleSink = subtitleAudioContext.createGain();
-  subtitleSink.gain.value = 0;
-
-  subtitleMicSource = subtitleAudioContext.createMediaStreamSource(subtitleMicStream);
-  subtitleMicSource.connect(subtitleMixer);
-  if (subtitleSystemStream) {
-    subtitleSystemSource = subtitleAudioContext.createMediaStreamSource(subtitleSystemStream);
-    subtitleSystemSource.connect(subtitleMixer);
-    subtitleCurrentSource = "mixed";
   } else {
-    subtitleCurrentSource = "microphone";
+    addDiagnosticLog({
+      level: "warning",
+      category: "subtitle",
+      title: "实时字幕未找到系统声音输入",
+      message: "未解析到可用的系统声音输入设备，本轮将先使用麦克风输入继续监听。",
+      mode: "subtitle",
+      details: [`系统声音设置：${config.systemAudioDeviceId || "auto"}`],
+    });
   }
 
-  subtitleProcessor.onaudioprocess = collectSubtitleSamples;
-  subtitleMixer.connect(subtitleProcessor);
-  subtitleProcessor.connect(subtitleSink);
-  subtitleSink.connect(subtitleAudioContext.destination);
+  subtitleCurrentSource = isSubtitleUsingNativeSystemAudio ? "system" : subtitleSystemStream ? "mixed" : "microphone";
+  subtitleRecorderChunkIndex = 0;
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕开始创建录音器",
+    message: isSubtitleUsingNativeSystemAudio
+      ? "音频输入已准备，开始创建原生系统音频切片。"
+      : "音频输入已准备，开始创建 MediaRecorder。",
+    mode: "subtitle",
+    details: [`音频来源：${formatSubtitleSource(subtitleCurrentSource)}`],
+  });
+  startSubtitleRecorderSegment();
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕录音器就绪",
+    message: isSubtitleUsingNativeSystemAudio
+      ? "原生系统音频采集已就绪，按独立小段录制并发送 ASR。"
+      : "麦克风与系统声音输入已接入 MediaRecorder，按独立小段录制并发送 ASR。",
+    mode: "subtitle",
+    details: [`音频来源：${formatSubtitleSource(subtitleCurrentSource)}`],
+  });
+}
+
+/** 启动一段独立的实时字幕录音，停止后自动转写并进入下一段。 */
+function startSubtitleRecorderSegment(): void {
+  const hasAudioInput = isSubtitleUsingNativeSystemAudio || subtitleMicStream !== null;
+  if ((!isSubtitleListening && !isStartingSubtitleListening) || !hasAudioInput) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "subtitle",
+      title: "实时字幕录音片段未启动",
+      message: "当前状态不允许启动录音片段。",
+      mode: "subtitle",
+      details: [
+        `监听中：${isSubtitleListening ? "是" : "否"}`,
+        `启动中：${isStartingSubtitleListening ? "是" : "否"}`,
+        `麦克风：${subtitleMicStream ? "已打开" : "未打开"}`,
+        `原生系统音频：${isSubtitleUsingNativeSystemAudio ? "已启用" : "未启用"}`,
+      ],
+    });
+    return;
+  }
+  if (isSubtitleUsingNativeSystemAudio) {
+    void startSubtitleNativeRecorderSegment();
+    return;
+  }
+  if (!subtitleMicStream) {
+    return;
+  }
+  const recorder = createSubtitleMediaRecorder(subtitleMicStream, subtitleSystemStream);
+  const chunks: Blob[] = [];
+  const mimeType = recorder.mimeType || "audio/webm";
+  subtitleMediaRecorder = recorder;
+  subtitleRecorderMimeType = mimeType;
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data.size) {
+      chunks.push(event.data);
+    }
+  });
+  recorder.addEventListener("stop", () => {
+    if (subtitleRecorderStopTimerHandle !== null) {
+      window.clearTimeout(subtitleRecorderStopTimerHandle);
+      subtitleRecorderStopTimerHandle = null;
+    }
+    const shouldContinue = isSubtitleListening && subtitleMicStream !== null;
+    if (chunks.length) {
+      subtitleRecorderChunkIndex += 1;
+      const blob = new Blob(chunks, { type: mimeType });
+      void handleSubtitleRecorderChunk({
+        index: subtitleRecorderChunkIndex,
+        blob,
+        mimeType,
+      });
+    }
+    if (shouldContinue) {
+      startSubtitleRecorderSegment();
+    }
+  });
+  recorder.addEventListener("error", (event) => {
+    addDiagnosticLog({
+      level: "error",
+      category: "subtitle",
+      title: "实时字幕录音器异常",
+      message: formatError(event.error),
+      mode: "subtitle",
+    });
+    void emitSubtitleHistoryUpdate("录音器异常", true);
+  });
+  recorder.start();
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕录音片段已开始",
+    message: "MediaRecorder 已开始录制当前字幕片段。",
+    mode: "subtitle",
+    details: [`格式：${mimeType}`, `片段时长：${SUBTITLE_CHUNK_MS}ms`],
+  });
+  subtitleRecorderStopTimerHandle = window.setTimeout(() => {
+    if (recorder.state !== "inactive") {
+      recorder.stop();
+    }
+  }, SUBTITLE_CHUNK_MS);
+}
+
+/** 启动一段原生系统音频录制，停止后自动转写并进入下一段。 */
+async function startSubtitleNativeRecorderSegment(): Promise<void> {
+  if (
+    (!isSubtitleListening && !isStartingSubtitleListening) ||
+    !isSubtitleUsingNativeSystemAudio ||
+    subtitleNativeChunkInFlight
+  ) {
+    return;
+  }
+  subtitleRecorderChunkIndex += 1;
+  const chunkIndex = subtitleRecorderChunkIndex;
+  try {
+    subtitleNativeChunkInFlight = true;
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "实时字幕原生音频片段已开始",
+      message: "Core Audio Process Tap 正在采集当前活跃系统声音。",
+      mode: "subtitle",
+      details: [`序号：${chunkIndex}`, `片段时长：${SUBTITLE_NATIVE_CHUNK_MS}ms`],
+    });
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "实时字幕调用原生采集",
+      message: "正在调用 Tauri 原生命令采集系统音频。",
+      mode: "subtitle",
+      details: [`序号：${chunkIndex}`, `超时：${SUBTITLE_NATIVE_CAPTURE_TIMEOUT_MS}ms`],
+    });
+    if (subtitleNativeChunkTimeoutHandle !== null) {
+      window.clearTimeout(subtitleNativeChunkTimeoutHandle);
+    }
+    subtitleNativeChunkTimeoutHandle = window.setTimeout(() => {
+      subtitleNativeChunkInFlight = false;
+      addDiagnosticLog({
+        level: "error",
+        category: "subtitle",
+        title: "原生系统音频采集超时",
+        message: "原生系统音频采集或转写长时间无响应，已准备下一段重试。",
+        mode: "subtitle",
+        details: [`序号：${chunkIndex}`],
+      });
+      void emitSubtitleHistoryUpdate("系统音频采集超时", true);
+      if (isSubtitleListening && isSubtitleUsingNativeSystemAudio) {
+        startSubtitleRecorderSegment();
+      }
+    }, SUBTITLE_NATIVE_CAPTURE_TIMEOUT_MS + 25000);
+    void startProcessTapTranscribeTask(SUBTITLE_NATIVE_CHUNK_MS, "active", chunkIndex).catch((error: unknown) => {
+      handleSubtitleNativeTranscribeFailure(chunkIndex, formatError(error));
+    });
+    void pollProcessTapTranscribeOutcome(chunkIndex);
+  } catch (error) {
+    subtitleNativeChunkInFlight = false;
+    addDiagnosticLog({
+      level: "error",
+      category: "subtitle",
+      title: "原生系统音频采集失败",
+      message: formatError(error),
+      mode: "subtitle",
+    });
+    await emitSubtitleHistoryUpdate("系统音频采集失败", true);
+  }
+}
+
+/** 轮询 Rust 后台字幕任务结果，用短命令避免长耗时 invoke 卡住 WebView。 */
+async function pollProcessTapTranscribeOutcome(chunkIndex: number): Promise<void> {
+  const startedAt = Date.now();
+  while (isSubtitleListening && isSubtitleUsingNativeSystemAudio && subtitleNativeChunkInFlight) {
+    const outcome = await takeProcessTapTranscribeOutcome(chunkIndex);
+    if (outcome) {
+      await handleSubtitleNativeTranscribeOutcome(outcome);
+      return;
+    }
+    if (Date.now() - startedAt >= SUBTITLE_NATIVE_CAPTURE_TIMEOUT_MS + 25000) {
+      handleSubtitleNativeTranscribeFailure(chunkIndex, "原生系统音频采集或转写长时间无响应。");
+      return;
+    }
+    await delay(500);
+  }
+}
+
+/** 处理原生系统音频后台任务完成结果。 */
+async function handleSubtitleNativeTranscribeOutcome(outcome: ProcessTapTranscribeOutcome): Promise<void> {
+  if (outcome.ok && outcome.response) {
+    await handleSubtitleNativeTranscribeResult(outcome.response);
+    return;
+  }
+  handleSubtitleNativeTranscribeFailure(outcome.chunkIndex, outcome.error || "原生系统音频转写失败。");
+}
+
+/** 处理原生系统音频采集或转写失败，并在监听中继续下一段。 */
+function handleSubtitleNativeTranscribeFailure(chunkIndex: number, message: string): void {
+  if (!subtitleNativeChunkInFlight) {
+    return;
+  }
+  subtitleNativeChunkInFlight = false;
+  if (subtitleNativeChunkTimeoutHandle !== null) {
+    window.clearTimeout(subtitleNativeChunkTimeoutHandle);
+    subtitleNativeChunkTimeoutHandle = null;
+  }
+  addDiagnosticLog({
+    level: "error",
+    category: "subtitle",
+    title: "原生系统音频采集失败",
+    message,
+    mode: "subtitle",
+    details: [`序号：${chunkIndex}`],
+  });
+  void emitSubtitleHistoryUpdate("系统音频采集失败", true);
+  if (isSubtitleListening && isSubtitleUsingNativeSystemAudio) {
+    startSubtitleRecorderSegment();
+  }
+}
+
+/** 等待指定毫秒数后继续执行。 */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+/** 处理 Rust 端返回的原生系统音频转写结果，并继续下一段实时字幕。 */
+async function handleSubtitleNativeTranscribeResult(response: ProcessTapTranscribeResponse): Promise<void> {
+  if (!subtitleNativeChunkInFlight) {
+    return;
+  }
+  subtitleNativeChunkInFlight = false;
+  if (subtitleNativeChunkTimeoutHandle !== null) {
+    window.clearTimeout(subtitleNativeChunkTimeoutHandle);
+    subtitleNativeChunkTimeoutHandle = null;
+  }
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕原生转写返回",
+    message: "Tauri 原生命令已返回系统音频字幕。",
+    mode: "subtitle",
+    elapsedMs: response.captureElapsedMs + response.elapsedMs,
+    details: [
+      `序号：${response.chunkIndex}`,
+      `音频大小：${formatBytes(response.bytes)}`,
+      `采集耗时：${formatDuration(response.captureElapsedMs)}`,
+      `转写耗时：${formatDuration(response.elapsedMs)}`,
+      response.summary,
+    ],
+  });
+  await handleSubtitleText(response.text, response);
+  addDiagnosticLog({
+    level: "info",
+    category: "subtitle",
+    title: "实时字幕原生音频片段完成",
+    message: "系统音频片段已完成采集和 ASR。",
+    mode: "subtitle",
+    elapsedMs: response.captureElapsedMs + response.elapsedMs,
+    details: [`序号：${response.chunkIndex}`, `音频大小：${formatBytes(response.bytes)}`, response.summary],
+  });
+  if (isSubtitleListening && isSubtitleUsingNativeSystemAudio) {
+    startSubtitleRecorderSegment();
+  }
+}
+
+/**
+ * 创建实时字幕 MediaRecorder，优先把麦克风与系统声音轨道放进同一个录音流。
+ * 流程：合并可用音频轨道；选择当前 WebView 支持的 mimeType；创建失败时回退到麦克风单轨。
+ * 参数：micStream 为麦克风输入；systemStream 为可选系统声音输入。
+ * 返回：可按固定时间片产出 Blob 的 MediaRecorder。
+ * 异常：麦克风单轨也无法创建录音器时抛出浏览器原始错误。
+ */
+function createSubtitleMediaRecorder(micStream: MediaStream, systemStream: MediaStream | null): MediaRecorder {
+  const combinedTracks = [...micStream.getAudioTracks(), ...(systemStream?.getAudioTracks() ?? [])];
+  const combinedStream = new MediaStream(combinedTracks);
+  try {
+    return new MediaRecorder(combinedStream, createSubtitleRecorderOptions());
+  } catch (error) {
+    if (!systemStream) {
+      throw error;
+    }
+    addDiagnosticLog({
+      level: "warning",
+      category: "subtitle",
+      title: "系统声音混合录音失败",
+      message: `系统声音与麦克风混合录音器创建失败，已回退到麦克风：${formatError(error)}`,
+      mode: "subtitle",
+    });
+    subtitleCurrentSource = "microphone";
+    return new MediaRecorder(new MediaStream(micStream.getAudioTracks()), createSubtitleRecorderOptions());
+  }
+}
+
+/** 选择当前 WebView 支持的实时字幕录音格式，优先选择 ASR 常见可识别格式。 */
+function createSubtitleRecorderOptions(): MediaRecorderOptions {
+  const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/aac"].find((candidate) =>
+    MediaRecorder.isTypeSupported(candidate),
+  );
+  return mimeType ? { mimeType } : {};
+}
+
+/** 处理 MediaRecorder 产出的实时字幕音频片段，并串行发送给 ASR。 */
+async function handleSubtitleRecorderChunk(chunk: SubtitleRecorderChunk): Promise<void> {
+  if (!isSubtitleListening || !chunk.blob.size) {
+    return;
+  }
+  subtitleLastSoundAt = Date.now();
+  if (subtitleInFlight) {
+    subtitleDispatchQueued = true;
+    subtitlePendingRecorderChunk = chunk;
+    addDiagnosticLog({
+      level: "warning",
+      category: "subtitle",
+      title: "字幕切片等待",
+      message: "上一段字幕仍在转写，已保留最新片段等待下一次发送。",
+      mode: "subtitle",
+      details: [`序号：${chunk.index}`, `音频大小：${formatBytes(chunk.blob.size)}`, `格式：${chunk.mimeType || "unknown"}`],
+    });
+    return;
+  }
+  subtitleInFlight = true;
+  try {
+    let currentChunk: SubtitleRecorderChunk | null = chunk;
+    while (currentChunk && isSubtitleListening) {
+      await transcribeSubtitleBlob(currentChunk.blob, currentChunk.index);
+      currentChunk = subtitlePendingRecorderChunk;
+      subtitlePendingRecorderChunk = null;
+    }
+  } finally {
+    subtitleInFlight = false;
+    subtitleDispatchQueued = false;
+    if (subtitlePendingRecorderChunk && isSubtitleListening) {
+      const nextChunk = subtitlePendingRecorderChunk;
+      subtitlePendingRecorderChunk = null;
+      void handleSubtitleRecorderChunk(nextChunk);
+    }
+  }
+}
+
+/**
+ * 申请实时字幕音频流，并在系统长时间不返回权限或设备结果时主动失败。
+ * 流程：发起 getUserMedia，同时设置超时；任一方先完成后清理计时器。
+ * 参数：constraints 为浏览器音频采集约束；label 用于错误提示。
+ * 返回：成功获取到的 MediaStream。
+ * 异常：浏览器权限拒绝、设备不可用或超时都会抛出 Error。
+ */
+function requestSubtitleAudioStream(constraints: MediaStreamConstraints, label: string): Promise<MediaStream> {
+  return new Promise<MediaStream>((resolve, reject) => {
+    let settled = false;
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: `实时字幕${label}输入申请中`,
+      message: `已向系统申请${label}音频输入。`,
+      mode: "subtitle",
+    });
+    const timer = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      addDiagnosticLog({
+        level: "error",
+        category: "subtitle",
+        title: `实时字幕${label}输入超时`,
+        message: `${label}音频输入长时间无响应，请检查设备权限或输入源。`,
+        mode: "subtitle",
+      });
+      reject(new Error(`${label}音频输入长时间无响应，请检查设备权限或输入源。`));
+    }, SUBTITLE_AUDIO_SETUP_TIMEOUT_MS);
+
+    navigator.mediaDevices
+      .getUserMedia(constraints)
+      .then((stream) => {
+        if (settled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timer);
+        addDiagnosticLog({
+          level: "info",
+          category: "subtitle",
+          title: `实时字幕${label}输入已返回`,
+          message: `${label}音频输入已成功打开。`,
+          mode: "subtitle",
+          details: [`轨道数：${stream.getAudioTracks().length}`],
+        });
+        resolve(stream);
+      })
+      .catch((error: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timer);
+        addDiagnosticLog({
+          level: "error",
+          category: "subtitle",
+          title: `实时字幕${label}输入失败`,
+          message: formatError(error),
+          mode: "subtitle",
+        });
+        reject(error instanceof Error ? error : new Error(formatError(error)));
+      });
+  });
+}
+
+/**
+ * 确保实时字幕 AudioContext 真正进入运行态，避免 WebView 创建后保持 suspended 导致无采样回调。
+ * 流程：如果当前不是 running，则调用 resume；仍未运行时写入警告日志，便于现场排查。
+ */
+async function ensureSubtitleAudioContextRunning(): Promise<void> {
+  if (!subtitleAudioContext || subtitleAudioContext.state === "running") {
+    return;
+  }
+  await subtitleAudioContext.resume();
+  const resumedState = subtitleAudioContext.state as AudioContextState;
+  if (resumedState !== "running") {
+    addDiagnosticLog({
+      level: "warning",
+      category: "subtitle",
+      title: "实时字幕音频上下文未运行",
+      message: "AudioContext 没有进入 running 状态，可能导致字幕切片无法产生。",
+      mode: "subtitle",
+      details: [`AudioContext：${resumedState}`],
+    });
+  }
 }
 
 /** 自动选择可代表系统播放声音的输入设备，优先识别虚拟声卡。 */
@@ -3132,6 +3800,12 @@ function resetSubtitleRuntime(): void {
   subtitleSampleRate = 0;
   subtitleInFlight = false;
   subtitleDispatchQueued = false;
+  subtitlePendingRecorderChunk = null;
+  subtitleNativeChunkInFlight = false;
+  if (subtitleNativeChunkTimeoutHandle !== null) {
+    window.clearTimeout(subtitleNativeChunkTimeoutHandle);
+    subtitleNativeChunkTimeoutHandle = null;
+  }
   subtitlePendingText = "";
   subtitleLastDisplayedText = "";
   subtitleLastModel = "";
@@ -3267,22 +3941,35 @@ function sliceSubtitleSamples(startSample: number, endSample: number): Float32Ar
 async function transcribeSubtitleSamples(samples: Float32Array, level: number): Promise<void> {
   const config = readSavedConfig();
   const audioBlob = new Blob([encodeWav(samples, subtitleSampleRate)], { type: "audio/wav" });
-  addDiagnosticLog({
-    level: "info",
-    category: "subtitle",
-    title: "发送字幕切片",
-    message: "正在把实时字幕音频片段发送给 ASR。",
-    mode: "subtitle",
-    details: [`音频大小：${formatBytes(audioBlob.size)}`, `音量：${level.toFixed(3)}`],
-  });
+  await transcribeSubtitleBlob(audioBlob, subtitleRecorderChunkIndex, level);
+}
+
+/** 把 MediaRecorder 产出的字幕音频片段发送给 Mimo ASR，并处理返回文本。 */
+async function transcribeSubtitleBlob(audioBlob: Blob, chunkIndex: number, level?: number): Promise<void> {
+  const config = readSavedConfig();
   try {
+    const requestBlob = await normalizeSubtitleAudioBlob(audioBlob);
+    addDiagnosticLog({
+      level: "info",
+      category: "subtitle",
+      title: "发送字幕切片",
+      message: "正在把实时字幕音频片段发送给 ASR。",
+      mode: "subtitle",
+      details: [
+        `序号：${chunkIndex}`,
+        `音频大小：${formatBytes(audioBlob.size)}`,
+        `格式：${audioBlob.type || subtitleRecorderMimeType || "unknown"}`,
+        requestBlob === audioBlob ? "转码：未转码" : `转码：WAV ${formatBytes(requestBlob.size)}`,
+        typeof level === "number" ? `音量：${level.toFixed(3)}` : "音量：MediaRecorder",
+      ],
+    });
     const response = await callTranscribe({
       apiKey: "",
       baseUrl: config.baseUrl,
       asrModel: config.asrModel,
       language: config.language,
-      contentType: "audio/wav",
-      audioBase64: await blobToBase64(audioBlob),
+      contentType: requestBlob.type || "audio/wav",
+      audioBase64: await blobToBase64(requestBlob),
     });
     const text = normalizeSubtitleText(response.text);
     subtitleLastModel = response.model;
@@ -3307,6 +3994,40 @@ async function transcribeSubtitleSamples(samples: Float32Array, level: number): 
       mode: "subtitle",
     });
     await emitSubtitleHistoryUpdate("转写失败", true);
+  }
+}
+
+/**
+ * 把实时字幕录音器产出的浏览器格式统一转成 ASR 已验证可接受的 WAV。
+ * 流程：如果已经是 WAV 直接返回；否则用 AudioContext 解码，再复用现有 WAV 编码器。
+ * 参数：blob 为 MediaRecorder 的原始片段。
+ * 返回：可发送给 ASR 的 WAV Blob。
+ * 异常：浏览器无法解码该片段时抛出错误，外层会写入字幕转写失败日志。
+ */
+async function normalizeSubtitleAudioBlob(blob: Blob): Promise<Blob> {
+  if (blob.type.includes("wav")) {
+    return blob;
+  }
+  const arrayBuffer = await blob.arrayBuffer();
+  const decodeContext = new AudioContext();
+  try {
+    const decodedBuffer = await decodeContext.decodeAudioData(arrayBuffer.slice(0));
+    const channelData = decodedBuffer.getChannelData(0);
+    const samples = new Float32Array(channelData.length);
+    samples.set(channelData);
+    return new Blob([encodeWav(samples, decodedBuffer.sampleRate)], { type: "audio/wav" });
+  } catch (error) {
+    addDiagnosticLog({
+      level: "error",
+      category: "subtitle",
+      title: "字幕转码失败",
+      message: formatError(error),
+      mode: "subtitle",
+      details: [`音频大小：${formatBytes(blob.size)}`, `格式：${blob.type || subtitleRecorderMimeType || "unknown"}`],
+    });
+    throw error;
+  } finally {
+    void decodeContext.close();
   }
 }
 
@@ -3420,6 +4141,18 @@ function mergeSubtitleText(previous: string, next: string): string {
 
 /** 停止实时字幕音频图并释放两个输入流。 */
 function stopSubtitleAudioGraph(): void {
+  if (subtitleRecorderStopTimerHandle !== null) {
+    window.clearTimeout(subtitleRecorderStopTimerHandle);
+    subtitleRecorderStopTimerHandle = null;
+  }
+  if (subtitleNativeChunkTimeoutHandle !== null) {
+    window.clearTimeout(subtitleNativeChunkTimeoutHandle);
+    subtitleNativeChunkTimeoutHandle = null;
+  }
+  subtitleNativeChunkInFlight = false;
+  if (subtitleMediaRecorder && subtitleMediaRecorder.state !== "inactive") {
+    subtitleMediaRecorder.stop();
+  }
   subtitleProcessor?.disconnect();
   subtitleProcessor && (subtitleProcessor.onaudioprocess = null);
   subtitleMicSource?.disconnect();
@@ -3439,6 +4172,9 @@ function stopSubtitleAudioGraph(): void {
   subtitleMixer = null;
   subtitleProcessor = null;
   subtitleSink = null;
+  subtitleMediaRecorder = null;
+  subtitleRecorderMimeType = "";
+  subtitlePendingRecorderChunk = null;
 }
 
 /** 向字幕窗口发送失败状态，并复用顶部错误提示做明显反馈。 */
@@ -3462,6 +4198,21 @@ async function showSubtitleWindows(): Promise<void> {
   }
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("show_subtitle_windows");
+}
+
+/** 异步显示字幕窗口，窗口异常不阻断已经启动的音频监听。 */
+async function showSubtitleWindowsWithDiagnostics(): Promise<void> {
+  try {
+    await runSubtitleStartupStep(showSubtitleWindows(), "字幕窗口打开", "实时字幕窗口打开长时间无响应。");
+  } catch (error) {
+    addDiagnosticLog({
+      level: "error",
+      category: "subtitle",
+      title: "字幕窗口打开失败",
+      message: formatError(error),
+      mode: "subtitle",
+    });
+  }
 }
 
 /** 隐藏实时字幕相关窗口。 */
@@ -3537,7 +4288,9 @@ async function ensureReadyForRecording(mode: ShortcutMode): Promise<boolean> {
       await showRequiredModePermission(mode, "shortcut", `请设置${SHORTCUT_MODE_LABELS[mode]}的快捷键权限。`);
       return false;
     }
-    if (microphoneDiagnostic.state !== "success") {
+    const config = readSavedConfig();
+    const isNativeSubtitleMode = mode === "subtitle" && config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID;
+    if (!isNativeSubtitleMode && microphoneDiagnostic.state !== "success") {
       await showRequiredModePermission(mode, "microphone", `请设置${SHORTCUT_MODE_LABELS[mode]}的麦克风权限。`);
       return false;
     }
@@ -3545,7 +4298,7 @@ async function ensureReadyForRecording(mode: ShortcutMode): Promise<boolean> {
       await showRequiredModePermission(mode, "accessibility", `请设置${SHORTCUT_MODE_LABELS[mode]}的自动粘贴权限。`);
       return false;
     }
-    if (mode === "subtitle" && readSavedConfig().systemAudioDeviceId === "none") {
+    if (mode === "subtitle" && readSystemAudioDiagnostic(config).state !== "success") {
       await showRequiredModePermission(mode, "systemAudio", "请设置实时字幕的系统声音来源。");
       return false;
     }
@@ -4085,6 +4838,73 @@ async function callTranscribe(request: TranscribeRequest): Promise<TranscribeRes
   };
 }
 
+/** 调用 Tauri 原生 Core Audio Process Tap helper 采集一段系统音频。 */
+async function captureProcessTapAudio(durationMs: number, targetKeyword: string): Promise<ProcessTapCaptureResponse> {
+  if (!isTauriRuntime()) {
+    throw new Error("网页预览模式不支持原生系统音频捕获。");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ProcessTapCaptureResponse>("capture_process_tap_audio", {
+    request: {
+      durationMs,
+      targetKeyword,
+    },
+  });
+}
+
+/** 调用 Tauri 原生命令采集系统音频并在 Rust 侧直接完成 ASR。 */
+async function captureProcessTapTranscribe(
+  durationMs: number,
+  targetKeyword: string,
+  chunkIndex: number,
+): Promise<ProcessTapTranscribeResponse> {
+  if (!isTauriRuntime()) {
+    throw new Error("网页预览模式不支持原生系统音频捕获。");
+  }
+  const config = readSavedConfig();
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ProcessTapTranscribeResponse>("capture_process_tap_transcribe", {
+    request: {
+      chunkIndex,
+      durationMs,
+      targetKeyword,
+      apiKey: "",
+      baseUrl: config.baseUrl,
+      asrModel: config.asrModel,
+      language: config.language,
+    },
+  });
+}
+
+/** 启动 Tauri 原生后台任务：采集系统音频并在 Rust 侧完成 ASR。 */
+async function startProcessTapTranscribeTask(durationMs: number, targetKeyword: string, chunkIndex: number): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("网页预览模式不支持原生系统音频捕获。");
+  }
+  const config = readSavedConfig();
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke<void>("start_process_tap_transcribe_task", {
+    request: {
+      chunkIndex,
+      durationMs,
+      targetKeyword,
+      apiKey: "",
+      baseUrl: config.baseUrl,
+      asrModel: config.asrModel,
+      language: config.language,
+    },
+  });
+}
+
+/** 轮询消费 Tauri 原生后台字幕任务结果。 */
+async function takeProcessTapTranscribeOutcome(chunkIndex: number): Promise<ProcessTapTranscribeOutcome | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ProcessTapTranscribeOutcome | null>("take_process_tap_transcribe_outcome", { chunkIndex });
+}
+
 /** 对识别结果执行口述润色、翻译或问答。 */
 async function processRecognizedText(
   text: string,
@@ -4384,6 +5204,16 @@ async function blobToBase64(blob: Blob): Promise<string> {
     binary += String.fromCharCode(...chunk);
   }
   return btoa(binary);
+}
+
+/** 把原生侧返回的 base64 音频还原为浏览器 Blob，继续复用实时字幕 ASR 队列。 */
+function base64ToBlob(value: string, contentType: string): Blob {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: contentType });
 }
 
 /** 切换 Hub 当前视图。 */

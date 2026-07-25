@@ -147,6 +147,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "externalBin": [
+      "binaries/typesass-process-tap"
+    ],
     "macOS": {
       "signingIdentity": "Apple Development: shuo Li (KCW9LKVGJ6)",
       "hardenedRuntime": false
