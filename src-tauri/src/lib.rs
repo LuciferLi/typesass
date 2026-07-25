@@ -58,6 +58,30 @@ struct RuntimeFocus {
     last_external_app: Mutex<String>,
 }
 
+/// 全局快捷键触发录音时的窗口和目标 App 决策。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceTriggerContext {
+    /// 本次录音结束后允许恢复的目标 App，Hub 前台触发时必须为空。
+    target_app: String,
+    /// 是否需要展示顶部悬浮胶囊。
+    show_floating_window: bool,
+    /// 是否必须保持 Hub 主界面不受录音影响。
+    keep_hub_visible: bool,
+    /// 是否需要把焦点恢复给目标 App。
+    restore_target_focus: bool,
+}
+
+/// 自动粘贴前的目标 App 与窗口隐藏决策。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasteTargetDecision {
+    /// 本次粘贴应恢复的目标 App。
+    target_app: String,
+    /// 是否需要激活目标 App。
+    should_activate_target: bool,
+    /// 是否允许隐藏 Hub 以避免粘贴回 typesass。
+    should_hide_hub: bool,
+}
+
 /// 全局快捷键注册结果，避免系统冲突时只表现为按键无响应。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -508,6 +532,57 @@ fn read_last_external_app(app: &AppHandle) -> String {
         .unwrap_or_default()
 }
 
+/// 根据当前前台 App 计算快捷键录音行为；Hub 前台时不复用历史外部目标。
+fn resolve_voice_trigger_context(
+    frontmost_app: &str,
+    _last_external_app: &str,
+) -> VoiceTriggerContext {
+    let normalized_frontmost_app = normalize_target_app_name(frontmost_app);
+    if normalized_frontmost_app.is_empty() {
+        return VoiceTriggerContext {
+            target_app: String::new(),
+            show_floating_window: false,
+            keep_hub_visible: true,
+            restore_target_focus: false,
+        };
+    }
+    VoiceTriggerContext {
+        target_app: normalized_frontmost_app,
+        show_floating_window: true,
+        keep_hub_visible: false,
+        restore_target_focus: true,
+    }
+}
+
+/// 根据请求目标和当前前台 App 计算粘贴行为；无目标且 typesass 前台时不隐藏 Hub。
+fn resolve_paste_target(
+    requested_target_app: &str,
+    frontmost_app: &str,
+    _last_external_app: &str,
+) -> PasteTargetDecision {
+    let normalized_requested_app = normalize_target_app_name(requested_target_app);
+    if !normalized_requested_app.is_empty() {
+        return PasteTargetDecision {
+            target_app: normalized_requested_app,
+            should_activate_target: true,
+            should_hide_hub: true,
+        };
+    }
+    let normalized_frontmost_app = normalize_target_app_name(frontmost_app);
+    if !normalized_frontmost_app.is_empty() {
+        return PasteTargetDecision {
+            target_app: normalized_frontmost_app,
+            should_activate_target: true,
+            should_hide_hub: true,
+        };
+    }
+    PasteTargetDecision {
+        target_app: String::new(),
+        should_activate_target: false,
+        should_hide_hub: false,
+    }
+}
+
 /// 从剪贴板读取词汇并交给 Hub 写入本地词典。
 #[cfg(desktop)]
 fn add_clipboard_words_to_dictionary(app: &AppHandle) {
@@ -561,22 +636,25 @@ fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
 
 /// 按指定模式通知悬浮录音条开始或停止。
 fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
-    let target_app = read_external_target_app(&app);
-    let should_show_floating_window =
-        !normalize_target_app_name(&get_frontmost_app().unwrap_or_default()).is_empty();
+    let frontmost_app = get_frontmost_app().unwrap_or_default();
+    let mut context = resolve_voice_trigger_context(&frontmost_app, &read_last_external_app(&app));
+    if !context.target_app.is_empty() {
+        context.target_app = remember_external_app(&app, &context.target_app);
+    }
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
     }
-    if should_show_floating_window {
+    if context.show_floating_window {
         let _ = present_window(&app, "main", true);
     } else if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
     }
-    if should_show_floating_window && !target_app.is_empty() {
-        let _ = activate_macos_app(&target_app);
+    if context.restore_target_focus && !context.target_app.is_empty() {
+        let _ = activate_macos_app(&context.target_app);
     }
     let mode = mode.to_string();
-    let keep_hub_visible = !should_show_floating_window;
+    let target_app = context.target_app;
+    let keep_hub_visible = context.keep_hub_visible;
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(180));
         if let Some(window) = app.get_webview_window("main") {
@@ -850,21 +928,23 @@ fn normalize_shortcut(value: &str) -> String {
 /// 显示胶囊悬浮条，供前端在需要时主动唤起。
 #[tauri::command]
 fn show_main_window(app: tauri::AppHandle) -> Result<String, String> {
-    let target_app = read_external_target_app(&app);
-    let should_show_floating_window =
-        !normalize_target_app_name(&get_frontmost_app().unwrap_or_default()).is_empty();
+    let frontmost_app = get_frontmost_app().unwrap_or_default();
+    let mut context = resolve_voice_trigger_context(&frontmost_app, &read_last_external_app(&app));
+    if !context.target_app.is_empty() {
+        context.target_app = remember_external_app(&app, &context.target_app);
+    }
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
     }
-    if should_show_floating_window {
+    if context.show_floating_window {
         present_window(&app, "main", true)?;
     } else if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
     }
-    if should_show_floating_window && !target_app.is_empty() {
-        let _ = activate_macos_app(&target_app);
+    if context.restore_target_focus && !context.target_app.is_empty() {
+        let _ = activate_macos_app(&context.target_app);
     }
-    Ok(target_app)
+    Ok(context.target_app)
 }
 
 /// 隐藏胶囊悬浮条，应用继续在后台等待全局快捷键。
@@ -1609,18 +1689,37 @@ async fn paste_text(
     }
 
     let frontmost_before_paste = get_frontmost_app().unwrap_or_default();
-    let frontmost_target_app = normalize_target_app_name(&frontmost_before_paste);
-    let requested_target_app = normalize_target_app_name(&target_app);
-    let normalized_target_app = if !requested_target_app.is_empty() {
-        remember_external_app(&app, &requested_target_app)
-    } else if !frontmost_target_app.is_empty() {
-        remember_external_app(&app, &frontmost_target_app)
+    let paste_target = resolve_paste_target(
+        &target_app,
+        &frontmost_before_paste,
+        &read_last_external_app(&app),
+    );
+    let normalized_target_app = if !paste_target.target_app.is_empty() {
+        remember_external_app(&app, &paste_target.target_app)
     } else {
-        read_last_external_app(&app)
+        String::new()
     };
     write_clipboard_text(normalized_text)?;
     let clipboard_written = true;
     let accessibility_trusted = is_accessibility_trusted();
+    if normalized_target_app.is_empty() {
+        return Ok(PasteResponse {
+            pasted: false,
+            message: "已写入剪贴板；当前没有可恢复的目标输入框，已保持 typesass 界面不变。"
+                .to_string(),
+            requires_accessibility: false,
+            target_app: normalized_target_app,
+            clipboard_written,
+            accessibility_trusted,
+            paste_method: "notSent".to_string(),
+            frontmost_before_paste,
+            frontmost_after_activate: String::new(),
+            frontmost_after_paste: String::new(),
+            focused_element_before_paste: String::new(),
+            focused_element_after_activate: String::new(),
+            focused_element_after_paste: String::new(),
+        });
+    }
     if !accessibility_trusted {
         return Ok(PasteResponse {
             pasted: false,
@@ -1646,10 +1745,12 @@ async fn paste_text(
     if let Some(window) = app.get_webview_window("result") {
         let _ = window.hide();
     }
-    if let Some(window) = app.get_webview_window("hub") {
-        let _ = window.hide();
+    if paste_target.should_hide_hub {
+        if let Some(window) = app.get_webview_window("hub") {
+            let _ = window.hide();
+        }
     }
-    if !normalized_target_app.is_empty() {
+    if paste_target.should_activate_target && !normalized_target_app.is_empty() {
         let _ = activate_macos_app(&normalized_target_app);
     }
     thread::sleep(Duration::from_millis(620));
@@ -1694,28 +1795,25 @@ async fn paste_text(
         }
     }
     let paste_method = paste_methods.join(" -> ");
-    let final_target_ready = normalized_target_app.is_empty()
-        || is_frontmost_target(&frontmost_after_paste, &normalized_target_app);
+    let final_target_ready = is_frontmost_target(&frontmost_after_paste, &normalized_target_app);
 
     Ok(PasteResponse {
         pasted: paste_result.accessibility_ready,
-        message: if normalized_target_app.is_empty() {
-            "已隐藏悬浮条并向当前输入位置发送粘贴指令；是否插入取决于目标输入框焦点。".to_string()
-        } else if final_target_ready {
+        message: if final_target_ready {
             format!(
-                "已向 {} 发送粘贴指令；若仍未插入，请查看目标输入框焦点。",
+                "已向 {} 发送粘贴指令；是否插入取决于目标输入框焦点。",
                 normalized_target_app
             )
         } else {
             format!(
-                "已向 {} 发送粘贴指令，但发送后前台变为 {}，请重新聚焦目标输入框。",
+                "已向 {} 发送粘贴指令，但当前前台是 {}；如果未插入，请重新聚焦输入框。",
                 normalized_target_app, frontmost_after_paste
             )
         },
         requires_accessibility: false,
         target_app: normalized_target_app,
         clipboard_written,
-        accessibility_trusted: paste_result.accessibility_ready,
+        accessibility_trusted,
         paste_method,
         frontmost_before_paste,
         frontmost_after_activate,
@@ -2087,4 +2185,48 @@ fn open_accessibility_preferences() -> Result<(), String> {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_frontmost_shortcut_keeps_hub_and_does_not_reuse_previous_external_target() {
+        let decision = resolve_voice_trigger_context("typesass", "ChatGPT");
+
+        assert_eq!(decision.target_app, "");
+        assert!(!decision.show_floating_window);
+        assert!(decision.keep_hub_visible);
+        assert!(!decision.restore_target_focus);
+    }
+
+    #[test]
+    fn external_frontmost_shortcut_uses_current_app_as_paste_target() {
+        let decision = resolve_voice_trigger_context("ChatGPT", "TextEdit");
+
+        assert_eq!(decision.target_app, "ChatGPT");
+        assert!(decision.show_floating_window);
+        assert!(!decision.keep_hub_visible);
+        assert!(decision.restore_target_focus);
+    }
+
+    #[test]
+    fn paste_without_explicit_target_does_not_fallback_to_last_external_when_typesass_is_frontmost()
+    {
+        let decision = resolve_paste_target("", "typesass", "ChatGPT");
+
+        assert_eq!(decision.target_app, "");
+        assert!(!decision.should_activate_target);
+        assert!(!decision.should_hide_hub);
+    }
+
+    #[test]
+    fn paste_with_explicit_target_can_hide_hub_and_activate_target() {
+        let decision = resolve_paste_target("ChatGPT", "typesass", "TextEdit");
+
+        assert_eq!(decision.target_app, "ChatGPT");
+        assert!(decision.should_activate_target);
+        assert!(decision.should_hide_hub);
+    }
 }

@@ -490,3 +490,34 @@
 - 打开 Hub 后按物理快捷键开始录音，确认 Hub 不再立即消失，也不被顶部悬浮胶囊或目标 App 抢走显示。
 - 再次按物理快捷键结束录音，确认 Hub 仍保持显示，最近结果或历史记录可看到本次输出。
 - 聚焦真实输入框后再走一次完整录音和停止转写，确认粘贴阶段仍能把文本送回目标输入框。
+
+## 2026-07-25 目标 App 决策单元测试与系统粘贴诊断
+
+检查对象：
+
+- `src-tauri/src/lib.rs` 的 `resolve_voice_trigger_context` 和 `resolve_paste_target`。
+- macOS TextEdit 真实粘贴链路。
+
+结论：
+
+- 根因确认：旧逻辑在当前前台是 typesass 时，会回退使用“上一次外部 App”作为本次录音/粘贴目标；这会导致 Hub 主界面录音结束后误进自动粘贴流程，并触发 `hub.hide()`。
+- 已新增 Rust 单元测试锁定四条规则：Hub 前台不复用历史外部目标、外部 App 前台才作为粘贴目标、无明确目标且 typesass 前台不隐藏 Hub、显式目标才允许隐藏 Hub 并激活目标。
+- 已把录音触发和自动粘贴统一接入同一套决策函数，避免前后两段逻辑各自判断。
+- 已执行 TextEdit 真实系统粘贴诊断：剪贴板写入和系统 `Cmd+V` 能进入 TextEdit 文档，说明系统粘贴基础链路可用。
+- 最新 `.app` 已重新构建并启动。
+
+验证命令：
+
+- `cargo test --manifest-path src-tauri/Cargo.toml`：通过，4 条 Rust 单元测试全部通过。
+- `npm run lint`：通过。
+- `npm run build`：通过。
+- `cargo fmt --check --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
+- `git diff --check`：通过。
+- `npx tauri build --bundles app`：通过。
+- TextEdit 粘贴诊断：通过，写入剪贴板的 `typesass-paste-check-*` 文本成功进入 TextEdit 文档。
+
+剩余风险：
+
+- Mimo ASR/AI 的真实结果仍依赖真实麦克风输入和上游接口响应；本轮未用假录音替代用户语音。
+- ChatGPT 这类 WebView 输入框是否稳定接收粘贴，仍需结合诊断日志里的目标 App、发送前后前台 App 和焦点元素判断。
