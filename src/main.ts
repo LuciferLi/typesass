@@ -13,6 +13,7 @@ import {
   Plus,
   Refresh,
   Setting,
+  Terminal,
   Translate,
   VoiceInput,
   setConfig,
@@ -22,12 +23,17 @@ import brandLogoUrl from "./assets/typesass-logo.png";
 const DEFAULT_BASE_URL = "https://token-plan-cn.xiaomimimo.com/v1";
 const DEFAULT_ASR_MODEL = "mimo-v2.5-asr";
 const DEFAULT_TEXT_MODEL = "mimo-v2.5";
+const DEFAULT_TARGET_LANGUAGE = "简体中文";
+const DEFAULT_DICTATION_OUTPUT_LANGUAGE = "source";
 const CONFIG_STORAGE_KEY = "aiToolVoiceConfigV2";
 const LEGACY_CONFIG_STORAGE_KEY = "aiToolVoiceConfig";
 const HISTORY_STORAGE_KEY = "aiToolVoiceHistoryV1";
 const DICTIONARY_STORAGE_KEY = "aiToolDictionaryV1";
+const DIAGNOSTIC_LOG_STORAGE_KEY = "aiToolDiagnosticLogV1";
 const DEFAULT_HUB_NOTICE = "所有设置和历史都只保存在本机。";
 const MIN_RECORDING_MS = 800;
+const HUB_DIAGNOSTICS_REFRESH_INTERVAL_MS = 4000;
+const MAX_DIAGNOSTIC_LOG_ITEMS = 160;
 const EMPTY_TRANSCRIPTION_MARKERS = [
   "无实际内容输出",
   "没有实际内容输出",
@@ -55,6 +61,7 @@ const ICON_RENDERERS = {
   plus: Plus,
   refresh: Refresh,
   setting: Setting,
+  terminal: Terminal,
   translate: Translate,
   voice: VoiceInput,
 } as const;
@@ -66,6 +73,8 @@ type WindowMode = "main" | "hub" | "toast" | "result";
 type HistoryRetention = "forever" | "30" | "7" | "never";
 type DictionaryFilter = "all" | "auto" | "manual";
 type DiagnosticState = "idle" | "success" | "warning" | "error";
+type DiagnosticLogLevel = "info" | "success" | "warning" | "error";
+type DiagnosticLogCategory = "recording" | "transcribe" | "process" | "paste" | "system";
 type IconName = keyof typeof ICON_RENDERERS;
 type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "start" | "refresh";
 
@@ -92,6 +101,8 @@ interface ShortcutTriggerPayload {
   mode: VoiceMode;
   /** 按下快捷键瞬间的前台目标 App。 */
   targetApp: string;
+  /** 本次录音是否来自 Hub 主界面，需要避免影响 Hub 显示。 */
+  keepHubVisible?: boolean;
 }
 
 interface ShortcutConfig {
@@ -118,6 +129,8 @@ interface VoiceConfig {
   historyRetention: HistoryRetention;
   /** 口述后是否执行 AI 润色。 */
   postProcessDictation: boolean;
+  /** 口述 AI 润色后的输出语言，source 表示跟随原文。 */
+  dictationOutputLanguage: string;
   /** 选定的麦克风设备 ID，default 表示系统默认设备。 */
   microphoneDeviceId: string;
   /** 是否播放开始和停止录音提示音。 */
@@ -130,8 +143,14 @@ interface VoiceConfig {
   showInDock: boolean;
   /** 三种语音模式的快捷键配置。 */
   shortcuts: ShortcutConfig;
-  /** 用户对输出风格的本地偏好。 */
+  /** 所有 AI 文本处理共同遵循的本地输出偏好。 */
   personalStyle: string;
+  /** 只在口述润色时追加的本地输出偏好。 */
+  dictationStyle: string;
+  /** 只在翻译时追加的本地输出偏好。 */
+  translationStyle: string;
+  /** 只在随便问时追加的本地回答偏好。 */
+  askStyle: string;
 }
 
 interface TranscribeRequest {
@@ -195,6 +214,26 @@ interface PasteResponse {
   message: string;
   /** 是否需要用户授予辅助功能权限。 */
   requiresAccessibility: boolean;
+  /** 桌面端尝试恢复的目标应用。 */
+  targetApp: string;
+  /** 是否已经把最终输出写入系统剪贴板。 */
+  clipboardWritten: boolean;
+  /** Rust 侧触发粘贴前检测到的辅助功能授权状态。 */
+  accessibilityTrusted: boolean;
+  /** 本次粘贴指令的触发方式，便于区分 System Events 和 CoreGraphics 兜底。 */
+  pasteMethod: string;
+  /** 隐藏 typesass 窗口前系统前台应用。 */
+  frontmostBeforePaste: string;
+  /** 尝试激活目标 App 后系统前台应用。 */
+  frontmostAfterActivate: string;
+  /** 粘贴指令发出后系统前台应用。 */
+  frontmostAfterPaste: string;
+  /** 发送粘贴指令前目标 App 内的系统焦点元素。 */
+  focusedElementBeforePaste: string;
+  /** 激活目标 App 后的系统焦点元素。 */
+  focusedElementAfterActivate: string;
+  /** 发送粘贴指令后的系统焦点元素。 */
+  focusedElementAfterPaste: string;
 }
 
 interface ResultWindowPayload {
@@ -264,11 +303,53 @@ interface DictionaryItem {
   createdAt: number;
 }
 
+interface DiagnosticLogDraft {
+  /** 日志等级，用于快速区分正常、警告和错误。 */
+  level: DiagnosticLogLevel;
+  /** 日志所属链路阶段。 */
+  category: DiagnosticLogCategory;
+  /** 日志标题，展示给用户快速扫描。 */
+  title: string;
+  /** 不含转写正文的诊断说明。 */
+  message: string;
+  /** 关联的语音模式。 */
+  mode?: VoiceMode;
+  /** 本次链路记录的目标 App。 */
+  targetApp?: string;
+  /** 写日志时观测到的前台 App。 */
+  frontmostApp?: string;
+  /** 粘贴动作使用的系统触发方式。 */
+  pasteMethod?: string;
+  /** 当时辅助功能权限是否已授权。 */
+  accessibilityTrusted?: boolean;
+  /** 是否已成功写入剪贴板。 */
+  clipboardWritten?: boolean;
+  /** 发送粘贴指令前的系统焦点元素摘要。 */
+  focusedElementBeforePaste?: string;
+  /** 激活目标 App 后的系统焦点元素摘要。 */
+  focusedElementAfterActivate?: string;
+  /** 发送粘贴指令后的系统焦点元素摘要。 */
+  focusedElementAfterPaste?: string;
+  /** 当前阶段耗时，单位毫秒。 */
+  elapsedMs?: number;
+  /** 额外诊断字段，严禁放入转写正文。 */
+  details?: string[];
+}
+
+interface DiagnosticLogItem extends DiagnosticLogDraft {
+  /** 本地日志 ID。 */
+  id: string;
+  /** 记录创建时间戳。 */
+  createdAt: number;
+  /** 额外诊断字段，已做类型兜底。 */
+  details: string[];
+}
+
 interface TauriWindow extends Window {
   /** Tauri 运行时注入对象，浏览器预览模式不存在。 */
   __TAURI_INTERNALS__?: unknown;
   /** Rust 快捷键直达前端的处理函数。 */
-  __AIToolHandleShortcutMode?: (mode: VoiceMode, targetApp?: string) => void;
+  __AIToolHandleShortcutMode?: (mode: VoiceMode, targetApp?: string, keepHubVisible?: boolean) => void;
   /** 前端尚未加载完成时暂存的快捷键触发模式。 */
   __AIToolPendingShortcutMode?: VoiceMode | ShortcutTriggerPayload;
   /** Rust 结果窗口直达前端的渲染函数。 */
@@ -281,18 +362,49 @@ const MODE_LABELS: Record<VoiceMode, string> = {
   ask: "随便问",
 };
 
+const MODE_START_LABELS: Record<VoiceMode, string> = {
+  dictate: "开始口述",
+  translate: "开始翻译",
+  ask: "开始提问",
+};
+
 const MODE_ACTION_ICONS: Record<VoiceMode, IconName> = {
   dictate: "microphone",
   translate: "translate",
   ask: "message",
 };
 
+const DIAGNOSTIC_LOG_LEVEL_LABELS: Record<DiagnosticLogLevel, string> = {
+  info: "信息",
+  success: "成功",
+  warning: "警告",
+  error: "错误",
+};
+
+const DIAGNOSTIC_LOG_CATEGORY_LABELS: Record<DiagnosticLogCategory, string> = {
+  recording: "录音",
+  transcribe: "转写",
+  process: "AI",
+  paste: "粘贴",
+  system: "系统",
+};
+
+const MODE_SETTINGS_VIEWS: Record<VoiceMode, string> = {
+  dictate: "dictateSettings",
+  translate: "translateSettings",
+  ask: "askSettings",
+};
+
 const VIEW_TITLES: Record<string, { eyebrow: string; title: string }> = {
   home: { eyebrow: "说话，不要打字", title: "仪表盘" },
   modes: { eyebrow: "选择真实语音流程", title: "语音模式" },
+  dictateSettings: { eyebrow: "只影响口述", title: "口述设置" },
+  translateSettings: { eyebrow: "只影响翻译", title: "翻译设置" },
+  askSettings: { eyebrow: "只影响随便问", title: "随便问设置" },
   shortcuts: { eyebrow: "按一次开始，再按一次结束", title: "快捷键" },
   history: { eyebrow: "只保存在本机", title: "历史记录" },
   dictionary: { eyebrow: "专有名词更准确", title: "词典" },
+  diagnosticsLog: { eyebrow: "定位自动粘贴问题", title: "诊断日志" },
   settings: { eyebrow: "本机配置", title: "系统设置" },
 };
 
@@ -320,10 +432,11 @@ const baseUrlInput = getElement<HTMLInputElement>("baseUrlInput");
 const modelInput = getElement<HTMLInputElement>("modelInput");
 const textModelInput = getElement<HTMLInputElement>("textModelInput");
 const languageSelect = getElement<HTMLSelectElement>("languageSelect");
-const targetLanguagesInput = getElement<HTMLInputElement>("targetLanguagesInput");
+const targetLanguagesSelect = getElement<HTMLSelectElement>("targetLanguagesSelect");
 const historyRetentionSelect = getElement<HTMLSelectElement>("historyRetentionSelect");
 const postProcessDictationInput = getElement<HTMLInputElement>("postProcessDictationInput");
-const quickAiPolishInput = getElement<HTMLInputElement>("quickAiPolishInput");
+const dictationOutputLanguageRow = getElement<HTMLLabelElement>("dictationOutputLanguageRow");
+const dictationOutputLanguageSelect = getElement<HTMLSelectElement>("dictationOutputLanguageSelect");
 const microphoneSelect = getElement<HTMLSelectElement>("microphoneSelect");
 const refreshMicrophonesButton = getElement<HTMLButtonElement>("refreshMicrophonesButton");
 const interactionSoundsInput = getElement<HTMLInputElement>("interactionSoundsInput");
@@ -331,6 +444,9 @@ const muteWhileDictatingInput = getElement<HTMLInputElement>("muteWhileDictating
 const launchAtLoginInput = getElement<HTMLInputElement>("launchAtLoginInput");
 const showInDockInput = getElement<HTMLInputElement>("showInDockInput");
 const personalStyleInput = getElement<HTMLTextAreaElement>("personalStyleInput");
+const dictationStyleInput = getElement<HTMLTextAreaElement>("dictationStyleInput");
+const translationStyleInput = getElement<HTMLTextAreaElement>("translationStyleInput");
+const askStyleInput = getElement<HTMLTextAreaElement>("askStyleInput");
 const dictateShortcutInput = getElement<HTMLInputElement>("dictateShortcutInput");
 const translateShortcutInput = getElement<HTMLInputElement>("translateShortcutInput");
 const askShortcutInput = getElement<HTMLInputElement>("askShortcutInput");
@@ -341,12 +457,9 @@ const askShortcutText = getElement<HTMLElement>("askShortcutText");
 const homeDictateShortcutText = getElement<HTMLElement>("homeDictateShortcutText");
 const homeTranslateShortcutText = getElement<HTMLElement>("homeTranslateShortcutText");
 const homeAskShortcutText = getElement<HTMLElement>("homeAskShortcutText");
-const saveConfigButton = getElement<HTMLButtonElement>("saveConfigButton");
 const saveShortcutButton = getElement<HTMLButtonElement>("saveShortcutButton");
 const clearConfigButton = getElement<HTMLButtonElement>("clearConfigButton");
-const startDictateButton = getElement<HTMLButtonElement>("startDictateButton");
 const quickStartButton = getElement<HTMLButtonElement>("quickStartButton");
-const operationHint = getElement<HTMLElement>("operationHint");
 const refreshStatusButton = getElement<HTMLButtonElement>("refreshStatusButton");
 const hubTitle = getElement<HTMLElement>("hubTitle");
 const hubEyebrow = getElement<HTMLElement>("hubEyebrow");
@@ -378,6 +491,10 @@ const dictionaryList = getElement<HTMLElement>("dictionaryList");
 const dictionaryImportInput = getElement<HTMLInputElement>("dictionaryImportInput");
 const importDictionaryButton = getElement<HTMLButtonElement>("importDictionaryButton");
 const exportDictionaryButton = getElement<HTMLButtonElement>("exportDictionaryButton");
+const diagnosticLogList = getElement<HTMLElement>("diagnosticLogList");
+const diagnosticLogCount = getElement<HTMLElement>("diagnosticLogCount");
+const copyDiagnosticLogButton = getElement<HTMLButtonElement>("copyDiagnosticLogButton");
+const clearDiagnosticLogButton = getElement<HTMLButtonElement>("clearDiagnosticLogButton");
 const authorizeMicrophoneButton = getElement<HTMLButtonElement>("authorizeMicrophoneButton");
 const apiKeyStatus = getElement<HTMLElement>("apiKeyStatus");
 const microphoneStatus = getElement<HTMLElement>("microphoneStatus");
@@ -419,11 +536,14 @@ let dictionaryFilter: DictionaryFilter = "all";
 let shortcutRecordingMode: VoiceMode | null = null;
 let previousSystemMuteState: boolean | null = null;
 let recordingTargetApp = "";
+let recordingKeepsHubVisible = false;
 let resultCopyFeedbackTimer: number | null = null;
 let nextReadinessAction: ReadinessAction = "apiKey";
 let pendingConfirmation: PendingConfirmation | null = null;
 let shortcutRecordingSnapshot: ShortcutRecordingSnapshot | null = null;
 let accessibilityWatchHandle: number | null = null;
+let hubDiagnosticsRefreshHandle: number | null = null;
+let isRefreshingDiagnostics = false;
 
 init();
 
@@ -535,7 +655,9 @@ function initHubWindow(): void {
   void syncDesktopPreferences(readSavedConfig());
   renderHub();
   void refreshDiagnostics();
+  startHubDiagnosticsRefresh();
   window.addEventListener("storage", renderHub);
+  window.addEventListener("beforeunload", stopHubDiagnosticsRefresh);
 }
 
 /** 监听其它窗口要求 Hub 切换页面的事件。 */
@@ -621,7 +743,7 @@ function bindNativeShortcutBridge(): void {
       if (typeof pendingShortcut === "string") {
         handleShortcutMode(pendingShortcut);
       } else {
-        handleShortcutMode(pendingShortcut.mode, pendingShortcut.targetApp);
+        handleShortcutMode(pendingShortcut.mode, pendingShortcut.targetApp, pendingShortcut.keepHubVisible);
       }
     }, 0);
   }
@@ -634,8 +756,12 @@ async function bindHubStartEvent(): Promise<void> {
   }
   try {
     const { listen } = await import("@tauri-apps/api/event");
-    await listen<VoiceMode>("hub-start-mode", (event) => {
-      handleShortcutMode(event.payload);
+    await listen<VoiceMode | ShortcutTriggerPayload>("hub-start-mode", (event) => {
+      if (typeof event.payload === "string") {
+        handleShortcutMode(event.payload);
+        return;
+      }
+      handleShortcutMode(event.payload.mode, event.payload.targetApp, event.payload.keepHubVisible);
     });
   } catch (error) {
     setStatus(`Hub 事件监听失败：${formatError(error)}`, "error");
@@ -692,14 +818,11 @@ function bindHubEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-readiness-action]").forEach((button) => {
     button.addEventListener("click", () => void handleReadinessAction(button.dataset.readinessAction || ""));
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-mode-action]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const mode = normalizeMode(button.dataset.modeAction);
-      selectVoiceMode(mode);
-    });
-  });
   document.querySelectorAll<HTMLButtonElement>("[data-mode-start]").forEach((button) => {
     button.addEventListener("click", () => void requestFloatingMode(normalizeMode(button.dataset.modeStart)));
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-mode-settings]").forEach((button) => {
+    button.addEventListener("click", () => switchModeSettingsView(normalizeMode(button.dataset.modeSettings)));
   });
   document.querySelectorAll<HTMLButtonElement>("[data-history-filter]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -719,16 +842,18 @@ function bindHubEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-shortcut-reset]").forEach((button) => {
     button.addEventListener("click", () => resetShortcutInput(normalizeMode(button.dataset.shortcutReset)));
   });
-  startDictateButton.addEventListener("click", () => void requestFloatingMode(activeMode));
-  quickStartButton.addEventListener("click", () => void requestFloatingMode(activeMode));
-  quickAiPolishInput.addEventListener("change", () => setDictationPolishEnabled(quickAiPolishInput.checked));
+  quickStartButton.addEventListener("click", () => void requestFloatingMode("dictate"));
   postProcessDictationInput.addEventListener("change", () => setDictationPolishEnabled(postProcessDictationInput.checked));
   refreshStatusButton.addEventListener("click", () => void refreshHubRuntimeState());
-  saveConfigButton.addEventListener("click", () => void saveConfigFromForm());
+  document.querySelectorAll<HTMLButtonElement>("[data-save-config]").forEach((button) => {
+    button.addEventListener("click", () => void saveConfigFromForm());
+  });
   saveShortcutButton.addEventListener("click", () => void saveConfigFromForm("快捷键已保存并重新生效。"));
   clearConfigButton.addEventListener("click", () => clearSavedConfig(clearConfigButton));
   clearApiKeyButton.addEventListener("click", () => void clearSavedApiKey());
   clearHistoryButton.addEventListener("click", () => clearHistory(clearHistoryButton));
+  copyDiagnosticLogButton.addEventListener("click", () => void copyDiagnosticLogs());
+  clearDiagnosticLogButton.addEventListener("click", () => clearDiagnosticLogs(clearDiagnosticLogButton));
   copyHubResultButton.addEventListener("click", () => void copyText(hubResultTextarea.value));
   retryHubResultButton.addEventListener("click", () => void retryLatestHistory());
   authorizeMicrophoneButton.addEventListener("click", () => void authorizeMicrophoneAccess());
@@ -783,6 +908,12 @@ function normalizeMode(value: string | undefined): VoiceMode {
   return "dictate";
 }
 
+/** 从模式卡片进入对应设置页，模式设置不改变任何录音触发状态。 */
+function switchModeSettingsView(mode: VoiceMode): void {
+  switchHubView(MODE_SETTINGS_VIEWS[mode]);
+  showHubNotice(`正在编辑${MODE_LABELS[mode]}设置。`, "idle");
+}
+
 /** 根据字符串恢复历史筛选值，非法值回落到全部。 */
 function normalizeHistoryFilter(value: string | undefined): VoiceMode | "all" {
   if (value === "dictate" || value === "translate" || value === "ask") {
@@ -808,9 +939,18 @@ function normalizeHubNoticeState(value: unknown): HubNoticeState {
 }
 
 /** 处理快捷键触发，并过滤按键连发造成的重复切换。 */
-function handleShortcutMode(mode: VoiceMode, targetApp = ""): void {
+function handleShortcutMode(mode: VoiceMode, targetApp = "", keepHubVisible = false): void {
   const now = Date.now();
   if (now - lastShortcutAt < 500) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "system",
+      title: "快捷键触发过快",
+      message: "系统已收到快捷键，但本次被防抖拦截。",
+      mode,
+      targetApp,
+      details: [`状态：${isRecording ? "录音中" : isProcessing ? "处理中" : "准备中"}`, `保持Hub：${keepHubVisible ? "是" : "否"}`],
+    });
     flashFloatingNudge();
     if (isRecording) {
       setStatus("已经在录音，说完后再按一次停止。", "recording");
@@ -822,7 +962,16 @@ function handleShortcutMode(mode: VoiceMode, targetApp = ""): void {
     return;
   }
   lastShortcutAt = now;
-  void toggleRecording(mode, targetApp);
+  addDiagnosticLog({
+    level: "info",
+    category: "system",
+    title: "快捷键触发",
+    message: "已收到全局快捷键，准备切换录音状态。",
+    mode,
+    targetApp,
+    details: [`状态：${isRecording ? "停止录音" : "开始录音"}`, `保持Hub：${keepHubVisible ? "是" : "否"}`],
+  });
+  void toggleRecording(mode, targetApp, keepHubVisible);
 }
 
 /** 从本地存储读取配置并回填设置表单。 */
@@ -833,16 +982,20 @@ function loadConfigToForm(): void {
   modelInput.value = config.asrModel;
   textModelInput.value = config.textModel;
   languageSelect.value = config.language;
-  targetLanguagesInput.value = config.targetLanguages.join(", ");
+  setTargetLanguageSelectValue(config.targetLanguages);
   historyRetentionSelect.value = config.historyRetention;
   postProcessDictationInput.checked = config.postProcessDictation;
-  quickAiPolishInput.checked = config.postProcessDictation;
+  setSelectValueWithLegacyOption(dictationOutputLanguageSelect, config.dictationOutputLanguage);
+  syncDictationOutputLanguageState(config.postProcessDictation);
   microphoneSelect.value = config.microphoneDeviceId;
   interactionSoundsInput.checked = config.interactionSounds;
   muteWhileDictatingInput.checked = config.muteWhileDictating;
   launchAtLoginInput.checked = config.launchAtLogin;
   showInDockInput.checked = config.showInDock;
   personalStyleInput.value = config.personalStyle;
+  dictationStyleInput.value = config.dictationStyle;
+  translationStyleInput.value = config.translationStyle;
+  askStyleInput.value = config.askStyle;
   dictateShortcutInput.value = formatShortcutLabel(config.shortcuts.dictate);
   translateShortcutInput.value = formatShortcutLabel(config.shortcuts.translate);
   askShortcutInput.value = formatShortcutLabel(config.shortcuts.ask);
@@ -881,9 +1034,10 @@ function defaultConfig(): VoiceConfig {
     asrModel: DEFAULT_ASR_MODEL,
     textModel: DEFAULT_TEXT_MODEL,
     language: "auto",
-    targetLanguages: ["简体中文"],
+    targetLanguages: [DEFAULT_TARGET_LANGUAGE],
     historyRetention: "forever",
     postProcessDictation: true,
+    dictationOutputLanguage: DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: "default",
     interactionSounds: true,
     muteWhileDictating: false,
@@ -891,6 +1045,9 @@ function defaultConfig(): VoiceConfig {
     showInDock: false,
     shortcuts: { ...DEFAULT_SHORTCUTS },
     personalStyle: "",
+    dictationStyle: "",
+    translationStyle: "",
+    askStyle: "",
   };
 }
 
@@ -907,6 +1064,10 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
     historyRetention: normalizeRetention(value.historyRetention),
     postProcessDictation:
       typeof value.postProcessDictation === "boolean" ? value.postProcessDictation : fallback.postProcessDictation,
+    dictationOutputLanguage:
+      typeof value.dictationOutputLanguage === "string" && value.dictationOutputLanguage.trim()
+        ? value.dictationOutputLanguage
+        : fallback.dictationOutputLanguage,
     microphoneDeviceId:
       typeof value.microphoneDeviceId === "string" && value.microphoneDeviceId.trim()
         ? value.microphoneDeviceId
@@ -919,6 +1080,9 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
     showInDock: typeof value.showInDock === "boolean" ? value.showInDock : fallback.showInDock,
     shortcuts: normalizeShortcuts(value.shortcuts, fallback.shortcuts),
     personalStyle: typeof value.personalStyle === "string" ? value.personalStyle : fallback.personalStyle,
+    dictationStyle: typeof value.dictationStyle === "string" ? value.dictationStyle : fallback.dictationStyle,
+    translationStyle: typeof value.translationStyle === "string" ? value.translationStyle : fallback.translationStyle,
+    askStyle: typeof value.askStyle === "string" ? value.askStyle : fallback.askStyle,
   };
 }
 
@@ -990,9 +1154,10 @@ function readConfigFromForm(): VoiceConfig {
     asrModel: modelInput.value.trim() || DEFAULT_ASR_MODEL,
     textModel: textModelInput.value.trim() || DEFAULT_TEXT_MODEL,
     language: languageSelect.value || "auto",
-    targetLanguages: splitInputList(targetLanguagesInput.value, ["简体中文"]),
+    targetLanguages: [targetLanguagesSelect.value || DEFAULT_TARGET_LANGUAGE],
     historyRetention: normalizeRetention(historyRetentionSelect.value),
     postProcessDictation: postProcessDictationInput.checked,
+    dictationOutputLanguage: dictationOutputLanguageSelect.value || DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: microphoneSelect.value || "default",
     interactionSounds: interactionSoundsInput.checked,
     muteWhileDictating: muteWhileDictatingInput.checked,
@@ -1004,11 +1169,32 @@ function readConfigFromForm(): VoiceConfig {
       ask: normalizeShortcutText(askShortcutInput.value, DEFAULT_SHORTCUTS.ask),
     },
     personalStyle: personalStyleInput.value.trim(),
+    dictationStyle: dictationStyleInput.value.trim(),
+    translationStyle: translationStyleInput.value.trim(),
+    askStyle: askStyleInput.value.trim(),
   };
 }
 
+/** 回填翻译目标下拉框，并兼容旧版本手输保存的自定义语言。 */
+function setTargetLanguageSelectValue(targetLanguages: string[]): void {
+  const targetLanguage =
+    targetLanguages.map((item) => item.trim()).find((item) => Boolean(item)) || DEFAULT_TARGET_LANGUAGE;
+  setSelectValueWithLegacyOption(targetLanguagesSelect, targetLanguage);
+}
+
+/** 回填下拉框，并兼容旧版本存过的自定义值。 */
+function setSelectValueWithLegacyOption(select: HTMLSelectElement, value: string): void {
+  if (!Array.from(select.options).some((option) => option.value === value)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = `${value}（已保存）`;
+    select.appendChild(option);
+  }
+  select.value = value;
+}
+
 /** 保存配置；Mimo Key 只写入 macOS 钥匙串，不进入 localStorage。 */
-async function saveConfigFromForm(successMessage = "设置已保存，快捷键已重新生效。"): Promise<void> {
+async function saveConfigFromForm(successMessage = "设置已保存。"): Promise<void> {
   const config = readConfigFromForm();
   if (!validateShortcutInputs() || hasShortcutConflict(config.shortcuts)) {
     showHubNotice("快捷键配置需要处理后才能保存。", "error");
@@ -1047,8 +1233,15 @@ function setDictationPolishEnabled(enabled: boolean): void {
 
 /** 同步顶部快捷开关和设置页开关，确保同一配置没有两个状态。 */
 function syncDictationPolishSwitches(enabled: boolean): void {
-  quickAiPolishInput.checked = enabled;
   postProcessDictationInput.checked = enabled;
+  syncDictationOutputLanguageState(enabled);
+}
+
+/** 根据口述 AI 润色开关启用或禁用输出语言设置。 */
+function syncDictationOutputLanguageState(enabled: boolean): void {
+  dictationOutputLanguageSelect.disabled = !enabled;
+  dictationOutputLanguageRow.dataset.disabled = enabled ? "false" : "true";
+  dictationOutputLanguageRow.title = enabled ? "AI 润色后会按这里设置输出。" : "关闭 AI 润色时会直接使用 ASR 原文。";
 }
 
 /** 刷新 Hub 上可见的运行状态和本地统计。 */
@@ -1189,67 +1382,108 @@ function renderShortcutLabels(shortcuts: ShortcutConfig): void {
 
 /** 刷新设置页里所有桌面能力的真实状态。 */
 async function refreshDiagnostics(): Promise<void> {
-  if (windowMode !== "hub") {
+  if (windowMode !== "hub" || isRefreshingDiagnostics) {
     return;
   }
-  systemStateText.textContent = isTauriRuntime() ? "本机运行中" : "网页预览";
-  systemStateText.dataset.state = isTauriRuntime() ? "success" : "warning";
-  const microphoneDiagnostic = await readMicrophoneDiagnostic();
-  setDiagnosticStatus(microphoneStatus, microphoneDiagnostic.text, microphoneDiagnostic.state);
-  setDiagnosticStatus(homeMicrophoneStatus, microphoneDiagnostic.text, microphoneDiagnostic.state);
-
-  if (!isTauriRuntime()) {
-    setDiagnosticStatus(apiKeyStatus, "仅桌面端可检测", "warning");
-    setDiagnosticStatus(accessibilityStatus, "仅桌面端可检测", "warning");
-    setDiagnosticStatus(shortcutStatus, "仅桌面端可注册", "warning");
-    setDiagnosticStatus(homeApiKeyStatus, "仅桌面端可检测", "warning");
-    setDiagnosticStatus(homeAccessibilityStatus, "仅桌面端可检测", "warning");
-    setDiagnosticStatus(homeShortcutStatus, "仅桌面端可注册", "warning");
-    updateReadinessSummary(false, microphoneDiagnostic.state, false, false, false);
-    return;
-  }
-
+  isRefreshingDiagnostics = true;
   try {
-    const diagnostics = await readRuntimeDiagnostics();
-    const hasApiKey = diagnostics.hasSessionApiKey || diagnostics.hasKeychainApiKey || diagnostics.hasEnvApiKey;
-    const keyText = diagnostics.hasSessionApiKey
-      ? "会话 Key 已就绪"
-      : diagnostics.hasKeychainApiKey
-        ? "钥匙串 Key 已就绪"
-        : diagnostics.hasEnvApiKey
-          ? "环境 Key 已就绪"
-          : "未配置";
-    setDiagnosticStatus(apiKeyStatus, keyText, hasApiKey ? "success" : "error");
-    setDiagnosticStatus(homeApiKeyStatus, keyText, hasApiKey ? "success" : "error");
-    setDiagnosticStatus(
-      accessibilityStatus,
-      diagnostics.accessibilityTrusted ? "已授权" : "未授权，自动粘贴会受影响",
-      diagnostics.accessibilityTrusted ? "success" : "warning",
-    );
-    setDiagnosticStatus(
-      homeAccessibilityStatus,
-      diagnostics.accessibilityTrusted ? "已授权" : "未授权",
-      diagnostics.accessibilityTrusted ? "success" : "warning",
-    );
-    const shortcutDiagnostic = formatShortcutDiagnostic(diagnostics);
-    setDiagnosticStatus(shortcutStatus, shortcutDiagnostic.text, shortcutDiagnostic.state);
-    setDiagnosticStatus(homeShortcutStatus, shortcutDiagnostic.homeText, shortcutDiagnostic.state);
-    renderShortcutLabels(diagnostics.shortcuts);
-    updateReadinessSummary(
-      hasApiKey,
-      microphoneDiagnostic.state,
-      diagnostics.accessibilityTrusted,
-      diagnostics.shortcutRegistrationReady,
-      true,
-    );
-  } catch (error) {
-    setDiagnosticStatus(apiKeyStatus, "检测失败", "error");
-    setDiagnosticStatus(accessibilityStatus, "检测失败", "error");
-    setDiagnosticStatus(shortcutStatus, `检测失败：${formatError(error)}`, "error");
-    setDiagnosticStatus(homeApiKeyStatus, "检测失败", "error");
-    setDiagnosticStatus(homeAccessibilityStatus, "检测失败", "error");
-    setDiagnosticStatus(homeShortcutStatus, "检测失败", "error");
-    updateNextStepPanel("error", "重新检查运行状态", `诊断失败：${formatError(error)}`, "重新检查", "refresh", "refresh");
+    systemStateText.textContent = isTauriRuntime() ? "本机运行中" : "网页预览";
+    systemStateText.dataset.state = isTauriRuntime() ? "success" : "warning";
+    const microphoneDiagnostic = await readMicrophoneDiagnostic();
+    setDiagnosticStatus(microphoneStatus, microphoneDiagnostic.text, microphoneDiagnostic.state);
+    setDiagnosticStatus(homeMicrophoneStatus, microphoneDiagnostic.text, microphoneDiagnostic.state);
+
+    if (!isTauriRuntime()) {
+      setDiagnosticStatus(apiKeyStatus, "仅桌面端可检测", "warning");
+      setDiagnosticStatus(accessibilityStatus, "仅桌面端可检测", "warning");
+      setDiagnosticStatus(shortcutStatus, "仅桌面端可注册", "warning");
+      setDiagnosticStatus(homeApiKeyStatus, "仅桌面端可检测", "warning");
+      setDiagnosticStatus(homeAccessibilityStatus, "仅桌面端可检测", "warning");
+      setDiagnosticStatus(homeShortcutStatus, "仅桌面端可注册", "warning");
+      updateReadinessSummary(false, microphoneDiagnostic.state, false, false, false);
+      return;
+    }
+
+    try {
+      const diagnostics = await readRuntimeDiagnostics();
+      const hasApiKey = diagnostics.hasSessionApiKey || diagnostics.hasKeychainApiKey || diagnostics.hasEnvApiKey;
+      const keyText = diagnostics.hasSessionApiKey
+        ? "会话 Key 已就绪"
+        : diagnostics.hasKeychainApiKey
+          ? "钥匙串 Key 已就绪"
+          : diagnostics.hasEnvApiKey
+            ? "环境 Key 已就绪"
+            : "未配置";
+      setDiagnosticStatus(apiKeyStatus, keyText, hasApiKey ? "success" : "error");
+      setDiagnosticStatus(homeApiKeyStatus, keyText, hasApiKey ? "success" : "error");
+      setDiagnosticStatus(
+        accessibilityStatus,
+        diagnostics.accessibilityTrusted ? "已授权" : "未授权，自动粘贴会受影响",
+        diagnostics.accessibilityTrusted ? "success" : "warning",
+      );
+      setDiagnosticStatus(
+        homeAccessibilityStatus,
+        diagnostics.accessibilityTrusted ? "已授权" : "未授权",
+        diagnostics.accessibilityTrusted ? "success" : "warning",
+      );
+      const shortcutDiagnostic = formatShortcutDiagnostic(diagnostics);
+      setDiagnosticStatus(shortcutStatus, shortcutDiagnostic.text, shortcutDiagnostic.state);
+      setDiagnosticStatus(homeShortcutStatus, shortcutDiagnostic.homeText, shortcutDiagnostic.state);
+      renderShortcutLabels(diagnostics.shortcuts);
+      updateReadinessSummary(
+        hasApiKey,
+        microphoneDiagnostic.state,
+        diagnostics.accessibilityTrusted,
+        diagnostics.shortcutRegistrationReady,
+        true,
+      );
+    } catch (error) {
+      setDiagnosticStatus(apiKeyStatus, "检测失败", "error");
+      setDiagnosticStatus(accessibilityStatus, "检测失败", "error");
+      setDiagnosticStatus(shortcutStatus, `检测失败：${formatError(error)}`, "error");
+      setDiagnosticStatus(homeApiKeyStatus, "检测失败", "error");
+      setDiagnosticStatus(homeAccessibilityStatus, "检测失败", "error");
+      setDiagnosticStatus(homeShortcutStatus, "检测失败", "error");
+      updateNextStepPanel("error", "重新检查运行状态", `诊断失败：${formatError(error)}`, "重新检查", "refresh", "refresh");
+    }
+  } finally {
+    isRefreshingDiagnostics = false;
+  }
+}
+
+/** 启动 Hub 诊断轮询，覆盖用户在系统设置里手动移除权限后的状态变化。 */
+function startHubDiagnosticsRefresh(): void {
+  if (windowMode !== "hub" || hubDiagnosticsRefreshHandle !== null) {
+    return;
+  }
+  hubDiagnosticsRefreshHandle = window.setInterval(() => {
+    if (document.visibilityState === "visible") {
+      void refreshDiagnostics();
+    }
+  }, HUB_DIAGNOSTICS_REFRESH_INTERVAL_MS);
+  window.addEventListener("focus", refreshDiagnosticsAfterHubFocus);
+  document.addEventListener("visibilitychange", refreshDiagnosticsAfterVisibilityChange);
+}
+
+/** 停止 Hub 诊断轮询，窗口销毁时清理定时器和监听。 */
+function stopHubDiagnosticsRefresh(): void {
+  if (hubDiagnosticsRefreshHandle !== null) {
+    window.clearInterval(hubDiagnosticsRefreshHandle);
+    hubDiagnosticsRefreshHandle = null;
+  }
+  window.removeEventListener("focus", refreshDiagnosticsAfterHubFocus);
+  document.removeEventListener("visibilitychange", refreshDiagnosticsAfterVisibilityChange);
+}
+
+/** Hub 重新获得焦点时刷新一次桌面权限状态。 */
+function refreshDiagnosticsAfterHubFocus(): void {
+  void refreshDiagnostics();
+}
+
+/** Hub 从后台回到可见状态时刷新一次桌面权限状态。 */
+function refreshDiagnosticsAfterVisibilityChange(): void {
+  if (document.visibilityState === "visible") {
+    void refreshDiagnostics();
   }
 }
 
@@ -1351,15 +1585,15 @@ function updateReadinessSummary(
   updateReadyNextStepPanel();
 }
 
-/** 所有准备项就绪时，把首页下一步切成当前模式的真实开始动作。 */
+/** 所有准备项就绪时，把首页下一步切成默认口述入口，避免 Hub 存在“当前模式”概念。 */
 function updateReadyNextStepPanel(): void {
   const shortcuts = readSavedConfig().shortcuts;
-  const shortcutLabel = formatShortcutLabel(shortcuts[activeMode] || shortcuts.dictate);
+  const shortcutLabel = formatShortcutLabel(shortcuts.dictate);
   updateNextStepPanel(
     "success",
-    `可以开始${MODE_LABELS[activeMode]}`,
+    "可以开始口述",
     `点击开始或按 ${shortcutLabel}，说完再按一次停止并处理。`,
-    `开始${MODE_LABELS[activeMode]}`,
+    MODE_START_LABELS.dictate,
     "start",
     "play",
   );
@@ -1386,7 +1620,7 @@ function updateNextStepPanel(
 /** 执行首页智能下一步主动作。 */
 async function handleNextStepAction(): Promise<void> {
   if (nextReadinessAction === "start") {
-    await requestFloatingMode(activeMode);
+    await requestFloatingMode("dictate");
     return;
   }
   if (nextReadinessAction === "refresh") {
@@ -1858,11 +2092,11 @@ function clearSavedConfig(button: HTMLButtonElement): void {
 
 /** 请求悬浮窗按指定模式开始或停止录音。 */
 async function requestFloatingMode(mode: VoiceMode): Promise<void> {
-  selectVoiceMode(mode);
   if (windowMode === "hub" && nextReadinessAction !== "start") {
     await handleNextStepAction();
     return;
   }
+  setFloatingMode(mode);
   if (!isTauriRuntime()) {
     switchHubView("home");
     showHubNotice("网页预览模式不能触发系统悬浮录音。", "error");
@@ -1871,25 +2105,36 @@ async function requestFloatingMode(mode: VoiceMode): Promise<void> {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const { emitTo } = await import("@tauri-apps/api/event");
-    await invoke("show_main_window");
-    await emitTo("main", "hub-start-mode", mode);
+    await invoke<string>("show_main_window");
+    addDiagnosticLog({
+      level: "info",
+      category: "system",
+      title: "Hub 发起录音",
+      message: "用户从 Hub 发起语音流程，录音期间保持 Hub 主界面显示。",
+      mode,
+      details: ["保持Hub：是"],
+    });
+    await emitTo("main", "hub-start-mode", { mode, targetApp: "", keepHubVisible: true });
   } catch (error) {
+    addDiagnosticLog({
+      level: "error",
+      category: "system",
+      title: "Hub 发起录音失败",
+      message: formatError(error),
+      mode,
+    });
     showHubNotice(`无法唤起悬浮录音：${formatError(error)}`, "error");
   }
 }
 
-/** 只切换当前语音模式，不触发录音。 */
-function selectVoiceMode(mode: VoiceMode): void {
+/** 记录悬浮条本次要执行的模式，仅用于录音开始/停止时的内部状态。 */
+function setFloatingMode(mode: VoiceMode): void {
   activeMode = mode;
-  renderActiveModeButtons();
   updateFloatingShortcutTitle(readConfigFromForm().shortcuts);
-  if (nextReadinessAction === "start") {
-    updateReadyNextStepPanel();
-  }
 }
 
 /** 开始或停止录音。 */
-async function toggleRecording(mode: VoiceMode, targetApp = ""): Promise<void> {
+async function toggleRecording(mode: VoiceMode, targetApp = "", keepHubVisible = false): Promise<void> {
   if (isStartingRecording) {
     flashFloatingNudge();
     setStatus("正在准备麦克风，请稍等。", "busy");
@@ -1906,12 +2151,20 @@ async function toggleRecording(mode: VoiceMode, targetApp = ""): Promise<void> {
   }
   activeMode = mode;
   updateFloatingShortcutTitle(readSavedConfig().shortcuts);
-  await startRecording(mode, targetApp);
+  await startRecording(mode, targetApp, keepHubVisible);
 }
 
 /** 请求麦克风权限并开始录音。 */
-async function startRecording(mode: VoiceMode, targetApp = ""): Promise<void> {
+async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = false): Promise<void> {
   if (!navigator.mediaDevices?.getUserMedia) {
+    addDiagnosticLog({
+      level: "error",
+      category: "recording",
+      title: "录音能力不可用",
+      message: "当前环境不支持浏览器录音能力。",
+      mode,
+      targetApp,
+    });
     setStatus("当前环境不支持浏览器录音能力。", "error");
     return;
   }
@@ -1922,7 +2175,25 @@ async function startRecording(mode: VoiceMode, targetApp = ""): Promise<void> {
     if (!(await ensureReadyForRecording())) {
       return;
     }
-    recordingTargetApp = normalizeRecordingTargetApp(targetApp) || normalizeRecordingTargetApp(await readFrontmostApp());
+    recordingKeepsHubVisible = keepHubVisible;
+    recordingTargetApp = keepHubVisible
+      ? ""
+      : normalizeRecordingTargetApp(targetApp) ||
+        normalizeRecordingTargetApp(await readRecordingTargetApp()) ||
+        normalizeRecordingTargetApp(await readFrontmostApp());
+    addDiagnosticLog({
+      level: "info",
+      category: "recording",
+      title: "开始录音",
+      message: "已通过权限和 Key 检查，开始采集麦克风音频。",
+      mode,
+      targetApp: recordingTargetApp || targetApp,
+      details: [
+        `麦克风：${config.microphoneDeviceId || "default"}`,
+        `AI润色：${config.postProcessDictation ? "开启" : "关闭"}`,
+        `保持Hub：${recordingKeepsHubVisible ? "是" : "否"}`,
+      ],
+    });
     recordedSamples = [];
     recordedSampleLength = 0;
     if (config.muteWhileDictating) {
@@ -1950,9 +2221,18 @@ async function startRecording(mode: VoiceMode, targetApp = ""): Promise<void> {
     playInteractionSound("start", config);
     setStatus(`${MODE_LABELS[mode]}中，说完后再次按快捷键。`, "recording");
   } catch (error) {
+    recordingKeepsHubVisible = false;
     stopStream();
     void restoreSystemMute();
     const message = formatRecordingError(error);
+    addDiagnosticLog({
+      level: "error",
+      category: "recording",
+      title: "开始录音失败",
+      message,
+      mode,
+      targetApp: recordingTargetApp || targetApp,
+    });
     setStatus(message, "error");
     if (isMicrophonePermissionError(error)) {
       await showHubWindow();
@@ -2091,23 +2371,51 @@ async function stopRecordingAndTranscribe(): Promise<void> {
     const recordElapsedMs = Date.now() - recordStartedAt;
     recordDurationText.textContent = formatDuration(recordElapsedMs);
     audioSizeText.textContent = formatBytes(audioBlob.size);
+    addDiagnosticLog({
+      level: "info",
+      category: "recording",
+      title: "停止录音",
+      message: "已停止采集并生成待转写音频。",
+      mode: activeMode,
+      targetApp: recordingTargetApp,
+      elapsedMs: recordElapsedMs,
+      details: [`音频大小：${formatBytes(audioBlob.size)}`],
+    });
     recordButton.title = "开始录音";
     recordButton.setAttribute("aria-label", "开始录音");
     playInteractionSound("stop", readSavedConfig());
     if (recordElapsedMs < MIN_RECORDING_MS) {
       resultMeta.textContent = "录音太短";
       copyButton.disabled = true;
+      addDiagnosticLog({
+        level: "warning",
+        category: "recording",
+        title: "录音太短",
+        message: "本次录音短于最小时长，已跳过转写。",
+        mode: activeMode,
+        targetApp: recordingTargetApp,
+        elapsedMs: recordElapsedMs,
+      });
       setStatus("录音太短了，请说完一句话后再停止。", "error");
       return;
     }
     await transcribeAudio(audioBlob, activeMode, recordElapsedMs);
   } catch (error) {
     await restoreSystemMute();
+    addDiagnosticLog({
+      level: "error",
+      category: isRecording ? "recording" : "system",
+      title: "语音链路异常",
+      message: formatError(error),
+      mode: activeMode,
+      targetApp: recordingTargetApp,
+    });
     setStatus(formatError(error), "error");
   } finally {
     isProcessing = false;
     setFloatingDisabled(false);
     isRecording = false;
+    recordingKeepsHubVisible = false;
   }
 }
 
@@ -2130,11 +2438,20 @@ function cancelRecordingOrReset(): void {
     stopTimer();
     recordedSamples = [];
     recordedSampleLength = 0;
+    addDiagnosticLog({
+      level: "warning",
+      category: "recording",
+      title: "取消录音",
+      message: "用户取消了正在进行的录音，本次不会转写。",
+      mode: activeMode,
+      targetApp: recordingTargetApp,
+    });
     recordButton.title = "开始录音";
     recordButton.setAttribute("aria-label", "开始录音");
     recordDurationText.textContent = "--";
     audioSizeText.textContent = "--";
     resultMeta.textContent = "已取消";
+    recordingKeepsHubVisible = false;
     setStatus("已取消录音。", "ready");
     playInteractionSound("stop", readSavedConfig());
     void hideFloatingWindow();
@@ -2142,6 +2459,7 @@ function cancelRecordingOrReset(): void {
   }
   resultTextarea.value = "";
   recordingTargetApp = "";
+  recordingKeepsHubVisible = false;
   copyButton.disabled = true;
   resultMeta.textContent = "等待录音";
   recordDurationText.textContent = "--";
@@ -2266,20 +2584,63 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
   processDurationText.textContent = "--";
   resultMeta.textContent = "转写中";
 
-  const response = await callTranscribe({
-    apiKey: "",
-    baseUrl: config.baseUrl,
-    asrModel: config.asrModel,
-    language: config.language,
-    contentType: "audio/wav",
-    audioBase64: await blobToBase64(audioBlob),
+  addDiagnosticLog({
+    level: "info",
+    category: "transcribe",
+    title: "开始转写",
+    message: "正在把本次音频发送给 ASR 接口。",
+    mode,
+    targetApp: recordingTargetApp,
+    details: [`模型：${config.asrModel}`, `语言：${config.language}`, `音频大小：${formatBytes(audioBlob.size)}`],
   });
+
+  let response: TranscribeResponse;
+  try {
+    response = await callTranscribe({
+      apiKey: "",
+      baseUrl: config.baseUrl,
+      asrModel: config.asrModel,
+      language: config.language,
+      contentType: "audio/wav",
+      audioBase64: await blobToBase64(audioBlob),
+    });
+  } catch (error) {
+    addDiagnosticLog({
+      level: "error",
+      category: "transcribe",
+      title: "转写失败",
+      message: formatError(error),
+      mode,
+      targetApp: recordingTargetApp,
+    });
+    throw error;
+  }
 
   const sourceText = response.text.trim();
   transcribeDurationText.textContent = formatDuration(response.elapsedMs);
-  if (!isMeaningfulTranscription(sourceText)) {
+  const hasMeaningfulTranscription = isMeaningfulTranscription(sourceText);
+  addDiagnosticLog({
+    level: hasMeaningfulTranscription ? "success" : "warning",
+    category: "transcribe",
+    title: hasMeaningfulTranscription ? "转写完成" : "转写返回空内容",
+    message: hasMeaningfulTranscription ? "ASR 已返回可处理文本。" : "ASR 请求已返回，但内容为空或属于占位文案。",
+    mode,
+    targetApp: recordingTargetApp,
+    elapsedMs: response.elapsedMs,
+    details: [`模型：${response.model}`, `原文字数：${countTextUnits(sourceText)}`],
+  });
+  if (!hasMeaningfulTranscription) {
     resultMeta.textContent = "没有识别到语音";
     copyButton.disabled = true;
+    addDiagnosticLog({
+      level: "warning",
+      category: "transcribe",
+      title: "没有识别到有效语音",
+      message: "ASR 返回内容为空或属于上游空内容占位。",
+      mode,
+      targetApp: recordingTargetApp,
+      elapsedMs: response.elapsedMs,
+    });
     setStatus("没有识别到有效语音，请靠近麦克风后再试。", "error");
     return;
   }
@@ -2287,26 +2648,65 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
   const contextApp = recordingTargetApp || (await readFrontmostApp());
   const shouldProcess = mode !== "dictate" || config.postProcessDictation;
   let usedSourceFallback = false;
+  let sourceFallbackReason = "";
   let processed: { text: string; elapsedMs: number; model: string };
   if (shouldProcess) {
     try {
+      addDiagnosticLog({
+        level: "info",
+        category: "process",
+        title: mode === "dictate" ? "开始 AI 润色" : `开始${MODE_LABELS[mode]}处理`,
+        message: "正在把 ASR 文本发送给 AI 文本处理接口。",
+        mode,
+        targetApp: contextApp,
+        details: [`模型：${config.textModel}`, `原文字数：${countTextUnits(sourceText)}`],
+      });
       processed = await processRecognizedText(sourceText, mode, config, contextApp);
       if (mode === "dictate" && !processed.text.trim()) {
         usedSourceFallback = true;
+        sourceFallbackReason = "AI 润色返回为空";
         processed = { text: sourceText, elapsedMs: 0, model: response.model };
       }
     } catch (error) {
+      const processError = formatError(error);
+      addDiagnosticLog({
+        level: mode === "dictate" ? "warning" : "error",
+        category: "process",
+        title: mode === "dictate" ? "AI 润色失败，回退原文" : `${MODE_LABELS[mode]}处理失败`,
+        message: processError,
+        mode,
+        targetApp: contextApp,
+      });
       if (mode !== "dictate") {
         throw error;
       }
       usedSourceFallback = true;
+      sourceFallbackReason = processError;
       processed = { text: sourceText, elapsedMs: 0, model: response.model };
     }
   } else {
+    addDiagnosticLog({
+      level: "info",
+      category: "process",
+      title: "跳过 AI 润色",
+      message: "口述 AI 润色开关已关闭，本次直接使用 ASR 原文。",
+      mode,
+      targetApp: contextApp,
+    });
     processed = { text: sourceText, elapsedMs: 0, model: response.model };
   }
 
   const outputText = processed.text.trim();
+  addDiagnosticLog({
+    level: usedSourceFallback ? "warning" : "success",
+    category: "process",
+    title: usedSourceFallback ? "使用原始转写结果" : "文本处理完成",
+    message: usedSourceFallback ? formatAiFallbackMessage(sourceFallbackReason) : "最终输出已准备好进入粘贴流程。",
+    mode,
+    targetApp: contextApp,
+    elapsedMs: processed.elapsedMs,
+    details: [`模型：${processed.model || response.model}`, `输出字数：${countTextUnits(outputText)}`],
+  });
   resultTextarea.value = outputText;
   resultMeta.textContent = `${MODE_LABELS[mode]}完成`;
   processDurationText.textContent = processed.elapsedMs ? formatDuration(processed.elapsedMs) : "未润色";
@@ -2334,9 +2734,45 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
   }
 
   if (usedSourceFallback) {
-    setStatus("AI 润色没有及时返回，已先使用原始转写。", "error");
+    setStatus(formatAiFallbackMessage(sourceFallbackReason), "error");
+  }
+  if (recordingKeepsHubVisible) {
+    addDiagnosticLog({
+      level: "info",
+      category: "paste",
+      title: "跳过自动粘贴",
+      message: "本次录音来自 Hub 主界面，已保留 Hub 显示并把结果写入最近结果和历史记录。",
+      mode,
+      details: [`输出字数：${countTextUnits(outputText)}`],
+    });
+    setStatus("处理完成，结果已更新到最近结果和历史记录。", "ready");
+    await hideFloatingWindow();
+    return;
   }
   await pasteTranscription(outputText, contextApp);
+}
+
+/** 把 AI 润色回退原因整理成用户能判断的提示，避免把超时误解成转写失败。 */
+function formatAiFallbackMessage(reason: string): string {
+  const normalizedReason = reason.trim();
+  if (isAiTimeoutReason(normalizedReason)) {
+    return "AI 润色超时，本次已先使用 ASR 原文。";
+  }
+  if (normalizedReason) {
+    return `AI 润色未完成，本次已先使用 ASR 原文。原因：${normalizedReason}`;
+  }
+  return "AI 润色未产出可用内容，本次已先使用 ASR 原文。";
+}
+
+/** 判断 Mimo 文本处理错误是否属于等待超时，便于诊断日志展示真实原因。 */
+function isAiTimeoutReason(reason: string): boolean {
+  const normalizedReason = reason.toLowerCase();
+  return (
+    normalizedReason.includes("timeout") ||
+    normalizedReason.includes("timed out") ||
+    normalizedReason.includes("deadline") ||
+    normalizedReason.includes("超时")
+  );
 }
 
 /** 判断 ASR 返回内容是否是可交付文本，过滤上游的空内容占位文案。 */
@@ -2391,7 +2827,7 @@ async function processRecognizedText(
     dictionary: readDictionary(),
     targetLanguages: config.targetLanguages,
     contextApp,
-    styleInstruction: buildStyleInstruction(config),
+    styleInstruction: buildStyleInstruction(config, mode),
   };
   const response = await invoke<ProcessTextResponse>("process_text", { request });
   return {
@@ -2414,6 +2850,19 @@ async function readFrontmostApp(): Promise<string> {
   }
 }
 
+/** 读取 Rust 侧保存的录音目标 App，重启后首次录音也尽量保住自动粘贴目标。 */
+async function readRecordingTargetApp(): Promise<string> {
+  if (!isTauriRuntime()) {
+    return "";
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<string>("get_recording_target_app");
+  } catch {
+    return "";
+  }
+}
+
 /** 清理 typesass 自身窗口名，避免把悬浮窗当成最终粘贴目标。 */
 function normalizeRecordingTargetApp(appName: string): string {
   const normalizedAppName = appName.trim();
@@ -2423,25 +2872,89 @@ function normalizeRecordingTargetApp(appName: string): string {
   return normalizedAppName;
 }
 
-/** 生成本地个性化提示，不改写事实，只影响表达形态。 */
-function buildStyleInstruction(config: VoiceConfig): string {
+/** 生成本地个性化提示，先拼通用偏好，再追加当前模式自己的偏好。 */
+function buildStyleInstruction(config: VoiceConfig, mode: VoiceMode): string {
   const pieces: string[] = [];
   if (config.personalStyle.trim()) {
-    pieces.push(`用户偏好：${config.personalStyle.trim()}。`);
+    pieces.push(`通用偏好：${config.personalStyle.trim()}。`);
+  }
+  const outputLanguageInstruction = readDictationOutputLanguageInstruction(config, mode);
+  if (outputLanguageInstruction) {
+    pieces.push(outputLanguageInstruction);
+  }
+  const modeStyle = readModeStyle(config, mode);
+  if (modeStyle) {
+    pieces.push(`${MODE_LABELS[mode]}偏好：${modeStyle}。`);
   }
   return pieces.join("\n");
+}
+
+/** 读取口述 AI 润色的输出语言要求，关闭润色或跟随原文时不追加。 */
+function readDictationOutputLanguageInstruction(config: VoiceConfig, mode: VoiceMode): string {
+  if (mode !== "dictate" || !config.postProcessDictation) {
+    return "";
+  }
+  const language = config.dictationOutputLanguage.trim();
+  if (!language || language === DEFAULT_DICTATION_OUTPUT_LANGUAGE) {
+    return "";
+  }
+  return `口述输出语言：请使用${language}输出，保持原意，不新增事实。`;
+}
+
+/** 根据当前 AI 处理模式读取对应的局部输出偏好。 */
+function readModeStyle(config: VoiceConfig, mode: VoiceMode): string {
+  if (mode === "translate") {
+    return config.translationStyle.trim();
+  }
+  if (mode === "ask") {
+    return config.askStyle.trim();
+  }
+  return config.dictationStyle.trim();
 }
 
 /** 转写完成后把结果自动粘贴到当前焦点输入框。 */
 async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
   if (!isTauriRuntime()) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "paste",
+      title: "跳过自动粘贴",
+      message: "网页预览模式无法触发系统级粘贴。",
+      targetApp,
+    });
     setStatus("转写完成，可以复制结果。", "ready");
     return;
   }
   try {
     const { invoke } = await import("@tauri-apps/api/core");
-    await activateTargetApp(targetApp);
-    const response = await invoke<PasteResponse>("paste_text", { text });
+    addDiagnosticLog({
+      level: "info",
+      category: "paste",
+      title: "开始自动粘贴",
+      message: "正在写入剪贴板并请求系统粘贴到目标输入框。",
+      targetApp,
+      details: [`输出字数：${countTextUnits(text)}`],
+    });
+    const response = await invoke<PasteResponse>("paste_text", { text, targetApp });
+    addDiagnosticLog({
+      level: response.pasted ? "info" : "warning",
+      category: "paste",
+      title: response.pasted ? "粘贴指令已发送" : "自动粘贴未完成",
+      message: response.message,
+      targetApp: response.targetApp,
+      frontmostApp: response.frontmostAfterPaste || response.frontmostAfterActivate || response.frontmostBeforePaste,
+      pasteMethod: response.pasteMethod,
+      accessibilityTrusted: response.accessibilityTrusted,
+      clipboardWritten: response.clipboardWritten,
+      focusedElementBeforePaste: response.focusedElementBeforePaste,
+      focusedElementAfterActivate: response.focusedElementAfterActivate,
+      focusedElementAfterPaste: response.focusedElementAfterPaste,
+      details: [
+        `发送前：${response.frontmostBeforePaste || "未知"}`,
+        `激活后：${response.frontmostAfterActivate || "未知"}`,
+        `发送后：${response.frontmostAfterPaste || "未知"}`,
+      ],
+    });
     if (response.pasted) {
       setStatus(response.message, "ready");
       return;
@@ -2450,29 +2963,17 @@ async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
     await showResultWindow(text, response.message, response.requiresAccessibility);
   } catch (error) {
     const message = `${formatError(error)}。结果已保留，可手动复制。`;
+    addDiagnosticLog({
+      level: "error",
+      category: "paste",
+      title: "自动粘贴异常",
+      message,
+      targetApp,
+      details: [`输出字数：${countTextUnits(text)}`],
+    });
     setStatus(message, "error");
     await showResultWindow(text, message, false);
   }
-}
-
-/** 自动粘贴前切回录音触发时的目标 App，降低焦点被处理窗口抢走的概率。 */
-async function activateTargetApp(appName: string): Promise<void> {
-  const normalizedAppName = normalizeRecordingTargetApp(appName);
-  if (!normalizedAppName) {
-    return;
-  }
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("activate_app", { appName: normalizedAppName });
-    await wait(220);
-  } catch {
-    // 切回目标 App 失败时仍继续走剪贴板兜底，不中断转写结果。
-  }
-}
-
-/** 等待一小段时间，让 macOS 完成前台 App 切换。 */
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 /** 在独立结果窗口展示无法自动粘贴的内容。 */
@@ -2616,6 +3117,7 @@ async function blobToBase64(blob: Blob): Promise<string> {
 /** 切换 Hub 当前视图。 */
 function switchHubView(view: string): void {
   const title = VIEW_TITLES[view] || VIEW_TITLES.home;
+  const navView = readNavViewForHubView(view);
   hubTitle.textContent = title.title;
   hubEyebrow.textContent = title.eyebrow;
   resetHubNotice();
@@ -2623,17 +3125,17 @@ function switchHubView(view: string): void {
     element.classList.toggle("isActive", element.dataset.view === view);
   });
   document.querySelectorAll<HTMLButtonElement>("[data-view-target]").forEach((button) => {
-    button.classList.toggle("isActive", button.dataset.viewTarget === view);
+    button.classList.toggle("isActive", button.dataset.viewTarget === navView);
   });
   renderHub();
 }
 
-/** 同步 Hub 顶部三种语音模式按钮的选中态。 */
-function renderActiveModeButtons(): void {
-  document.querySelectorAll<HTMLElement>("[data-mode-action]").forEach((element) => {
-    element.classList.toggle("isActive", element.dataset.modeAction === activeMode);
-  });
-  syncStartActionButtons();
+/** 子设置页仍归属语音模式导航，避免侧边栏出现不存在的当前模式状态。 */
+function readNavViewForHubView(view: string): string {
+  if (Object.values(MODE_SETTINGS_VIEWS).includes(view)) {
+    return "modes";
+  }
+  return view;
 }
 
 /** 更新带 IconPark 图标按钮的文字，避免重绘时丢失图标。 */
@@ -2660,21 +3162,16 @@ function updateActionButtonIcon(button: HTMLButtonElement, iconName: IconName): 
 /** 根据准备状态同步所有开始按钮，避免未就绪时误唤起悬浮条再报错。 */
 function syncStartActionButtons(): void {
   const isReady = nextReadinessAction === "start";
-  const sharedLabel = isReady ? `开始${MODE_LABELS[activeMode]}` : "继续配置";
+  const sharedLabel = isReady ? MODE_START_LABELS.dictate : "继续配置";
   const sharedIcon = isReady ? "play" : "setting";
-  operationHint.textContent = isReady
-    ? "点击卡片切换模式，点击开始会唤起屏幕顶部的录音悬浮条。"
-    : "点击卡片切换模式，先完成必要配置后再开始录音。";
-  [startDictateButton, quickStartButton].forEach((button) => {
-    updateActionButtonLabel(button, sharedLabel);
-    updateActionButtonIcon(button, sharedIcon);
-    button.title = isReady ? sharedLabel : "继续完成必要配置";
-  });
+  updateActionButtonLabel(quickStartButton, sharedLabel);
+  updateActionButtonIcon(quickStartButton, sharedIcon);
+  quickStartButton.title = isReady ? sharedLabel : "继续完成必要配置";
   document.querySelectorAll<HTMLButtonElement>("[data-mode-start]").forEach((button) => {
     const mode = normalizeMode(button.dataset.modeStart);
-    updateActionButtonLabel(button, isReady ? `开始${MODE_LABELS[mode]}` : "继续配置");
+    updateActionButtonLabel(button, isReady ? MODE_START_LABELS[mode] : "继续配置");
     updateActionButtonIcon(button, isReady ? MODE_ACTION_ICONS[mode] : "setting");
-    button.title = isReady ? `开始${MODE_LABELS[mode]}` : "继续完成必要配置";
+    button.title = isReady ? MODE_START_LABELS[mode] : "继续完成必要配置";
   });
 }
 
@@ -2683,10 +3180,11 @@ function renderHub(): void {
   if (windowMode !== "hub") {
     return;
   }
-  renderActiveModeButtons();
+  syncStartActionButtons();
   renderStats();
   renderHistory();
   renderDictionary();
+  renderDiagnosticLog();
   const latest = readHistory()[0];
   updateRecentResult(latest || null);
 }
@@ -2704,7 +3202,17 @@ function renderStats(): void {
   usageTrackFill.style.width = words > 0 ? `${Math.min(100, Math.round((todayWords / words) * 100))}%` : "0%";
   metricSpeed.textContent = durationMs > 0 ? `${Math.round(todayWords / (durationMs / 60000))}/分钟` : "--";
   syncDictationPolishSwitches(readSavedConfig().postProcessDictation);
-  metricPersonalization.textContent = `${readDictionary().length} 词条${readSavedConfig().personalStyle ? " + 偏好" : ""}`;
+  metricPersonalization.textContent = `${readDictionary().length} 词条${hasOutputPreference(readSavedConfig()) ? " + 偏好" : ""}`;
+}
+
+/** 判断用户是否配置了任一通用或模式级输出偏好。 */
+function hasOutputPreference(config: VoiceConfig): boolean {
+  return Boolean(
+    config.personalStyle.trim() ||
+      config.dictationStyle.trim() ||
+      config.translationStyle.trim() ||
+      config.askStyle.trim(),
+  );
 }
 
 /** 渲染历史列表。 */
@@ -2823,6 +3331,218 @@ function clearHistory(button: HTMLButtonElement): void {
   resetPendingConfirmation();
   renderHub();
   showHubNotice("历史记录已清空。", "success");
+}
+
+/** 渲染本机诊断日志，帮助定位快捷键、转写和自动粘贴链路问题。 */
+function renderDiagnosticLog(): void {
+  if (windowMode !== "hub") {
+    return;
+  }
+  const logs = readDiagnosticLogs();
+  diagnosticLogCount.textContent = `${logs.length} 条`;
+  copyDiagnosticLogButton.disabled = logs.length === 0;
+  clearDiagnosticLogButton.disabled = logs.length === 0;
+  if (!logs.length) {
+    diagnosticLogList.innerHTML = '<div class="emptyState">还没有诊断日志。</div>';
+    return;
+  }
+  diagnosticLogList.innerHTML = logs.map(renderDiagnosticLogItem).join("");
+}
+
+/** 把单条诊断日志渲染为不暴露转写正文的列表项。 */
+function renderDiagnosticLogItem(item: DiagnosticLogItem): string {
+  const details = buildDiagnosticLogDetails(item);
+  return `
+    <article class="diagnosticLogItem" data-level="${item.level}">
+      <div class="historyMeta">
+        <span>${DIAGNOSTIC_LOG_CATEGORY_LABELS[item.category]} · ${DIAGNOSTIC_LOG_LEVEL_LABELS[item.level]}</span>
+        <time>${formatDateTime(item.createdAt)}</time>
+      </div>
+      <h2>${escapeHtml(item.title)}</h2>
+      <p>${escapeHtml(item.message)}</p>
+      ${details.length ? `<div class="diagnosticLogDetails">${details.map((detail) => `<span>${escapeHtml(detail)}</span>`).join("")}</div>` : ""}
+    </article>`;
+}
+
+/** 组装诊断日志的可视化标签，便于扫描焦点和粘贴路径。 */
+function buildDiagnosticLogDetails(item: DiagnosticLogItem): string[] {
+  const details: string[] = [];
+  if (item.mode) {
+    details.push(`模式：${MODE_LABELS[item.mode]}`);
+  }
+  if (item.targetApp) {
+    details.push(`目标：${item.targetApp}`);
+  }
+  if (item.frontmostApp) {
+    details.push(`前台：${item.frontmostApp}`);
+  }
+  if (item.pasteMethod) {
+    details.push(`方式：${item.pasteMethod}`);
+  }
+  if (typeof item.accessibilityTrusted === "boolean") {
+    details.push(`辅助功能：${item.accessibilityTrusted ? "已授权" : "未授权"}`);
+  }
+  if (typeof item.clipboardWritten === "boolean") {
+    details.push(`剪贴板：${item.clipboardWritten ? "已写入" : "未写入"}`);
+  }
+  if (item.focusedElementBeforePaste) {
+    details.push(`焦点发送前：${item.focusedElementBeforePaste}`);
+  }
+  if (item.focusedElementAfterActivate) {
+    details.push(`焦点激活后：${item.focusedElementAfterActivate}`);
+  }
+  if (item.focusedElementAfterPaste) {
+    details.push(`焦点发送后：${item.focusedElementAfterPaste}`);
+  }
+  if (typeof item.elapsedMs === "number" && item.elapsedMs > 0) {
+    details.push(`耗时：${formatDuration(item.elapsedMs)}`);
+  }
+  return [...details, ...item.details];
+}
+
+/** 新增本机诊断日志；只记录元信息，不保存用户转写正文。 */
+function addDiagnosticLog(draft: DiagnosticLogDraft): void {
+  const item: DiagnosticLogItem = {
+    ...draft,
+    id: createId(),
+    createdAt: Date.now(),
+    message: draft.message.trim() || draft.title,
+    targetApp: normalizeOptionalText(draft.targetApp),
+    frontmostApp: normalizeOptionalText(draft.frontmostApp),
+    pasteMethod: normalizeOptionalText(draft.pasteMethod),
+    focusedElementBeforePaste: normalizeOptionalText(draft.focusedElementBeforePaste),
+    focusedElementAfterActivate: normalizeOptionalText(draft.focusedElementAfterActivate),
+    focusedElementAfterPaste: normalizeOptionalText(draft.focusedElementAfterPaste),
+    details: (draft.details || []).map((detail) => detail.trim()).filter(Boolean),
+  };
+  const logs = [item, ...readDiagnosticLogs()].slice(0, MAX_DIAGNOSTIC_LOG_ITEMS);
+  writeDiagnosticLogs(logs);
+  renderDiagnosticLog();
+}
+
+/** 读取本机诊断日志，异常时返回空数组以免影响主流程。 */
+function readDiagnosticLogs(): DiagnosticLogItem[] {
+  const raw = localStorage.getItem(DIAGNOSTIC_LOG_STORAGE_KEY);
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<DiagnosticLogItem>[];
+    return parsed
+      .map(normalizeDiagnosticLogItem)
+      .filter((item): item is DiagnosticLogItem => Boolean(item))
+      .sort((left, right) => right.createdAt - left.createdAt);
+  } catch {
+    return [];
+  }
+}
+
+/** 对本地日志记录做类型兜底，兼容未来字段扩展。 */
+function normalizeDiagnosticLogItem(value: Partial<DiagnosticLogItem>): DiagnosticLogItem | null {
+  if (typeof value.id !== "string" || typeof value.title !== "string" || typeof value.message !== "string") {
+    return null;
+  }
+  return {
+    id: value.id,
+    createdAt: typeof value.createdAt === "number" ? value.createdAt : Date.now(),
+    level: normalizeDiagnosticLogLevel(value.level),
+    category: normalizeDiagnosticLogCategory(value.category),
+    title: value.title,
+    message: value.message,
+    mode: normalizeOptionalMode(value.mode),
+    targetApp: normalizeOptionalText(value.targetApp),
+    frontmostApp: normalizeOptionalText(value.frontmostApp),
+    pasteMethod: normalizeOptionalText(value.pasteMethod),
+    focusedElementBeforePaste: normalizeOptionalText(value.focusedElementBeforePaste),
+    focusedElementAfterActivate: normalizeOptionalText(value.focusedElementAfterActivate),
+    focusedElementAfterPaste: normalizeOptionalText(value.focusedElementAfterPaste),
+    accessibilityTrusted:
+      typeof value.accessibilityTrusted === "boolean" ? value.accessibilityTrusted : undefined,
+    clipboardWritten: typeof value.clipboardWritten === "boolean" ? value.clipboardWritten : undefined,
+    elapsedMs: typeof value.elapsedMs === "number" ? value.elapsedMs : undefined,
+    details: Array.isArray(value.details)
+      ? value.details.filter((detail): detail is string => typeof detail === "string" && Boolean(detail.trim()))
+      : [],
+  };
+}
+
+/** 规范化日志等级，防止异常存储值破坏样式。 */
+function normalizeDiagnosticLogLevel(value: unknown): DiagnosticLogLevel {
+  if (value === "success" || value === "warning" || value === "error") {
+    return value;
+  }
+  return "info";
+}
+
+/** 规范化日志阶段，未知值归到系统阶段。 */
+function normalizeDiagnosticLogCategory(value: unknown): DiagnosticLogCategory {
+  if (value === "recording" || value === "transcribe" || value === "process" || value === "paste") {
+    return value;
+  }
+  return "system";
+}
+
+/** 规范化可选语音模式，非法值直接不展示。 */
+function normalizeOptionalMode(value: unknown): VoiceMode | undefined {
+  if (value === "dictate" || value === "translate" || value === "ask") {
+    return value;
+  }
+  return undefined;
+}
+
+/** 规范化可选文本字段，空值不进入界面。 */
+function normalizeOptionalText(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+/** 写入诊断日志并通知同源窗口刷新。 */
+function writeDiagnosticLogs(logs: DiagnosticLogItem[]): void {
+  localStorage.setItem(DIAGNOSTIC_LOG_STORAGE_KEY, JSON.stringify(logs));
+}
+
+/** 复制诊断日志，方便把一次失败链路直接发给开发定位。 */
+async function copyDiagnosticLogs(): Promise<void> {
+  const logs = readDiagnosticLogs();
+  if (!logs.length) {
+    showHubNotice("当前没有可复制的诊断日志。", "idle");
+    return;
+  }
+  await copyText(formatDiagnosticLogsText(logs));
+  showHubNotice("诊断日志已复制。", "success");
+}
+
+/** 把诊断日志整理成纯文本，便于粘贴到对话里排查问题。 */
+function formatDiagnosticLogsText(logs: DiagnosticLogItem[]): string {
+  return logs
+    .map((item) => {
+      const details = buildDiagnosticLogDetails(item);
+      return [
+        `[${formatDateTime(item.createdAt)}] ${DIAGNOSTIC_LOG_CATEGORY_LABELS[item.category]} / ${DIAGNOSTIC_LOG_LEVEL_LABELS[item.level]}`,
+        item.title,
+        item.message,
+        ...details,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+/** 清空诊断日志，执行前要求二次点击确认。 */
+function clearDiagnosticLogs(button: HTMLButtonElement): void {
+  if (!readDiagnosticLogs().length) {
+    showHubNotice("当前没有诊断日志。", "idle");
+    return;
+  }
+  if (!confirmDangerousAction("clearDiagnosticLog", button, "再次点击清空", "再次点击将清空本机诊断日志。")) {
+    return;
+  }
+  localStorage.removeItem(DIAGNOSTIC_LOG_STORAGE_KEY);
+  resetPendingConfirmation();
+  renderHub();
+  showHubNotice("诊断日志已清空。", "success");
 }
 
 /** 让危险按钮进入短暂确认态；同一按钮在确认窗口内再次点击才返回 true。 */

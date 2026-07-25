@@ -218,6 +218,275 @@
 - 短录音错误气泡直接展示原因，文本没有溢出，圆角和深色风格与悬浮条一致。
 - 本批没有新增无功能界面或 mock 数据。
 
+## 2026-07-24 自动粘贴诊断日志复核
+
+检查对象：
+
+- `output/playwright/typesass-diagnostic-log-20260724.png`
+- `src/main.ts`
+- `src-tauri/src/lib.rs`
+
+结论：
+
+- Hub 侧边栏已新增“诊断日志”真实栏目，空态显示“还没有诊断日志”，无日志时“复制日志”和“清空日志”处于禁用态。
+- 日志记录快捷键触发、开始/停止录音、ASR、AI 处理、自动粘贴和异常路径，不保存用户转写正文，只保存字数、耗时、目标 App、前台 App、权限状态、剪贴板状态和粘贴方式。
+- Rust `paste_text` 返回剪贴板写入状态、辅助功能状态、System Events/CoreGraphics 粘贴方式，以及发送前、激活后、发送后的前台 App，便于定位授权后偶发不粘贴的问题。
+- 页面未发现白屏、遮挡、错位或按钮文字溢出；新增按钮均有真实复制/清空动作，不是 demo/mock。
+
+验证命令：
+
+- `npm run lint`：通过。
+- `npm run build`：通过。
+- `cargo fmt --check --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
+- `git diff --check`：通过。
+- `npx tauri build --bundles app`：通过。
+
+待用户确认：
+
+- 在真实 `.app` 中复现“授权后偶发不粘贴”时，诊断日志里目标 App、发送前后前台 App 和粘贴方式是否能暴露焦点丢失或系统粘贴失效原因。
+
 待用户确认：
 
 - 在真实 macOS 辅助功能设置中勾选当前 `typesass.app` 后，Hub 是否自动刷新为已授权。
+
+## 2026-07-24 翻译目标下拉选择视觉复核
+
+检查对象：
+
+- `output/playwright/typesass-translation-target-select-20260724.png`
+
+结论：
+
+- 设置页“翻译目标”已从手输输入框改为下拉选择，交互形态和“识别语言”一致。
+- 下拉项覆盖常用目标语言：简体中文、繁体中文、英语、日语、韩语、法语、德语、西班牙语、葡萄牙语、俄语、意大利语、阿拉伯语、泰语、越南语、印尼语。
+- 旧版本手输保存的自定义语言会作为“已保存”选项回填，不会因为改成下拉导致现有配置直接丢失。
+- 本批没有新增 demo/mock 数据或无功能按钮。
+
+待用户确认：
+
+- 在真实 `.app` 中选择目标语言并保存后，用 `Control + T` 录一句话，确认翻译目标符合选择结果。
+
+## 2026-07-24 模式设置拆分视觉复核
+
+检查对象：
+
+- `output/playwright/typesass-mode-settings-split-20260724.png`
+- `output/playwright/typesass-dictate-settings-20260724.png`
+- `output/playwright/typesass-translate-settings-20260724.png`
+- `output/playwright/typesass-ask-settings-20260724.png`
+- `output/playwright/typesass-system-settings-split-20260724.png`
+
+结论：
+
+- 语音模式页已移除“当前模式”面板，三张模式卡不再出现选中态或模式锁定概念。
+- 口述、翻译、随便问卡片的开始按钮旁边均有 IconPark 设置按钮，点击后进入对应模式设置页。
+- 口述设置只保留口述后 AI 润色和口述输出偏好；保存按钮有真实本地配置写入反馈。
+- 翻译设置只保留目标语言下拉和翻译输出偏好；目标语言已从系统设置迁出。
+- 随便问设置只保留回答偏好；系统设置只保留 Key、模型、识别语言、麦克风、历史、系统能力、通用输出偏好和诊断。
+- 浏览器预览中未发现白屏、明显遮挡、按钮文字溢出或无功能入口。
+
+待用户确认：
+
+- 在真实 `.app` 中分别保存三个模式设置后，用对应快捷键录音确认实际 AI 输出风格符合各自配置。
+
+## 2026-07-24 口述 AI 输出语言视觉复核
+
+检查对象：
+
+- `output/playwright/typesass-dictation-output-language-enabled-20260724.png`
+- `output/playwright/typesass-dictation-output-language-disabled-20260724.png`
+
+结论：
+
+- 口述设置页在“口述后 AI 润色”下方新增“输出语言”下拉框。
+- AI 润色开启时，下拉框可选择跟随原文、简体中文、繁体中文、英语、日语、韩语、法语、德语、西班牙语、葡萄牙语、俄语、意大利语、阿拉伯语、泰语、越南语、印尼语。
+- AI 润色关闭时，下拉框置灰禁用，并提示关闭后会直接使用 ASR 原文。
+- 浏览器预览中选择“英语”后点击“保存口述设置”，顶部反馈“设置已保存。”，选中状态保持正常。
+- 当前页面未发现白屏、遮挡、错位、文字溢出或无功能入口。
+
+待用户确认：
+
+- 在真实 `.app` 中开启 AI 润色并选择目标输出语言后，用 `Control + P` 录一句话，确认 Mimo 返回结果符合语言设置。
+
+## 2026-07-24 辅助功能移除后状态刷新复核
+
+检查对象：
+
+- `src/main.ts` Hub 诊断刷新逻辑
+
+结论：
+
+- 原逻辑只在 Hub 初始化、手动刷新、保存设置或从 App 内打开辅助功能设置后刷新诊断。
+- 如果用户直接在 macOS 系统设置中移除 `typesass.app` 辅助功能权限，Hub 可能短时间保留旧的“已授权”展示。
+- 本批新增 Hub 诊断自动刷新：窗口重新聚焦、页面重新可见、以及 Hub 打开时每 4 秒自动刷新一次。
+- 自动刷新仍读取 Rust `get_runtime_diagnostics` 的真实 `accessibilityTrusted`，不是前端缓存或 mock 状态。
+
+待用户确认：
+
+- 在最新 `.app` 中移除辅助功能权限后，回到 Hub 或等待几秒，确认辅助功能状态变为“未授权”。
+
+## 2026-07-24 多语言输出后自动粘贴回归复核
+
+检查对象：
+
+- `src/main.ts` 转写后调用 `paste_text` 的目标 App 参数。
+- `src-tauri/src/lib.rs` 桌面端剪贴板与 Cmd+V 自动粘贴策略。
+
+结论：
+
+- 口述输出语言本身只会追加到 AI 文本处理提示词，不直接影响剪贴板写入。
+- 多语言输出开启后 AI 处理耗时可能变长，期间悬浮窗/Hub 更容易让 macOS 焦点恢复不稳定。
+- 旧粘贴策略会在没有记录到标准输入焦点时提前进入结果兜底，容易表现为“转写成功但没有粘贴”。
+- 本批调整为：写入剪贴板后只检查辅助功能权限；权限通过后隐藏悬浮条和结果窗口，若记录到目标 App 则先切回目标 App，识别不到目标时也会等待 macOS 恢复上一个焦点后发送 Cmd+V。
+- 当前没有新增 demo/mock 数据或无功能入口。
+
+待用户确认：
+
+- 在最新 `.app` 中从真实输入框内按 `Control + P` 开始和停止录音，开启口述 AI 输出语言后确认结果能自动进入输入框。
+
+## 2026-07-24 自动粘贴目标和系统粘贴事件复测
+
+检查对象：
+
+- `src-tauri/src/lib.rs` 的外部目标 App 记忆、Hub 隐藏和系统粘贴触发。
+- `src/main.ts` 的 Hub 启动录音事件 payload。
+
+结论：
+
+- 已确认 macOS 基准粘贴可用：TextEdit 正文获得焦点后，剪贴板内容可以通过 `System Events` 的 `Cmd+V` 写入文档。
+- 已确认自动化脚本模拟 `Control + P` 不稳定：AppleScript / CoreGraphics 发送的 `Control + P` 不总是被 Tauri 全局快捷键插件当成真实快捷键，因此不能替代用户物理按键验收。
+- 修复方向改为产品逻辑层：打开 Hub 前记住最近一次非 typesass 前台 App；Hub 前台启动录音时隐藏 Hub 并把目标 App 传给悬浮录音条；粘贴前隐藏 main/result/hub 三类临时窗口。
+- 自动粘贴触发从单一 CoreGraphics 改为 `System Events` 优先，失败时回退 CoreGraphics，贴近本机基准粘贴成功路径。
+- 本地自动化能确认写剪贴板和系统粘贴动作，但物理 `Control + P -> 录音 -> 停止 -> 粘贴` 仍需要用户手按确认。
+
+待用户确认：
+
+- 打开最新 `.app` 后，点进真实输入框，用物理 `Control + P` 开始和停止录音，确认文本是否直接进入当前输入框。
+
+## 2026-07-25 重启后自动粘贴目标兜底复核
+
+检查对象：
+
+- `src-tauri/src/lib.rs` 的 `get_recording_target_app` 和 `paste_text` 目标 App 兜底。
+- `src/main.ts` 的录音开始目标 App 确认逻辑。
+- 最新打包产物 `src-tauri/target/release/bundle/macos/typesass.app`，打包时间 `2026-07-25 01:07`。
+
+结论：
+
+- 用户反馈退出并重新打开 App 后，转写能完成，但结果没有追加到当前输入框。
+- 该现象更符合“重启后目标 App 为空或丢失，粘贴指令没有回到输入框所在应用”，不是 ASR 失败。
+- 本批新增 Rust 侧录音目标读取命令：当前前台是 typesass 时回退到最近一次外部 App。
+- 自动粘贴时若前端传入目标为空，会依次使用发送前的外部前台 App、Rust 运行期最近外部 App 作为兜底，再激活目标后发送 Cmd+V。
+- 前端开始录音时也会主动读取 Rust 侧保存的目标 App，避免重启后第一次使用时 targetApp 在事件 payload 中丢失。
+- 构建和静态检查已通过；未使用脚本模拟真实录音，避免污染用户体验结论。
+
+验证命令：
+
+- `npm run lint`：通过。
+- `npm run build`：通过。
+- `cargo fmt --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
+- `git diff --check`：通过。
+- `npx tauri build --bundles app`：通过。
+
+待用户确认：
+
+- 退出 typesass 后重新打开，聚焦真实输入框，按物理 `Control + P` 开始录音，说 2-4 秒，再按 `Control + P` 停止，确认文本是否直接追加到输入框。
+- 如果仍失败，打开“诊断日志”查看最新粘贴记录中的目标、发送前、激活后、发送后和粘贴方式。
+
+## 2026-07-25 ChatGPT WebView 粘贴事件复核
+
+检查对象：
+
+- 用户提供的 `2026-07-25 08:14` 诊断日志。
+- `src-tauri/src/lib.rs` 的 `trigger_system_paste` 和焦点诊断。
+- `src/main.ts` 的自动粘贴日志级别和焦点字段展示。
+
+结论：
+
+- 用户日志显示 ASR、AI 润色、剪贴板写入、辅助功能授权、目标 App 激活均正常。
+- 日志同时显示 `System Events` 粘贴指令已发给 `ChatGPT`，但文字没有进入 ChatGPT 输入框。
+- 这说明“App 已前台”和“输入框真实接收粘贴”不是同一件事；旧日志把指令发出记为“成功”，容易误导。
+- 本批将系统粘贴改为优先使用更接近物理键盘事件的 `CoreGraphics`，仅在键盘事件创建失败时回退 `System Events`。
+- 自动粘贴日志中“粘贴指令已发送”改为信息级别，不再把命令发出等同于实际插入成功。
+- 诊断日志新增目标 App 内的焦点元素摘要：发送前、激活后、发送后，用于判断 ChatGPT 这类 WebView 是否还聚焦在输入框。
+- 最新打包产物 `typesass.app/Contents/MacOS/ai-tool` 时间为 `2026-07-25 08:20:41`，已启动。
+
+验证命令：
+
+- `npm run lint`：通过。
+- `npm run build`：通过。
+- `cargo fmt --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo fmt --check --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
+- `git diff --check`：通过。
+- `npx tauri build --bundles app`：通过。
+
+待用户确认：
+
+- 在最新 `.app` 中重新聚焦 ChatGPT 输入框，用物理 `Control + P` 录 2-4 秒再停止，确认粘贴方式是否变为 `CoreGraphics`，以及文字是否进入输入框。
+- 如果仍没有进入输入框，复制最新“粘贴”日志，重点看焦点发送前、焦点激活后、焦点发送后。
+
+## 2026-07-25 前台抢占后粘贴重试复核
+
+检查对象：
+
+- 用户提供的 `2026-07-25 08:22` 诊断日志。
+- `src-tauri/src/lib.rs` 的粘贴后前台校验和重试逻辑。
+
+结论：
+
+- 用户日志显示粘贴前目标为 `ChatGPT`，激活后也是 `ChatGPT`，但发送后系统前台变为 `System Settings`。
+- 这说明第一次 `Cmd+V` 发送后被系统设置抢回前台，粘贴事件很可能没有落到 ChatGPT 输入框。
+- 本批新增一次性补救：发送粘贴后如果前台不是目标 App，会重新激活目标 App，等待前台稳定后再补发一次 `Cmd+V`。
+- 为避免重复粘贴，只有“发送后前台不是目标 App”时才会补发；发送后仍是目标 App 时不会重试。
+- 日志中的“方式”会记录补救链路，例如 `CoreGraphics -> 前台被System Settings抢占，恢复目标后重试 -> 重试：CoreGraphics`。
+- 最新打包产物 `typesass.app/Contents/MacOS/ai-tool` 时间为 `2026-07-25 08:26:10`，已启动。
+
+验证命令：
+
+- `npm run lint`：通过。
+- `npm run build`：通过。
+- `cargo fmt --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo fmt --check --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
+- `git diff --check`：通过。
+- `npx tauri build --bundles app`：通过。
+
+待用户确认：
+
+- 在最新 `.app` 中重新聚焦 ChatGPT 输入框，用物理 `Control + P` 录 2-4 秒再停止。
+- 如果仍没有进入输入框，复制最新“粘贴”日志，重点看“方式”和“发送后”。
+
+## 2026-07-25 录音开始不影响 Hub 显示复核
+
+检查对象：
+
+- `src-tauri/src/lib.rs` 的 `trigger_voice_mode`、`show_main_window` 和 `paste_text`。
+- 最新打包产物 `src-tauri/target/release/bundle/macos/typesass.app`。
+
+结论：
+
+- 问题原因是 Rust 原生层在开始录音时主动执行了 `hub.hide()`，这是之前为了减少自动粘贴时焦点落回 typesass 的保护逻辑。
+- 本批删除“开始录音/Hub 发起录音时隐藏 Hub”的逻辑，Hub 打开时按快捷键不会被主动收起。
+- 当当前前台就是 typesass Hub 时，录音会发给后台录音窗口处理，不再弹出顶部悬浮胶囊，也不恢复外部 App 焦点，避免录制动作影响 Hub 主页面显示。
+- 从 Hub 主界面发起的录音完成后会跳过自动粘贴，结果只更新到最近结果和历史记录，避免结束录音后 `paste_text` 隐藏 Hub。
+- 当当前前台是外部输入 App 时，仍显示顶部悬浮胶囊并保留目标 App 焦点，保持快捷口述体验。
+- 自动粘贴阶段仍保留隐藏 `main`、`result` 和 `hub` 的逻辑，避免最终文本粘贴回 typesass 自己。
+- 最新 `.app` 已重新构建并启动，进程为 `typesass.app/Contents/MacOS/ai-tool`。
+
+验证命令：
+
+- `npm run lint`：通过。
+- `npm run build`：通过。
+- `cargo fmt --check --manifest-path src-tauri/Cargo.toml`：通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
+- `git diff --check`：通过。
+- `npx tauri build --bundles app`：通过。
+
+待用户确认：
+
+- 打开 Hub 后按物理快捷键开始录音，确认 Hub 不再立即消失，也不被顶部悬浮胶囊或目标 App 抢走显示。
+- 再次按物理快捷键结束录音，确认 Hub 仍保持显示，最近结果或历史记录可看到本次输出。
+- 聚焦真实输入框后再走一次完整录音和停止转写，确认粘贴阶段仍能把文本送回目标输入框。

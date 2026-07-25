@@ -51,6 +51,13 @@ impl Default for RuntimeShortcuts {
     }
 }
 
+/// 运行期间保存最近一次外部前台 App，Hub 前台时用于恢复真实粘贴目标。
+#[derive(Default)]
+struct RuntimeFocus {
+    /// 最近一次非 typesass 的前台应用名称。
+    last_external_app: Mutex<String>,
+}
+
 /// 全局快捷键注册结果，避免系统冲突时只表现为按键无响应。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,6 +194,35 @@ struct PasteResponse {
     message: String,
     /// 是否需要用户授予辅助功能权限。
     requires_accessibility: bool,
+    /// 本次尝试粘贴前恢复的目标应用。
+    target_app: String,
+    /// 是否已成功写入系统剪贴板。
+    clipboard_written: bool,
+    /// 触发粘贴前检测到的辅助功能授权状态。
+    accessibility_trusted: bool,
+    /// 本次粘贴指令实际使用的触发方式。
+    paste_method: String,
+    /// 隐藏 typesass 窗口前的系统前台应用。
+    frontmost_before_paste: String,
+    /// 尝试激活目标应用后的系统前台应用。
+    frontmost_after_activate: String,
+    /// 发送粘贴指令后的系统前台应用。
+    frontmost_after_paste: String,
+    /// 发送粘贴指令前目标 App 内的系统焦点元素。
+    focused_element_before_paste: String,
+    /// 激活目标 App 后的系统焦点元素。
+    focused_element_after_activate: String,
+    /// 发送粘贴指令后的系统焦点元素。
+    focused_element_after_paste: String,
+}
+
+/// 系统级粘贴触发结果，记录具体路径以便前端诊断。
+#[derive(Debug)]
+struct PasteTriggerResult {
+    /// 触发粘贴时辅助功能权限是否可信。
+    accessibility_ready: bool,
+    /// 实际使用的系统粘贴触发方式。
+    method: String,
 }
 
 /// 返回给前端的桌面运行状态诊断。
@@ -235,6 +271,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(RuntimeSecrets::default())
         .manage(RuntimeShortcuts::default())
+        .manage(RuntimeFocus::default())
         .manage(RuntimeResult::default())
         .setup(|app| {
             #[cfg(desktop)]
@@ -296,6 +333,7 @@ pub fn run() {
             get_login_launch,
             set_dock_visible,
             get_frontmost_app,
+            get_recording_target_app,
             activate_app,
             set_system_output_muted
         ])
@@ -303,6 +341,7 @@ pub fn run() {
         .expect("启动 typesass 失败")
         .run(|app, event| {
             if let tauri::RunEvent::Reopen { .. } = event {
+                remember_current_external_app(app);
                 let _ = present_window(app, "hub", false);
             }
         });
@@ -415,6 +454,7 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
 /// 打开 Hub 并切到指定页面，供托盘菜单复用。
 #[cfg(desktop)]
 fn present_hub_view(app: &AppHandle, view: &str) {
+    remember_current_external_app(app);
     let _ = present_window(app, "hub", false);
     emit_hub_event(app.clone(), "hub-switch-view", view.to_string());
 }
@@ -426,6 +466,46 @@ fn emit_hub_event(app: AppHandle, event: &'static str, payload: String) {
         thread::sleep(Duration::from_millis(120));
         let _ = app.emit_to("hub", event, payload);
     });
+}
+
+/// 记住当前非 typesass 前台 App，避免 Hub 抢焦点后丢失自动粘贴目标。
+fn remember_current_external_app(app: &AppHandle) -> String {
+    get_frontmost_app()
+        .map(|app_name| remember_external_app(app, &app_name))
+        .unwrap_or_default()
+}
+
+/// 读取当前外部目标 App；如果当前前台是 typesass，则回退到最近一次外部 App。
+fn read_external_target_app(app: &AppHandle) -> String {
+    let current_app = get_frontmost_app().unwrap_or_default();
+    let normalized_current_app = normalize_target_app_name(&current_app);
+    if !normalized_current_app.is_empty() {
+        return remember_external_app(app, &normalized_current_app);
+    }
+    read_last_external_app(app)
+}
+
+/// 写入最近一次外部 App 名称，空值或 typesass 自身不会覆盖旧目标。
+fn remember_external_app(app: &AppHandle, app_name: &str) -> String {
+    let normalized_app_name = normalize_target_app_name(app_name);
+    if normalized_app_name.is_empty() {
+        return String::new();
+    }
+    let focus_state = app.state::<RuntimeFocus>();
+    if let Ok(mut last_external_app) = focus_state.last_external_app.lock() {
+        *last_external_app = normalized_app_name.clone();
+    }
+    normalized_app_name
+}
+
+/// 读取最近一次外部 App 名称，状态锁异常时回退为空，避免中断主链路。
+fn read_last_external_app(app: &AppHandle) -> String {
+    let focus_state = app.state::<RuntimeFocus>();
+    focus_state
+        .last_external_app
+        .lock()
+        .map(|app_name| normalize_target_app_name(&app_name))
+        .unwrap_or_default()
 }
 
 /// 从剪贴板读取词汇并交给 Hub 写入本地词典。
@@ -481,12 +561,22 @@ fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
 
 /// 按指定模式通知悬浮录音条开始或停止。
 fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
-    let target_app = get_frontmost_app().unwrap_or_default();
+    let target_app = read_external_target_app(&app);
+    let should_show_floating_window =
+        !normalize_target_app_name(&get_frontmost_app().unwrap_or_default()).is_empty();
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
     }
-    let _ = present_window(&app, "main", true);
+    if should_show_floating_window {
+        let _ = present_window(&app, "main", true);
+    } else if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    if should_show_floating_window && !target_app.is_empty() {
+        let _ = activate_macos_app(&target_app);
+    }
     let mode = mode.to_string();
+    let keep_hub_visible = !should_show_floating_window;
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(180));
         if let Some(window) = app.get_webview_window("main") {
@@ -494,11 +584,12 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
                 serde_json::to_string(&mode).unwrap_or_else(|_| "\"dictate\"".to_string());
             let target_app_json =
                 serde_json::to_string(&target_app).unwrap_or_else(|_| "\"\"".to_string());
+            let keep_hub_visible_json = keep_hub_visible.to_string();
             let script = format!(
                 r#"if (window.__AIToolHandleShortcutMode) {{
-                    window.__AIToolHandleShortcutMode({mode_json}, {target_app_json});
+                    window.__AIToolHandleShortcutMode({mode_json}, {target_app_json}, {keep_hub_visible_json});
                 }} else {{
-                    window.__AIToolPendingShortcutMode = {{ mode: {mode_json}, targetApp: {target_app_json} }};
+                    window.__AIToolPendingShortcutMode = {{ mode: {mode_json}, targetApp: {target_app_json}, keepHubVisible: {keep_hub_visible_json} }};
                 }}"#
             );
             let _ = window.eval(&script);
@@ -758,11 +849,22 @@ fn normalize_shortcut(value: &str) -> String {
 
 /// 显示胶囊悬浮条，供前端在需要时主动唤起。
 #[tauri::command]
-fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+fn show_main_window(app: tauri::AppHandle) -> Result<String, String> {
+    let target_app = read_external_target_app(&app);
+    let should_show_floating_window =
+        !normalize_target_app_name(&get_frontmost_app().unwrap_or_default()).is_empty();
     if let Some(result) = app.get_webview_window("result") {
         let _ = result.hide();
     }
-    present_window(&app, "main", true)
+    if should_show_floating_window {
+        present_window(&app, "main", true)?;
+    } else if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    if should_show_floating_window && !target_app.is_empty() {
+        let _ = activate_macos_app(&target_app);
+    }
+    Ok(target_app)
 }
 
 /// 隐藏胶囊悬浮条，应用继续在后台等待全局快捷键。
@@ -779,6 +881,7 @@ fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
 /// 显示 Hub 主窗口，用于查看历史、词典和设置。
 #[tauri::command]
 fn show_hub_window(app: tauri::AppHandle) -> Result<(), String> {
+    remember_current_external_app(&app);
     present_window(&app, "hub", false)
 }
 
@@ -980,26 +1083,61 @@ fn get_frontmost_app() -> Result<String, String> {
     }
 }
 
+/// 读取本次录音应恢复的目标 App；当前前台是 typesass 时回退到最近一次外部 App。
+#[tauri::command]
+fn get_recording_target_app(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(read_external_target_app(&app))
+}
+
 /// 激活指定 macOS App，用于转写完成前回到录音触发时的目标输入应用。
 #[tauri::command]
 fn activate_app(app_name: String) -> Result<(), String> {
+    let normalized_app_name = normalize_target_app_name(&app_name);
+    if normalized_app_name.is_empty() {
+        return Ok(());
+    }
+    activate_macos_app(&normalized_app_name)
+}
+
+/// 过滤 typesass 自身窗口，避免把录音浮窗当作自动粘贴目标。
+fn normalize_target_app_name(app_name: &str) -> String {
     let normalized_app_name = app_name.trim();
     if normalized_app_name.is_empty()
         || normalized_app_name == "AiTool"
         || normalized_app_name == "typesass"
+        || normalized_app_name == "ai-tool"
     {
-        return Ok(());
+        return String::new();
     }
+    normalized_app_name.to_string()
+}
+
+/// 判断当前前台 App 是否仍是自动粘贴目标，避免前台被系统设置等窗口抢走。
+fn is_frontmost_target(frontmost_app: &str, target_app: &str) -> bool {
+    let normalized_target_app = normalize_target_app_name(target_app);
+    !normalized_target_app.is_empty()
+        && normalize_target_app_name(frontmost_app) == normalized_target_app
+}
+
+/// 当前台在发送粘贴后变成非目标 App 时，允许补救一次，避免粘贴事件落到系统设置。
+fn should_retry_paste_for_target(target_app: &str, frontmost_after_paste: &str) -> bool {
+    let normalized_target_app = normalize_target_app_name(target_app);
+    !normalized_target_app.is_empty()
+        && !is_frontmost_target(frontmost_after_paste, &normalized_target_app)
+}
+
+/// 激活 macOS 目标 App；非 macOS 平台保留空实现以便编译通过。
+fn activate_macos_app(app_name: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         run_osascript(&format!(
             r#"tell application "{}" to activate"#,
-            apple_script_escape(normalized_app_name)
+            apple_script_escape(app_name)
         ))?;
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = normalized_app_name;
+        let _ = app_name;
     }
     Ok(())
 }
@@ -1300,13 +1438,19 @@ fn build_process_prompt(request: &ProcessTextRequest, text: &str) -> (String, St
         format!("优先保留这些专有名词和大小写：{}。", dictionary)
     };
     let context_rule = build_context_rule(request);
+    let fast_context_rule = build_fast_context_rule(request);
+    let fast_glossary_rule = if dictionary.is_empty() {
+        "词典：无。".to_string()
+    } else {
+        format!("词典：{}。", dictionary)
+    };
 
     match request.mode {
         ProcessMode::Dictate => (
-            "你是桌面语音输入整理器。只输出可直接粘贴的最终文本；保持原意，不新增事实，不解释。".to_string(),
+            "只输出整理后的最终文本，保持原意，不解释。".to_string(),
             format!(
-                "{}\n{}\n任务：修正 ASR 误识别、标点、明显口误和重复；不要总结、扩写或改变意图。\n\nASR 原文：{}",
-                glossary_rule, context_rule, text
+                "{}\n{}\n规则：修正 ASR 误识别、标点、明显口误和重复；不总结，不扩写。\nASR：{}",
+                fast_glossary_rule, fast_context_rule, text
             ),
         ),
         ProcessMode::Translate => {
@@ -1330,7 +1474,8 @@ fn build_process_prompt(request: &ProcessTextRequest, text: &str) -> (String, St
             )
         }
         ProcessMode::Ask => (
-            "你是一个简洁可靠的桌面问答助手。请直接回答用户问题，不重复问题，不输出无关说明。".to_string(),
+            "你是一个简洁可靠的桌面问答助手。请直接回答用户问题，不重复问题，不输出无关说明。"
+                .to_string(),
             format!("{}\n{}\n用户问题：{}", glossary_rule, context_rule, text),
         ),
     }
@@ -1365,7 +1510,7 @@ fn calculate_process_temperature(mode: &ProcessMode) -> f64 {
 /// 根据模式限制 AI 文本处理等待时间，口述优先快速粘贴，翻译和问答保留更长响应窗口。
 fn calculate_process_timeout(mode: &ProcessMode) -> Duration {
     match mode {
-        ProcessMode::Dictate => Duration::from_millis(4500),
+        ProcessMode::Dictate => Duration::from_millis(6500),
         ProcessMode::Translate => Duration::from_millis(9000),
         ProcessMode::Ask => Duration::from_millis(15000),
     }
@@ -1390,6 +1535,24 @@ fn build_context_rule(request: &ProcessTextRequest) -> String {
     }
     if rules.is_empty() {
         "没有额外上下文。".to_string()
+    } else {
+        rules.join("\n")
+    }
+}
+
+/// 构造口述润色的短上下文提示，减少短句处理时的模型排队和生成负担。
+fn build_fast_context_rule(request: &ProcessTextRequest) -> String {
+    let mut rules = Vec::new();
+    let context_app = request.context_app.trim();
+    if !context_app.is_empty() {
+        rules.push(format!("应用：{}。", context_app));
+    }
+    let style_instruction = request.style_instruction.trim();
+    if !style_instruction.is_empty() {
+        rules.push(format!("偏好：{}。", style_instruction));
+    }
+    if rules.is_empty() {
+        "上下文：无。".to_string()
     } else {
         rules.join("\n")
     }
@@ -1435,34 +1598,64 @@ async fn send_chat_completion(
 
 /// 把文字写入系统剪贴板，并模拟 Cmd+V 粘贴到当前前台输入框。
 #[tauri::command]
-async fn paste_text(app: tauri::AppHandle, text: String) -> Result<PasteResponse, String> {
+async fn paste_text(
+    app: tauri::AppHandle,
+    text: String,
+    target_app: String,
+) -> Result<PasteResponse, String> {
     let normalized_text = text.trim();
     if normalized_text.is_empty() {
         return Err("转写结果为空，无法自动粘贴".to_string());
     }
 
+    let frontmost_before_paste = get_frontmost_app().unwrap_or_default();
+    let frontmost_target_app = normalize_target_app_name(&frontmost_before_paste);
+    let requested_target_app = normalize_target_app_name(&target_app);
+    let normalized_target_app = if !requested_target_app.is_empty() {
+        remember_external_app(&app, &requested_target_app)
+    } else if !frontmost_target_app.is_empty() {
+        remember_external_app(&app, &frontmost_target_app)
+    } else {
+        read_last_external_app(&app)
+    };
     write_clipboard_text(normalized_text)?;
-    if !is_accessibility_trusted() {
+    let clipboard_written = true;
+    let accessibility_trusted = is_accessibility_trusted();
+    if !accessibility_trusted {
         return Ok(PasteResponse {
             pasted: false,
             message: "已写入剪贴板；自动粘贴需要先给 typesass 开启辅助功能权限。".to_string(),
             requires_accessibility: true,
+            target_app: normalized_target_app,
+            clipboard_written,
+            accessibility_trusted,
+            paste_method: "notSent".to_string(),
+            frontmost_before_paste,
+            frontmost_after_activate: String::new(),
+            frontmost_after_paste: String::new(),
+            focused_element_before_paste: String::new(),
+            focused_element_after_activate: String::new(),
+            focused_element_after_paste: String::new(),
         });
     }
 
-    if !is_text_input_focused() {
-        return Ok(PasteResponse {
-            pasted: false,
-            message: "已写入剪贴板；当前没有检测到可输入焦点。".to_string(),
-            requires_accessibility: false,
-        });
-    }
-
+    let focused_element_before_paste = read_focused_element_summary(&normalized_target_app);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
-    thread::sleep(Duration::from_millis(180));
-    let accessibility_ready = match trigger_system_paste() {
+    if let Some(window) = app.get_webview_window("result") {
+        let _ = window.hide();
+    }
+    if let Some(window) = app.get_webview_window("hub") {
+        let _ = window.hide();
+    }
+    if !normalized_target_app.is_empty() {
+        let _ = activate_macos_app(&normalized_target_app);
+    }
+    thread::sleep(Duration::from_millis(620));
+    let frontmost_after_activate = get_frontmost_app().unwrap_or_default();
+    let focused_element_after_activate = read_focused_element_summary(&normalized_target_app);
+    let paste_result = match trigger_system_paste() {
         Ok(value) => value,
         Err(error) => {
             if let Some(window) = app.get_webview_window("main") {
@@ -1471,11 +1664,65 @@ async fn paste_text(app: tauri::AppHandle, text: String) -> Result<PasteResponse
             return Err(error);
         }
     };
+    let mut paste_methods = vec![paste_result.method.clone()];
+    thread::sleep(Duration::from_millis(160));
+    let mut frontmost_after_paste = get_frontmost_app().unwrap_or_default();
+    let mut focused_element_after_paste = read_focused_element_summary(&normalized_target_app);
+
+    if should_retry_paste_for_target(&normalized_target_app, &frontmost_after_paste) {
+        paste_methods.push(format!(
+            "前台被{}抢占，恢复目标后重试",
+            frontmost_after_paste
+        ));
+        let _ = activate_macos_app(&normalized_target_app);
+        thread::sleep(Duration::from_millis(760));
+        if is_frontmost_target(
+            &get_frontmost_app().unwrap_or_default(),
+            &normalized_target_app,
+        ) {
+            match trigger_system_paste() {
+                Ok(retry_result) => paste_methods.push(format!("重试：{}", retry_result.method)),
+                Err(error) => {
+                    paste_methods.push(format!("重试失败：{}", trim_error_message(&error)))
+                }
+            }
+            thread::sleep(Duration::from_millis(160));
+            frontmost_after_paste = get_frontmost_app().unwrap_or_default();
+            focused_element_after_paste = read_focused_element_summary(&normalized_target_app);
+        } else {
+            paste_methods.push("重试跳过：目标 App 未能回到前台".to_string());
+        }
+    }
+    let paste_method = paste_methods.join(" -> ");
+    let final_target_ready = normalized_target_app.is_empty()
+        || is_frontmost_target(&frontmost_after_paste, &normalized_target_app);
 
     Ok(PasteResponse {
-        pasted: accessibility_ready,
-        message: "已触发自动粘贴到当前输入位置。".to_string(),
+        pasted: paste_result.accessibility_ready,
+        message: if normalized_target_app.is_empty() {
+            "已隐藏悬浮条并向当前输入位置发送粘贴指令；是否插入取决于目标输入框焦点。".to_string()
+        } else if final_target_ready {
+            format!(
+                "已向 {} 发送粘贴指令；若仍未插入，请查看目标输入框焦点。",
+                normalized_target_app
+            )
+        } else {
+            format!(
+                "已向 {} 发送粘贴指令，但发送后前台变为 {}，请重新聚焦目标输入框。",
+                normalized_target_app, frontmost_after_paste
+            )
+        },
         requires_accessibility: false,
+        target_app: normalized_target_app,
+        clipboard_written,
+        accessibility_trusted: paste_result.accessibility_ready,
+        paste_method,
+        frontmost_before_paste,
+        frontmost_after_activate,
+        frontmost_after_paste,
+        focused_element_before_paste,
+        focused_element_after_activate,
+        focused_element_after_paste,
     })
 }
 
@@ -1703,13 +1950,85 @@ fn split_dictionary_words(text: &str) -> Vec<String> {
     .collect()
 }
 
-/// 触发系统级 Cmd+V；macOS 会要求给 typesass 开启辅助功能权限。
+/// 读取目标 App 当前辅助功能焦点摘要，用于定位 App 前台但输入框未聚焦的问题。
 #[cfg(target_os = "macos")]
-fn trigger_system_paste() -> Result<bool, String> {
+fn read_focused_element_summary(app_name: &str) -> String {
+    let normalized_app_name = normalize_target_app_name(app_name);
+    if normalized_app_name.is_empty() {
+        return String::new();
+    }
+    let script = format!(
+        r#"
+tell application "System Events"
+    if not (exists process "{app_name}") then return ""
+    tell process "{app_name}"
+        try
+            set focusedElement to value of attribute "AXFocusedUIElement"
+            set roleText to ""
+            set subroleText to ""
+            set titleText to ""
+            set descriptionText to ""
+            try
+                set roleText to value of attribute "AXRole" of focusedElement as text
+            end try
+            try
+                set subroleText to value of attribute "AXSubrole" of focusedElement as text
+            end try
+            try
+                set titleText to value of attribute "AXTitle" of focusedElement as text
+            end try
+            try
+                set descriptionText to value of attribute "AXDescription" of focusedElement as text
+            end try
+            return roleText & " / " & subroleText & " / " & titleText & " / " & descriptionText
+        on error errorMessage
+            return "读取焦点失败：" & errorMessage
+        end try
+    end tell
+end tell
+"#,
+        app_name = apple_script_escape(&normalized_app_name)
+    );
+    run_osascript(&script)
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 非 macOS 暂不提供系统焦点诊断。
+#[cfg(not(target_os = "macos"))]
+fn read_focused_element_summary(app_name: &str) -> String {
+    let _ = app_name;
+    String::new()
+}
+
+/// 触发系统级 Cmd+V；优先使用更接近物理按键的 CoreGraphics，再回退到 AppleScript。
+#[cfg(target_os = "macos")]
+fn trigger_system_paste() -> Result<PasteTriggerResult, String> {
+    let accessibility_ready = is_accessibility_trusted();
+    match trigger_core_graphics_paste(accessibility_ready) {
+        Ok(_) => Ok(PasteTriggerResult {
+            accessibility_ready,
+            method: "CoreGraphics".to_string(),
+        }),
+        Err(_) => trigger_system_events_paste(accessibility_ready),
+    }
+}
+
+/// 使用 AppleScript 触发 Cmd+V，作为 CoreGraphics 键盘事件创建失败时的兜底。
+#[cfg(target_os = "macos")]
+fn trigger_system_events_paste(accessibility_ready: bool) -> Result<PasteTriggerResult, String> {
+    run_osascript(r#"tell application "System Events" to keystroke "v" using command down"#)?;
+    Ok(PasteTriggerResult {
+        accessibility_ready,
+        method: "System Events".to_string(),
+    })
+}
+
+/// 使用 CoreGraphics 触发 Cmd+V，尽量模拟真实键盘粘贴事件。
+#[cfg(target_os = "macos")]
+fn trigger_core_graphics_paste(accessibility_ready: bool) -> Result<PasteTriggerResult, String> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-
-    let accessibility_ready = is_accessibility_trusted();
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| "自动粘贴失败：无法创建系统按键事件源".to_string())?;
@@ -1724,38 +2043,16 @@ fn trigger_system_paste() -> Result<bool, String> {
         .map_err(|_| "自动粘贴失败：无法创建粘贴松开事件".to_string())?;
     key_up.set_flags(CGEventFlags::CGEventFlagCommand);
     key_up.post(CGEventTapLocation::HID);
-    Ok(accessibility_ready)
+    Ok(PasteTriggerResult {
+        accessibility_ready,
+        method: "CoreGraphics".to_string(),
+    })
 }
 
 /// 非 macOS 平台暂不支持系统级自动粘贴。
 #[cfg(not(target_os = "macos"))]
-fn trigger_system_paste() -> Result<bool, String> {
+fn trigger_system_paste() -> Result<PasteTriggerResult, String> {
     Err("自动粘贴失败：当前版本暂时只支持 macOS 自动粘贴".to_string())
-}
-
-/// 检查当前前台应用是否有可输入文本的焦点控件。
-#[cfg(target_os = "macos")]
-fn is_text_input_focused() -> bool {
-    let script = r#"tell application "System Events"
-  set frontApp to first application process whose frontmost is true
-  set focusedElement to value of attribute "AXFocusedUIElement" of frontApp
-  set focusedRole to value of attribute "AXRole" of focusedElement
-  return focusedRole
-end tell"#;
-    let role = match run_osascript(script) {
-        Ok(value) => value.trim().to_string(),
-        Err(_) => return false,
-    };
-    matches!(
-        role.as_str(),
-        "AXTextArea" | "AXTextField" | "AXTextView" | "AXComboBox" | "AXSearchField"
-    )
-}
-
-/// 非 macOS 平台当前无法判断输入焦点。
-#[cfg(not(target_os = "macos"))]
-fn is_text_input_focused() -> bool {
-    false
 }
 
 /// 查询当前进程是否已获得 macOS 辅助功能权限。

@@ -69,6 +69,10 @@
             <span class="navIcon" data-icon="book" aria-hidden="true"></span>
             <span>词典</span>
           </button>
+          <button class="hubNavButton" type="button" data-view-target="diagnosticsLog">
+            <span class="navIcon" data-icon="terminal" aria-hidden="true"></span>
+            <span>诊断日志</span>
+          </button>
           <button class="hubNavButton" type="button" data-view-target="settings">
             <span class="navIcon" data-icon="setting" aria-hidden="true"></span>
             <span>系统设置</span>
@@ -90,10 +94,6 @@
           </div>
           <div class="hubHeaderTools">
             <div class="runtimePill" id="systemStateText">本机运行中</div>
-            <label class="quickPolishSwitch" title="关闭后口述只做语音转文字，不等待 AI 润色">
-              <span>口述润色</span>
-              <input id="quickAiPolishInput" type="checkbox" aria-label="AI 润色" />
-            </label>
             <button id="refreshStatusButton" class="smallIconButton" type="button" title="刷新状态" aria-label="刷新状态">
               <span data-icon="refresh" aria-hidden="true"></span>
             </button>
@@ -201,7 +201,7 @@
 
         <section id="modesView" class="hubView" data-view="modes">
           <div class="modeChoiceGrid">
-            <article class="modeChoiceCard isActive" data-mode-action="dictate">
+            <article class="modeChoiceCard">
               <div class="modeCardHeader">
                 <div>
                   <span class="modeBadge">Dictation</span>
@@ -209,13 +209,18 @@
                 </div>
                 <strong id="dictateShortcutText">Control + P</strong>
               </div>
-              <p>录音结束后转成可直接粘贴的文字，可用顶部 AI 润色开关控制是否等待润色。</p>
-              <button class="primaryAction" type="button" data-mode-start="dictate">
-                <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>
-                <span>开始口述</span>
-              </button>
+              <p>录音结束后转成可直接粘贴的文字；是否等待 AI 润色在口述设置里单独控制。</p>
+              <div class="modeCardActions">
+                <button class="primaryAction" type="button" data-mode-start="dictate">
+                  <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>
+                  <span>开始口述</span>
+                </button>
+                <button class="modeSettingsButton" type="button" data-mode-settings="dictate" aria-label="口述设置" title="口述设置">
+                  <span data-icon="setting" aria-hidden="true"></span>
+                </button>
+              </div>
             </article>
-            <article class="modeChoiceCard" data-mode-action="translate">
+            <article class="modeChoiceCard">
               <div class="modeCardHeader">
                 <div>
                   <span class="modeBadge">Translate</span>
@@ -223,13 +228,18 @@
                 </div>
                 <strong id="translateShortcutText">Control + T</strong>
               </div>
-              <p>录音结束后先转写，再翻译到设置里的目标语言。</p>
-              <button class="primaryAction" type="button" data-mode-start="translate">
-                <span class="buttonIcon" data-icon="translate" aria-hidden="true"></span>
-                <span>开始翻译</span>
-              </button>
+              <p>录音结束后先转写，再翻译到翻译设置里的目标语言。</p>
+              <div class="modeCardActions">
+                <button class="primaryAction" type="button" data-mode-start="translate">
+                  <span class="buttonIcon" data-icon="translate" aria-hidden="true"></span>
+                  <span>开始翻译</span>
+                </button>
+                <button class="modeSettingsButton" type="button" data-mode-settings="translate" aria-label="翻译设置" title="翻译设置">
+                  <span data-icon="setting" aria-hidden="true"></span>
+                </button>
+              </div>
             </article>
-            <article class="modeChoiceCard" data-mode-action="ask">
+            <article class="modeChoiceCard">
               <div class="modeCardHeader">
                 <div>
                   <span class="modeBadge">Ask</span>
@@ -238,22 +248,17 @@
                 <strong id="askShortcutText">Control + Space</strong>
               </div>
               <p>把语音问题交给 AI 回答，结果展示在 Hub 中，不自动粘贴。</p>
-              <button class="primaryAction" type="button" data-mode-start="ask">
-                <span class="buttonIcon" data-icon="message" aria-hidden="true"></span>
-                <span>开始提问</span>
-              </button>
+              <div class="modeCardActions">
+                <button class="primaryAction" type="button" data-mode-start="ask">
+                  <span class="buttonIcon" data-icon="message" aria-hidden="true"></span>
+                  <span>开始提问</span>
+                </button>
+                <button class="modeSettingsButton" type="button" data-mode-settings="ask" aria-label="随便问设置" title="随便问设置">
+                  <span data-icon="setting" aria-hidden="true"></span>
+                </button>
+              </div>
             </article>
           </div>
-          <section class="operationPanel">
-            <div>
-              <div class="sectionTitle">当前模式</div>
-              <p id="operationHint" class="sectionHint">点击卡片切换模式，准备完成后会唤起屏幕顶部的录音悬浮条。</p>
-            </div>
-            <button id="startDictateButton" class="primaryAction wideAction" type="button">
-              <span class="buttonIcon" data-icon="play" aria-hidden="true"></span>
-              <span data-action-label>开始口述</span>
-            </button>
-          </section>
         </section>
 
         <section id="shortcutsView" class="hubView" data-view="shortcuts">
@@ -327,6 +332,149 @@
           <div id="dictionaryList" class="tagList"></div>
         </section>
 
+        <section id="diagnosticsLogView" class="hubView" data-view="diagnosticsLog">
+          <div class="toolbarLine">
+            <div class="logSummary">
+              <span>最近链路日志</span>
+              <strong id="diagnosticLogCount">0 条</strong>
+            </div>
+            <div class="rowActions rowActionsInline">
+              <button id="copyDiagnosticLogButton" type="button" disabled>复制日志</button>
+              <button id="clearDiagnosticLogButton" class="plainButton" type="button" disabled>清空日志</button>
+            </div>
+          </div>
+          <div id="diagnosticLogList" class="listSurface"></div>
+        </section>
+
+        <section id="dictateSettingsView" class="hubView" data-view="dictateSettings">
+          <section class="settingsBlock modeSettingsLead">
+            <div>
+              <div class="sectionTitle">口述设置</div>
+              <p class="sectionHint">这里只影响口述：转成可粘贴文本，以及是否再交给 AI 润色。</p>
+            </div>
+            <button class="plainButton" type="button" data-view-jump="modes">返回语音模式</button>
+          </section>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">口述处理</div>
+            <div class="settingsRows">
+              <label class="settingsRow switchRow">
+                <span>口述后 AI 润色</span>
+                <input id="postProcessDictationInput" type="checkbox" />
+              </label>
+              <label id="dictationOutputLanguageRow" class="settingsRow">
+                <span>输出语言</span>
+                <select id="dictationOutputLanguageSelect">
+                  <option value="source">跟随原文</option>
+                  <option value="简体中文">简体中文</option>
+                  <option value="繁体中文">繁体中文</option>
+                  <option value="英语">英语</option>
+                  <option value="日语">日语</option>
+                  <option value="韩语">韩语</option>
+                  <option value="法语">法语</option>
+                  <option value="德语">德语</option>
+                  <option value="西班牙语">西班牙语</option>
+                  <option value="葡萄牙语">葡萄牙语</option>
+                  <option value="俄语">俄语</option>
+                  <option value="意大利语">意大利语</option>
+                  <option value="阿拉伯语">阿拉伯语</option>
+                  <option value="泰语">泰语</option>
+                  <option value="越南语">越南语</option>
+                  <option value="印尼语">印尼语</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="settingsBlock">
+            <label class="wideLabel">
+              <span>口述输出偏好</span>
+              <textarea id="dictationStyleInput" placeholder="例如：保留我的语气，但去掉明显重复；不要改动事实和指代。"></textarea>
+            </label>
+          </div>
+
+          <div class="settingsActions">
+            <button class="primaryAction" type="button" data-save-config>
+              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
+              <span>保存口述设置</span>
+            </button>
+          </div>
+        </section>
+
+        <section id="translateSettingsView" class="hubView" data-view="translateSettings">
+          <section class="settingsBlock modeSettingsLead">
+            <div>
+              <div class="sectionTitle">翻译设置</div>
+              <p class="sectionHint">这里只影响翻译：目标语言和翻译时的表达要求。</p>
+            </div>
+            <button class="plainButton" type="button" data-view-jump="modes">返回语音模式</button>
+          </section>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">翻译目标</div>
+            <div class="settingsRows">
+              <label class="settingsRow">
+                <span>目标语言</span>
+                <select id="targetLanguagesSelect">
+                  <option value="简体中文">简体中文</option>
+                  <option value="繁体中文">繁体中文</option>
+                  <option value="英语">英语</option>
+                  <option value="日语">日语</option>
+                  <option value="韩语">韩语</option>
+                  <option value="法语">法语</option>
+                  <option value="德语">德语</option>
+                  <option value="西班牙语">西班牙语</option>
+                  <option value="葡萄牙语">葡萄牙语</option>
+                  <option value="俄语">俄语</option>
+                  <option value="意大利语">意大利语</option>
+                  <option value="阿拉伯语">阿拉伯语</option>
+                  <option value="泰语">泰语</option>
+                  <option value="越南语">越南语</option>
+                  <option value="印尼语">印尼语</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="settingsBlock">
+            <label class="wideLabel">
+              <span>翻译输出偏好</span>
+              <textarea id="translationStyleInput" placeholder="例如：翻译成自然口语；专有名词优先保留英文；不要额外解释。"></textarea>
+            </label>
+          </div>
+
+          <div class="settingsActions">
+            <button class="primaryAction" type="button" data-save-config>
+              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
+              <span>保存翻译设置</span>
+            </button>
+          </div>
+        </section>
+
+        <section id="askSettingsView" class="hubView" data-view="askSettings">
+          <section class="settingsBlock modeSettingsLead">
+            <div>
+              <div class="sectionTitle">随便问设置</div>
+              <p class="sectionHint">这里只影响随便问：回答风格和结果呈现偏好。</p>
+            </div>
+            <button class="plainButton" type="button" data-view-jump="modes">返回语音模式</button>
+          </section>
+
+          <div class="settingsBlock">
+            <label class="wideLabel">
+              <span>回答偏好</span>
+              <textarea id="askStyleInput" placeholder="例如：先给结论，再给 2-3 个要点；不需要寒暄。"></textarea>
+            </label>
+          </div>
+
+          <div class="settingsActions">
+            <button class="primaryAction" type="button" data-save-config>
+              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
+              <span>保存随便问设置</span>
+            </button>
+          </div>
+        </section>
+
         <section id="settingsView" class="hubView" data-view="settings">
           <div class="settingsSection">
             <div class="settingsSectionTitle">模型与识别</div>
@@ -359,15 +507,11 @@
                   <option value="ja">日文</option>
                 </select>
               </label>
-              <label class="settingsRow">
-                <span>翻译目标</span>
-                <input id="targetLanguagesInput" type="text" autocomplete="off" placeholder="简体中文, 日语, 英语" />
-              </label>
             </div>
           </div>
 
           <div class="settingsSection">
-            <div class="settingsSectionTitle">录音与输出</div>
+            <div class="settingsSectionTitle">录音与系统</div>
             <div class="settingsRows">
               <label class="settingsRow">
                 <span>麦克风</span>
@@ -387,10 +531,6 @@
                   <option value="7">7 天</option>
                   <option value="never">不保存</option>
                 </select>
-              </label>
-              <label class="settingsRow switchRow">
-                <span>口述后 AI 润色</span>
-                <input id="postProcessDictationInput" type="checkbox" />
               </label>
               <label class="settingsRow switchRow">
                 <span>交互声音</span>
@@ -413,8 +553,8 @@
 
           <div class="settingsBlock">
             <label class="wideLabel">
-              <span>个人输出偏好</span>
-              <textarea id="personalStyleInput" placeholder="填写你希望转写结果遵循的表达偏好。"></textarea>
+              <span>通用输出偏好</span>
+              <textarea id="personalStyleInput" placeholder="填写所有 AI 处理都要遵循的共同偏好。"></textarea>
             </label>
           </div>
 
@@ -445,7 +585,7 @@
           </div>
 
           <div class="settingsActions">
-            <button id="saveConfigButton" class="primaryAction" type="button">
+            <button id="saveConfigButton" class="primaryAction" type="button" data-save-config>
               <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
               <span>保存设置</span>
             </button>
