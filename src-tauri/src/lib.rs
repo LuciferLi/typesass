@@ -1239,6 +1239,14 @@ fn clear_saved_api_key(secrets: State<'_, RuntimeSecrets>) -> Result<(), String>
 /// 在屏幕顶部显示错误气泡，让用户知道本次失败原因。
 #[tauri::command]
 fn show_error_bubble(app: tauri::AppHandle, message: String) -> Result<(), String> {
+    if let Some(result) = app.get_webview_window("result") {
+        if result.is_visible().unwrap_or(false) {
+            if let Some(toast) = app.get_webview_window("toast") {
+                let _ = toast.hide();
+            }
+            return Ok(());
+        }
+    }
     let toast = app
         .get_webview_window("toast")
         .ok_or_else(|| "未找到错误提示窗口".to_string())?;
