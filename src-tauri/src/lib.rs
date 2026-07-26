@@ -38,9 +38,12 @@ const KEYCHAIN_ACCOUNT: &str = "mimo-api-key";
 const FLOAT_WINDOW_WIDTH: f64 = 132.0;
 const FLOAT_WINDOW_TOP: f64 = 60.0;
 const TOAST_WINDOW_WIDTH: f64 = 460.0;
+const TOAST_WINDOW_HEIGHT: f64 = 86.0;
 const TOAST_WINDOW_TOP: f64 = 42.0;
 const RESULT_WINDOW_WIDTH: f64 = 520.0;
+const RESULT_WINDOW_HEIGHT: f64 = 320.0;
 const RESULT_WINDOW_TOP: f64 = 76.0;
+const RESULT_TOAST_GAP: f64 = 12.0;
 const SUBTITLE_WINDOW_WIDTH: f64 = 1000.0;
 const SUBTITLE_WINDOW_HEIGHT: f64 = 170.0;
 const SUBTITLE_WINDOW_BOTTOM: f64 = 54.0;
@@ -1239,14 +1242,6 @@ fn clear_saved_api_key(secrets: State<'_, RuntimeSecrets>) -> Result<(), String>
 /// 在屏幕顶部显示错误气泡，让用户知道本次失败原因。
 #[tauri::command]
 fn show_error_bubble(app: tauri::AppHandle, message: String) -> Result<(), String> {
-    if let Some(result) = app.get_webview_window("result") {
-        if result.is_visible().unwrap_or(false) {
-            if let Some(toast) = app.get_webview_window("toast") {
-                let _ = toast.hide();
-            }
-            return Ok(());
-        }
-    }
     let toast = app
         .get_webview_window("toast")
         .ok_or_else(|| "未找到错误提示窗口".to_string())?;
@@ -1294,9 +1289,6 @@ fn show_result_window(
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
-    if let Some(toast) = app.get_webview_window("toast") {
-        let _ = toast.hide();
-    }
     let result = app
         .get_webview_window("result")
         .ok_or_else(|| "未找到结果窗口".to_string())?;
@@ -1311,6 +1303,11 @@ fn show_result_window(
     result
         .set_focus()
         .map_err(|error| format!("聚焦结果窗口失败：{}", error))?;
+    if let Some(toast) = app.get_webview_window("toast") {
+        if toast.is_visible().unwrap_or(false) {
+            position_toast_window(&app, &toast)?;
+        }
+    }
     let payload = ResultWindowPayload {
         text: normalized_text.to_string(),
         reason: trim_error_message(&reason),
@@ -1662,8 +1659,25 @@ fn position_toast_window(
     app: &tauri::AppHandle,
     toast: &tauri::WebviewWindow,
 ) -> Result<(), String> {
-    position_top_center_window(app, toast, TOAST_WINDOW_WIDTH, TOAST_WINDOW_TOP)
-        .map_err(|error| error.replace("定位窗口", "定位错误提示"))
+    let work_area = preferred_window_work_area(app)?;
+    let top = if app
+        .get_webview_window("result")
+        .and_then(|result| result.is_visible().ok())
+        .unwrap_or(false)
+    {
+        let below_result_top = RESULT_WINDOW_TOP + RESULT_WINDOW_HEIGHT + RESULT_TOAST_GAP;
+        let max_visible_top =
+            (work_area.height - TOAST_WINDOW_HEIGHT - RESULT_TOAST_GAP).max(TOAST_WINDOW_TOP);
+        below_result_top.min(max_visible_top)
+    } else {
+        TOAST_WINDOW_TOP
+    };
+    let position = top_center_position_in_work_area(work_area, TOAST_WINDOW_WIDTH, top);
+    toast
+        .set_position(Position::Logical(LogicalPosition::new(
+            position.x, position.y,
+        )))
+        .map_err(|error| format!("定位错误提示失败：{}", error))
 }
 
 /// 把实时字幕承载窗口定位到当前工作屏幕底部安全区域上方。
