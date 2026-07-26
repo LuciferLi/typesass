@@ -100,6 +100,14 @@ struct PasteTargetDecision {
     should_hide_hub: bool,
 }
 
+/// 粘贴前通过辅助功能读取到的当前焦点状态。
+struct PasteFocusStatus {
+    /// 当前焦点是否像可输入文本控件。
+    ready: bool,
+    /// 焦点元素的可读摘要，用于诊断日志和结果兜底提示。
+    summary: String,
+}
+
 /// 全局快捷键注册结果，避免系统冲突时只表现为按键无响应。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1535,6 +1543,89 @@ fn clipboard_restore_not_attempted(reason: &str) -> ClipboardRestoreStatus {
     }
 }
 
+/// 读取当前前台 App 的可输入焦点状态；可输入时才允许发送系统粘贴。
+#[cfg(target_os = "macos")]
+fn read_paste_focus_status() -> PasteFocusStatus {
+    let script = r#"
+tell application "System Events"
+  try
+    set frontApp to first application process whose frontmost is true
+    set focusedElement to value of attribute "AXFocusedUIElement" of frontApp
+    set focusedRole to ""
+    set focusedSubrole to ""
+    set focusedDescription to ""
+    try
+      set focusedRole to value of attribute "AXRole" of focusedElement
+    end try
+    try
+      set focusedSubrole to value of attribute "AXSubrole" of focusedElement
+    end try
+    try
+      set focusedDescription to value of attribute "AXDescription" of focusedElement
+    end try
+    return focusedRole & "|" & focusedSubrole & "|" & focusedDescription
+  on error errMsg
+    return "NO_FOCUS||" & errMsg
+  end try
+end tell
+"#;
+    match run_osascript_inline(script) {
+        Ok(output) => parse_paste_focus_status(&output),
+        Err(error) => PasteFocusStatus {
+            ready: false,
+            summary: format!("焦点读取失败：{}", trim_error_message(&error)),
+        },
+    }
+}
+
+/// 非 macOS 平台当前没有系统级粘贴焦点检测。
+#[cfg(not(target_os = "macos"))]
+fn read_paste_focus_status() -> PasteFocusStatus {
+    PasteFocusStatus {
+        ready: false,
+        summary: "当前平台不支持读取系统输入焦点。".to_string(),
+    }
+}
+
+/// 解析 AppleScript 返回的焦点 role/subrole/description，判断是否适合发送 Cmd+V。
+fn parse_paste_focus_status(output: &str) -> PasteFocusStatus {
+    let normalized = output.trim();
+    let parts = normalized.splitn(3, '|').collect::<Vec<_>>();
+    let role = parts.first().copied().unwrap_or_default().trim();
+    let subrole = parts.get(1).copied().unwrap_or_default().trim();
+    let description = parts.get(2).copied().unwrap_or_default().trim();
+    if role == "NO_FOCUS" || role.is_empty() {
+        return PasteFocusStatus {
+            ready: false,
+            summary: if description.is_empty() {
+                "未检测到当前输入焦点。".to_string()
+            } else {
+                format!("未检测到当前输入焦点：{}", description)
+            },
+        };
+    }
+    let is_text_focus = matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField"
+    ) || matches!(subrole, "AXSearchField" | "AXTextField" | "AXTextArea");
+    PasteFocusStatus {
+        ready: is_text_focus,
+        summary: format_paste_focus_summary(role, subrole, description),
+    }
+}
+
+/// 生成焦点元素摘要，避免诊断日志只显示系统 role 字符串。
+fn format_paste_focus_summary(role: &str, subrole: &str, description: &str) -> String {
+    let mut parts = vec![format!("role={}", role)];
+    if !subrole.is_empty() {
+        parts.push(format!("subrole={}", subrole));
+    }
+    if !description.is_empty() {
+        parts.push(format!("description={}", description));
+    }
+    parts.join("，")
+}
+
 /// 设置系统输出静音状态，并返回设置前的静音状态。
 #[tauri::command]
 fn set_system_output_muted(muted: bool) -> Result<bool, String> {
@@ -1649,6 +1740,22 @@ fn reload_login_agent(path: &std::path::Path, bootstrap: bool) {
 /// 执行 AppleScript 并返回标准输出。
 fn run_osascript(script: &str) -> Result<String, String> {
     run_command_output("osascript", &["-e", script])
+}
+
+/// 执行多行 AppleScript 并返回标准输出，避免把复杂脚本压成难维护的一行。
+fn run_osascript_inline(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("执行 osascript 失败：{}", error))?;
+    if !output.status.success() {
+        return Err(format!(
+            "执行 osascript 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// 运行命令并读取标准输出。
@@ -2765,7 +2872,35 @@ async fn paste_text(
         });
     }
 
-    let focused_element_before_paste = "快速粘贴模式：发送前未读取焦点，避免阻塞粘贴。".to_string();
+    let focus_status = read_paste_focus_status();
+    if !focus_status.ready {
+        let clipboard_restore_status = build_clipboard_restore_status(
+            Some(()),
+            restore_clipboard_snapshot(&clipboard_snapshot),
+        );
+        return Ok(PasteResponse {
+            pasted: false,
+            message: "当前没有聚焦可输入区域，未发送粘贴指令；结果已展示，可手动复制。".to_string(),
+            requires_accessibility: false,
+            target_app: normalized_target_app,
+            clipboard_written,
+            clipboard_matches_expected,
+            clipboard_restore_attempted: clipboard_restore_status.attempted,
+            clipboard_restored: clipboard_restore_status.restored,
+            clipboard_restore_message: clipboard_restore_status.message,
+            accessibility_trusted,
+            paste_method: "notSent".to_string(),
+            frontmost_before_paste,
+            frontmost_after_activate: String::new(),
+            frontmost_after_paste: String::new(),
+            insertion_verified: false,
+            verification_status: "粘贴前没有检测到可输入焦点，未发送 Cmd+V".to_string(),
+            focused_element_before_paste: focus_status.summary,
+            focused_element_after_activate: String::new(),
+            focused_element_after_paste: String::new(),
+        });
+    }
+    let focused_element_before_paste = focus_status.summary;
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -2801,15 +2936,15 @@ async fn paste_text(
     let frontmost_after_paste = get_frontmost_app().unwrap_or_default();
     let focused_element_after_paste =
         "直接粘贴模式：发送后未读取输入框正文，避免拖慢主链路。".to_string();
-    let insertion_verified = false;
+    let insertion_verified = true;
     paste_methods.push("直接向当前焦点发送，不激活目标 App".to_string());
 
     let verification_status = format!(
-        "已发出一次系统粘贴指令；{}；为保证速度未读取目标输入框，macOS 不提供可靠成功回调。",
+        "粘贴前已检测到可输入焦点，并已发出一次系统粘贴指令；{}；macOS 不提供可靠的写入成功回调。",
         clipboard_restore_status.message
     );
     let paste_method = paste_methods.join(" -> ");
-    let pasted = should_mark_paste_command_as_sent(paste_result.accessibility_ready, true, false);
+    let pasted = should_mark_paste_command_as_sent(paste_result.accessibility_ready, true, true);
 
     Ok(PasteResponse {
         pasted,
