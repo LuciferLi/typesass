@@ -69,6 +69,15 @@ button {
   display: none !important;
 }
 
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -1229,6 +1238,67 @@ button[data-confirming="true"] {
   line-height: 1.65;
 }
 
+.modeCardShortcut {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--lineSoft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.modeCardShortcut > span {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 740;
+}
+
+.modeCardShortcut strong {
+  overflow: hidden;
+  color: #34d399;
+  font-size: 13px;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modeCardShortcut strong[data-recording="true"] {
+  color: #fbbf24;
+}
+
+.modeCardShortcut div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.modeCardShortcut button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: #e4e4e7;
+  background: #151519;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 740;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    transform 160ms var(--motion);
+}
+
+.modeCardShortcut button:hover {
+  border-color: rgba(139, 92, 246, 0.42);
+  background: var(--surfaceHover);
+  transform: translateY(-1px);
+}
+
 .modePermissionList {
   display: grid;
   gap: 8px;
@@ -1391,7 +1461,7 @@ button[data-confirming="true"] {
 
 .healthGrid {
   display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
+  grid-template-columns: 1fr;
   gap: 16px;
   margin-top: 16px;
 }

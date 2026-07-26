@@ -149,23 +149,14 @@
                 </div>
               </div>
             </article>
-            <article class="healthPanel shortcutHealthPanel">
-              <div class="panelHeader">
-                <div>
-                  <div class="sectionTitle">快捷键动作</div>
-                  <p class="sectionHint">短按一次开始录音，再短按一次停止并处理。</p>
-                </div>
-                <button class="plainButton" type="button" data-view-jump="modes">编辑</button>
-              </div>
-              <div class="shortcutHealthRows">
-                <span>口述 <strong id="homeDictateShortcutText">Control + P</strong></span>
-                <span>翻译 <strong id="homeTranslateShortcutText">Control + T</strong></span>
-                <span>随便问 <strong id="homeAskShortcutText">Control + Space</strong></span>
-                <span>润色 <strong id="homePolishShortcutText">Control + Shift + P</strong></span>
-                <span>实时字幕 <strong id="homeSubtitleShortcutText">Control + Shift + S</strong></span>
-              </div>
-            </article>
           </section>
+          <div class="srOnly" aria-hidden="true" hidden>
+            <strong id="homeDictateShortcutText">Control + P</strong>
+            <strong id="homeTranslateShortcutText">Control + T</strong>
+            <strong id="homeAskShortcutText">Control + Space</strong>
+            <strong id="homePolishShortcutText">Control + Shift + P</strong>
+            <strong id="homeSubtitleShortcutText">Control + Shift + S</strong>
+          </div>
 
           <section id="nextStepPanel" class="nextStepPanel" data-state="warning" aria-label="下一步操作">
             <div class="nextStepContent">
@@ -201,10 +192,16 @@
                   <span class="modeBadge">Dictation</span>
                   <h2>口述</h2>
                 </div>
-                <strong id="dictateShortcutText">Control + P</strong>
               </div>
               <p>录音结束后转成可直接粘贴的文字；是否等待 AI 润色在口述设置里单独控制。</p>
               <div class="modePermissionList" data-mode-permissions="dictate" aria-label="口述权限状态"></div>
+              <div class="modeCardShortcut">
+                <span>快捷键 <strong id="dictateShortcutText">Control + P</strong></span>
+                <div>
+                  <button type="button" data-shortcut-record="dictate">录制</button>
+                  <button type="button" data-shortcut-reset="dictate">默认</button>
+                </div>
+              </div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="dictate">
                   <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>
@@ -221,10 +218,16 @@
                   <span class="modeBadge">Translate</span>
                   <h2>翻译</h2>
                 </div>
-                <strong id="translateShortcutText">Control + T</strong>
               </div>
               <p>录音结束后先转写，再翻译到翻译设置里的目标语言。</p>
               <div class="modePermissionList" data-mode-permissions="translate" aria-label="翻译权限状态"></div>
+              <div class="modeCardShortcut">
+                <span>快捷键 <strong id="translateShortcutText">Control + T</strong></span>
+                <div>
+                  <button type="button" data-shortcut-record="translate">录制</button>
+                  <button type="button" data-shortcut-reset="translate">默认</button>
+                </div>
+              </div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="translate">
                   <span class="buttonIcon" data-icon="translate" aria-hidden="true"></span>
@@ -241,10 +244,16 @@
                   <span class="modeBadge">Ask</span>
                   <h2>随便问</h2>
                 </div>
-                <strong id="askShortcutText">Control + Space</strong>
               </div>
               <p>把语音问题交给 AI 回答，结果展示在 Hub 中，不自动粘贴。</p>
               <div class="modePermissionList" data-mode-permissions="ask" aria-label="随便问权限状态"></div>
+              <div class="modeCardShortcut">
+                <span>快捷键 <strong id="askShortcutText">Control + Space</strong></span>
+                <div>
+                  <button type="button" data-shortcut-record="ask">录制</button>
+                  <button type="button" data-shortcut-reset="ask">默认</button>
+                </div>
+              </div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="ask">
                   <span class="buttonIcon" data-icon="message" aria-hidden="true"></span>
@@ -261,10 +270,16 @@
                   <span class="modeBadge">Polish</span>
                   <h2>润色模式</h2>
                 </div>
-                <strong id="polishShortcutText">Control + Shift + P</strong>
               </div>
               <p>框选电脑上的一段文字，按快捷键后由 AI 优化表达，并直接替换原选中文本。</p>
               <div class="modePermissionList" data-mode-permissions="polish" aria-label="润色权限状态"></div>
+              <div class="modeCardShortcut">
+                <span>快捷键 <strong id="polishShortcutText">Control + Shift + P</strong></span>
+                <div>
+                  <button type="button" data-shortcut-record="polish">录制</button>
+                  <button type="button" data-shortcut-reset="polish">默认</button>
+                </div>
+              </div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-mode-start="polish">
                   <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
@@ -281,10 +296,16 @@
                   <span class="modeBadge">Subtitle</span>
                   <h2>实时字幕</h2>
                 </div>
-                <strong id="subtitleShortcutText">Control + Shift + S</strong>
               </div>
               <p>持续监听音频输入，识别后在屏幕底部显示字幕，并在右上角保留历史。</p>
               <div class="modePermissionList" data-mode-permissions="subtitle" aria-label="实时字幕权限状态"></div>
+              <div class="modeCardShortcut">
+                <span>快捷键 <strong id="subtitleShortcutText">Control + Shift + S</strong></span>
+                <div>
+                  <button type="button" data-shortcut-record="subtitle">录制</button>
+                  <button type="button" data-shortcut-reset="subtitle">默认</button>
+                </div>
+              </div>
               <div class="modeCardActions">
                 <button class="primaryAction" type="button" data-subtitle-toggle>
                   <span class="buttonIcon" data-icon="microphone" aria-hidden="true"></span>

@@ -2750,6 +2750,9 @@ function startShortcutRecording(mode: ShortcutMode): void {
   shortcutRecordingSnapshot = { mode, label: input.value };
   input.value = "请按新的组合键";
   input.dataset.recording = "true";
+  const label = getShortcutLabel(mode);
+  label.textContent = "请按新的组合键";
+  label.dataset.recording = "true";
   setShortcutValidation("按下包含 Control、Command、Option 或 Shift 的组合键；Esc 可取消。", "busy", true);
   showHubNotice(`正在录制${SHORTCUT_MODE_LABELS[mode]}快捷键。`, "busy");
 }
@@ -2812,6 +2815,11 @@ function clearShortcutRecordingState(): void {
   askShortcutInput.removeAttribute("data-recording");
   polishShortcutInput.removeAttribute("data-recording");
   subtitleShortcutInput.removeAttribute("data-recording");
+  dictateShortcutText.removeAttribute("data-recording");
+  translateShortcutText.removeAttribute("data-recording");
+  askShortcutText.removeAttribute("data-recording");
+  polishShortcutText.removeAttribute("data-recording");
+  subtitleShortcutText.removeAttribute("data-recording");
 }
 
 /** 取消当前快捷键录制并恢复进入录制态前的展示值。 */
@@ -2819,6 +2827,7 @@ function cancelShortcutRecording(): void {
   restoreShortcutRecordingSnapshot();
   shortcutRecordingMode = null;
   clearShortcutRecordingState();
+  renderShortcutLabels(readConfigFromForm().shortcuts);
   validateShortcutInputs();
   showHubNotice("已取消快捷键录制。", "idle");
 }
@@ -2830,6 +2839,7 @@ function restoreShortcutRecordingSnapshot(): void {
   }
   getShortcutInput(shortcutRecordingSnapshot.mode).value = shortcutRecordingSnapshot.label;
   shortcutRecordingSnapshot = null;
+  renderShortcutLabels(readConfigFromForm().shortcuts);
 }
 
 /** 实时校验快捷键配置，并同步保存按钮和提示文案。 */
@@ -2946,6 +2956,23 @@ function getShortcutInput(mode: ShortcutMode): HTMLInputElement {
     return polishShortcutInput;
   }
   return dictateShortcutInput;
+}
+
+/** 读取语音模式卡片上的快捷键文本元素，用于录制时给出就地反馈。 */
+function getShortcutLabel(mode: ShortcutMode): HTMLElement {
+  if (mode === "subtitle") {
+    return subtitleShortcutText;
+  }
+  if (mode === "translate") {
+    return translateShortcutText;
+  }
+  if (mode === "ask") {
+    return askShortcutText;
+  }
+  if (mode === "polish") {
+    return polishShortcutText;
+  }
+  return dictateShortcutText;
 }
 
 /** 从浏览器枚举麦克风设备并填充选择器。 */
