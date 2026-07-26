@@ -537,14 +537,21 @@
           <div class="settingsSection">
             <div class="settingsSectionTitle">音频来源</div>
             <div class="settingsRows">
-              <label class="settingsRow">
-                <span>麦克风</span>
-                <select id="subtitleMicrophoneMirrorSelect" data-mirror-control="microphoneSelect" disabled>
-                  <option>跟随系统设置</option>
-                </select>
+              <label class="settingsRow switchRow">
+                <span>同时采集麦克风</span>
+                <input id="subtitleIncludeMicrophoneInput" type="checkbox" />
               </label>
               <label class="settingsRow">
-                <span>系统声音</span>
+                <span>采集 App</span>
+                <div class="inlineControl">
+                  <select id="subtitleTargetAppsSelect" class="multiSelect" multiple size="5">
+                    <option value="active">自动选择正在发声的 App</option>
+                  </select>
+                  <button id="refreshSubtitleAppsButton" type="button">刷新</button>
+                </div>
+              </label>
+              <label class="settingsRow">
+                <span>系统声音方式</span>
                 <select id="subtitleSystemAudioMirrorSelect" data-mirror-control="systemAudioSelect" disabled>
                   <option>跟随系统设置</option>
                 </select>

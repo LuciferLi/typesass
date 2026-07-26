@@ -107,7 +107,7 @@ struct AudioProcessInfo {
 }
 
 final class ProcessTapRecorder {
-  private let target: AudioProcessInfo
+  private let targets: [AudioProcessInfo]
   private let outputURL: URL
   private let durationSeconds: Double
   private let queue = DispatchQueue(label: "typesass.process-tap.demo")
@@ -118,16 +118,17 @@ final class ProcessTapRecorder {
   private var bufferCount = 0
   private var frameCount: AVAudioFramePosition = 0
 
-  init(target: AudioProcessInfo, outputURL: URL, durationSeconds: Double) {
-    self.target = target
+  init(targets: [AudioProcessInfo], outputURL: URL, durationSeconds: Double) {
+    self.targets = targets
     self.outputURL = outputURL
     self.durationSeconds = durationSeconds
   }
 
   func run() throws {
     let tapDescription: CATapDescription
-    if target.objectID.isValid {
-      tapDescription = CATapDescription(stereoMixdownOfProcesses: [target.objectID])
+    let processObjectIDs = targets.map(\.objectID).filter(\.isValid)
+    if !processObjectIDs.isEmpty {
+      tapDescription = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
     } else {
       let ownProcessID = try? translatePIDToProcessObjectID(pid: ProcessInfo.processInfo.processIdentifier)
       tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: ownProcessID.map { [$0] } ?? [])
@@ -148,8 +149,9 @@ final class ProcessTapRecorder {
     )
     let outputUID = try defaultOutput.readString(kAudioDevicePropertyDeviceUID)
     let aggregateUID = UUID().uuidString
+    let aggregateName = targets.map(\.name).joined(separator: "+")
     let aggregateDescription: [String: Any] = [
-      kAudioAggregateDeviceNameKey: "typesass-process-tap-\(target.pid)",
+      kAudioAggregateDeviceNameKey: "typesass-process-tap-\(aggregateName)",
       kAudioAggregateDeviceUIDKey: aggregateUID,
       kAudioAggregateDeviceMainSubDeviceKey: outputUID,
       kAudioAggregateDeviceIsPrivateKey: true,
@@ -222,8 +224,11 @@ final class ProcessTapRecorder {
 
     Thread.sleep(forTimeInterval: durationSeconds)
     cleanup()
+    let targetSummary = targets
+      .map { "\($0.name)(pid=\($0.pid))" }
+      .joined(separator: ",")
     print(
-      "wrote=\(outputURL.path) target=\(target.name) pid=\(target.pid) buffers=\(bufferCount) frames=\(frameCount) sampleRate=\(Int(format.sampleRate)) channels=\(format.channelCount)"
+      "wrote=\(outputURL.path) targets=\(targetSummary) buffers=\(bufferCount) frames=\(frameCount) sampleRate=\(Int(format.sampleRate)) channels=\(format.channelCount)"
     )
   }
 
@@ -380,17 +385,8 @@ func findAutoTarget(processes: [AudioProcessInfo]) -> AudioProcessInfo {
   )
 }
 
-func findTarget(keyword: String) throws -> AudioProcessInfo {
+func findTarget(keyword: String, processes: [AudioProcessInfo]) throws -> AudioProcessInfo {
   let normalizedKeyword = keyword.lowercased()
-  let processes = try readAudioProcesses()
-  if keyword == "--list" {
-    for process in processes.sorted(by: { $0.name < $1.name }) {
-      print(
-        "pid=\(process.pid) active=\(process.audioActive) name=\(process.name) bundle=\(process.bundleID)"
-      )
-    }
-    exit(0)
-  }
   if normalizedKeyword == "active" || normalizedKeyword == "auto" {
     return findAutoTarget(processes: processes)
   }
@@ -408,6 +404,35 @@ func findTarget(keyword: String) throws -> AudioProcessInfo {
   throw "未找到音频进程：\(keyword)"
 }
 
+func findTargets(keyword: String) throws -> [AudioProcessInfo] {
+  let processes = try readAudioProcesses()
+  if keyword == "--list" {
+    for process in processes.sorted(by: { $0.name < $1.name }) {
+      print(
+        "pid=\(process.pid) active=\(process.audioActive) name=\(process.name) bundle=\(process.bundleID)"
+      )
+    }
+    exit(0)
+  }
+  let keywords = keyword
+    .split(separator: ",")
+    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    .filter { !$0.isEmpty }
+  if keywords.isEmpty {
+    return [findAutoTarget(processes: processes)]
+  }
+  var targets: [AudioProcessInfo] = []
+  var seenPIDs = Set<pid_t>()
+  for item in keywords {
+    let target = try findTarget(keyword: item, processes: processes)
+    if !seenPIDs.contains(target.pid) {
+      targets.append(target)
+      seenPIDs.insert(target.pid)
+    }
+  }
+  return targets
+}
+
 @main
 struct ProcessTapCaptureDemo {
   static func main() throws {
@@ -415,9 +440,9 @@ struct ProcessTapCaptureDemo {
     let outputPath = arguments.first ?? "/tmp/typesass-process-tap-demo.caf"
     let duration = Double(arguments.dropFirst().first ?? "8") ?? 8
     let keyword = arguments.dropFirst().dropFirst().first ?? "Music"
-    let target = try findTarget(keyword: keyword)
+    let targets = try findTargets(keyword: keyword)
     let recorder = ProcessTapRecorder(
-      target: target,
+      targets: targets,
       outputURL: URL(fileURLWithPath: outputPath),
       durationSeconds: duration
     )

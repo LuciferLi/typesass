@@ -1842,6 +1842,16 @@ textarea::placeholder {
   background: #151519;
 }
 
+.settingsRows select.multiSelect {
+  height: auto;
+  min-height: 132px;
+  padding: 8px;
+}
+
+.settingsRows select.multiSelect option {
+  padding: 6px 8px;
+}
+
 .apiKeyControl {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 92px;

@@ -3,9 +3,9 @@ use std::fs;
 #[cfg(not(target_os = "macos"))]
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 #[cfg(not(target_os = "macos"))]
 use std::process::Stdio;
+use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -208,6 +208,20 @@ struct ProcessTapCaptureResponse {
     summary: String,
     /// 本地采集和文件读取总耗时。
     elapsed_ms: u128,
+}
+
+/// 当前可被 Core Audio Process Tap 发现的音频 App。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTapAudioApp {
+    /// 音频进程 PID，可作为精确采集目标。
+    pid: i32,
+    /// App 或进程名称。
+    name: String,
+    /// App Bundle ID，部分系统进程可能为空。
+    bundle_id: String,
+    /// Core Audio 标记该进程是否正在运行音频。
+    audio_active: bool,
 }
 
 /// 前端请求原生系统音频并直接转写的参数。
@@ -498,6 +512,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             transcribe_audio,
+            list_process_tap_audio_apps,
             capture_process_tap_audio,
             capture_process_tap_transcribe,
             start_process_tap_transcribe_task,
@@ -1241,6 +1256,9 @@ fn show_result_window(
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
+    if let Some(toast) = app.get_webview_window("toast") {
+        let _ = toast.hide();
+    }
     let result = app
         .get_webview_window("result")
         .ok_or_else(|| "未找到结果窗口".to_string())?;
@@ -1865,6 +1883,14 @@ async fn transcribe_audio(
     })
 }
 
+/// 列出当前 Core Audio 能看到的音频进程，供实时字幕选择采集 App。
+#[tauri::command]
+async fn list_process_tap_audio_apps() -> Result<Vec<ProcessTapAudioApp>, String> {
+    tauri::async_runtime::spawn_blocking(list_process_tap_audio_apps_blocking)
+        .await
+        .map_err(|error| format!("系统音频 App 列表读取任务失败：{}", error))?
+}
+
 /// 调用打包的 Core Audio Process Tap helper 采集一段系统播放声音。
 #[tauri::command]
 async fn capture_process_tap_audio(
@@ -2037,6 +2063,67 @@ async fn run_process_tap_transcribe(
     })
 }
 
+/// 同步调用 helper 的列表模式并解析为前端可用的 App 选项。
+fn list_process_tap_audio_apps_blocking() -> Result<Vec<ProcessTapAudioApp>, String> {
+    let helper = resolve_process_tap_helper_path()?;
+    let output = run_process_tap_helper_with_timeout(
+        &helper,
+        &[
+            env::temp_dir()
+                .join("typesass-process-tap-list.wav")
+                .to_string_lossy()
+                .to_string(),
+            "0.1".to_string(),
+            "--list".to_string(),
+        ],
+        Duration::from_secs(4),
+        "读取系统音频 App 列表",
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(format!(
+            "读取系统音频 App 列表失败：{}{}",
+            stdout,
+            if stderr.is_empty() {
+                "".to_string()
+            } else {
+                format!("；{}", stderr)
+            }
+        ));
+    }
+    Ok(stdout
+        .lines()
+        .filter_map(parse_process_tap_audio_app_line)
+        .collect())
+}
+
+/// 解析 helper 输出的一行音频进程描述。
+fn parse_process_tap_audio_app_line(line: &str) -> Option<ProcessTapAudioApp> {
+    let pid = line
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("pid="))
+        .and_then(|value| value.parse::<i32>().ok())?;
+    let audio_active = line
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("active="))
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let name_start = line.find(" name=")? + " name=".len();
+    let bundle_marker = " bundle=";
+    let bundle_start = line.find(bundle_marker)?;
+    let name = line[name_start..bundle_start].trim().to_string();
+    let bundle_id = line[bundle_start + bundle_marker.len()..]
+        .trim()
+        .to_string();
+    Some(ProcessTapAudioApp {
+        pid,
+        name,
+        bundle_id,
+        audio_active,
+    })
+}
+
 /// 同步执行系统音频 helper，避免阻塞 Tauri 异步运行时。
 fn capture_process_tap_audio_blocking(
     request: ProcessTapCaptureRequest,
@@ -2069,12 +2156,16 @@ fn capture_process_tap_audio_bytes(
         std::process::id(),
         started_at.elapsed().as_nanos()
     ));
-    let output = Command::new(&helper)
-        .arg(&output_path)
-        .arg(duration_seconds)
-        .arg(target_keyword)
-        .output()
-        .map_err(|error| format!("启动系统音频采集器失败：{}", error))?;
+    let output = run_process_tap_helper_with_timeout(
+        &helper,
+        &[
+            output_path.to_string_lossy().to_string(),
+            duration_seconds,
+            target_keyword.to_string(),
+        ],
+        Duration::from_millis(duration_ms + 12_000),
+        "采集系统音频",
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {
@@ -2101,6 +2192,46 @@ fn capture_process_tap_audio_bytes(
         summary: stdout,
         elapsed_ms: started_at.elapsed().as_millis(),
     })
+}
+
+/// 运行系统音频 helper，并在 Core Audio 卡住时主动结束子进程。
+fn run_process_tap_helper_with_timeout(
+    helper: &PathBuf,
+    args: &[String],
+    timeout: Duration,
+    action: &str,
+) -> Result<Output, String> {
+    let mut child = Command::new(helper)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动系统音频采集器失败：{}", error))?;
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("读取系统音频采集器输出失败：{}", error));
+            }
+            Ok(None) => {
+                if started_at.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{}超时，请刷新音频 App 或重新选择采集目标。",
+                        action
+                    ));
+                }
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("等待系统音频采集器失败：{}", error));
+            }
+        }
+    }
 }
 
 /// 查找随 Tauri 打包或开发环境生成的 Core Audio Process Tap helper。
@@ -2214,9 +2345,9 @@ fn build_process_prompt(request: &ProcessTextRequest, text: &str) -> (String, St
 
     match request.mode {
         ProcessMode::Dictate => (
-            "只输出整理后的最终文本，保持原意，不解释。".to_string(),
+            "你是桌面语音口述整理助手。只输出整理后的最终文本，不解释过程，不输出标题。".to_string(),
             format!(
-                "{}\n{}\n规则：修正 ASR 误识别、标点、明显口误和重复；不总结，不扩写。\nASR：{}",
+                "{}\n{}\n规则：把口语转写整理成清晰、可直接发送或记录的文字；删除“嗯、啊、然后、就是说”等无意义语气词和重复；合并断裂句；修正 ASR 误识别和标点；如果原文是一段散乱想法，请提炼核心意思并简洁总结；保持事实和意图，不新增信息。\nASR：{}",
                 fast_glossary_rule, fast_context_rule, text
             ),
         ),
@@ -2252,7 +2383,7 @@ fn build_process_prompt(request: &ProcessTextRequest, text: &str) -> (String, St
 fn calculate_process_max_tokens(request: &ProcessTextRequest, text: &str) -> u32 {
     let char_count = text.chars().count() as u32;
     match request.mode {
-        ProcessMode::Dictate => (char_count.saturating_mul(2) + 64).clamp(128, 512),
+        ProcessMode::Dictate => (char_count.saturating_mul(2) + 160).clamp(192, 800),
         ProcessMode::Translate => {
             let target_count = request
                 .target_languages
@@ -2277,7 +2408,7 @@ fn calculate_process_temperature(mode: &ProcessMode) -> f64 {
 /// 根据模式限制 AI 文本处理等待时间，口述优先快速粘贴，翻译和问答保留更长响应窗口。
 fn calculate_process_timeout(mode: &ProcessMode) -> Duration {
     match mode {
-        ProcessMode::Dictate => Duration::from_millis(6500),
+        ProcessMode::Dictate => Duration::from_millis(10000),
         ProcessMode::Translate => Duration::from_millis(9000),
         ProcessMode::Ask => Duration::from_millis(15000),
     }

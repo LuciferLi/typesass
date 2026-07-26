@@ -167,6 +167,10 @@ interface VoiceConfig {
   microphoneDeviceId: string;
   /** 实时字幕使用的系统音频输入设备，auto 表示自动检测虚拟声卡，none 表示只采集麦克风。 */
   systemAudioDeviceId: string;
+  /** 实时字幕是否同时采集麦克风输入。 */
+  subtitleIncludeMicrophone: boolean;
+  /** 实时字幕原生系统音频采集目标，active 表示自动选择正在发声的 App。 */
+  subtitleTargetApps: string[];
   /** 是否播放开始和停止录音提示音。 */
   interactionSounds: boolean;
   /** 录音期间是否临时静音系统输出。 */
@@ -222,6 +226,17 @@ interface ProcessTapCaptureResponse {
   summary: string;
   /** 本地采集总耗时。 */
   elapsedMs: number;
+}
+
+interface ProcessTapAudioApp {
+  /** 音频进程 PID，可作为精确采集目标。 */
+  pid: number;
+  /** App 或进程名称。 */
+  name: string;
+  /** App Bundle ID。 */
+  bundleId: string;
+  /** 当前是否有运行中的音频。 */
+  audioActive: boolean;
 }
 
 interface ProcessTapTranscribeResponse {
@@ -634,6 +649,9 @@ const dictationOutputLanguageRow = getElement<HTMLLabelElement>("dictationOutput
 const dictationOutputLanguageSelect = getElement<HTMLSelectElement>("dictationOutputLanguageSelect");
 const microphoneSelect = getElement<HTMLSelectElement>("microphoneSelect");
 const systemAudioSelect = getElement<HTMLSelectElement>("systemAudioSelect");
+const subtitleIncludeMicrophoneInput = getElement<HTMLInputElement>("subtitleIncludeMicrophoneInput");
+const subtitleTargetAppsSelect = getElement<HTMLSelectElement>("subtitleTargetAppsSelect");
+const refreshSubtitleAppsButton = getElement<HTMLButtonElement>("refreshSubtitleAppsButton");
 const refreshMicrophonesButton = getElement<HTMLButtonElement>("refreshMicrophonesButton");
 const interactionSoundsInput = getElement<HTMLInputElement>("interactionSoundsInput");
 const muteWhileDictatingInput = getElement<HTMLInputElement>("muteWhileDictatingInput");
@@ -919,6 +937,7 @@ function initHubWindow(): void {
   void bindHubControlEvents();
   void bindSubtitleNativeEvents();
   void populateMicrophones();
+  void populateSubtitleTargetApps();
   void syncDesktopPreferences(readSavedConfig());
   renderHub();
   void refreshDiagnostics();
@@ -1237,6 +1256,7 @@ function bindHubEvents(): void {
   retryHubResultButton.addEventListener("click", () => void retryLatestHistory());
   authorizeMicrophoneButton.addEventListener("click", () => void authorizeMicrophoneAccess());
   refreshMicrophonesButton.addEventListener("click", () => void populateMicrophones());
+  refreshSubtitleAppsButton.addEventListener("click", () => void populateSubtitleTargetApps(true));
   importDictionaryButton.addEventListener("click", () => dictionaryImportInput.click());
   exportDictionaryButton.addEventListener("click", exportDictionaryCsv);
   refreshDiagnosticsButton.addEventListener("click", () => void refreshDiagnostics());
@@ -1429,6 +1449,8 @@ function loadConfigToForm(): void {
   syncDictationOutputLanguageState(config.postProcessDictation);
   microphoneSelect.value = config.microphoneDeviceId;
   systemAudioSelect.value = config.systemAudioDeviceId;
+  subtitleIncludeMicrophoneInput.checked = config.subtitleIncludeMicrophone;
+  setSubtitleTargetAppsValue(config.subtitleTargetApps);
   interactionSoundsInput.checked = config.interactionSounds;
   muteWhileDictatingInput.checked = config.muteWhileDictating;
   launchAtLoginInput.checked = config.launchAtLogin;
@@ -1443,6 +1465,30 @@ function loadConfigToForm(): void {
   subtitleShortcutInput.value = formatShortcutLabel(config.shortcuts.subtitle);
   renderShortcutLabels(config.shortcuts);
   validateShortcutInputs();
+}
+
+/** 读取实时字幕 App 多选框的目标列表。 */
+function readSelectedSubtitleTargetApps(): string[] {
+  const selected = Array.from(subtitleTargetAppsSelect.selectedOptions)
+    .map((option) => option.value.trim())
+    .filter(Boolean);
+  return selected.length ? selected : ["active"];
+}
+
+/** 回填实时字幕 App 多选框，列表尚未刷新时先补临时选项。 */
+function setSubtitleTargetAppsValue(targets: string[]): void {
+  const normalizedTargets = normalizeSubtitleTargetApps(targets, ["active"]);
+  normalizedTargets.forEach((target) => {
+    if (!Array.from(subtitleTargetAppsSelect.options).some((option) => option.value === target)) {
+      const option = document.createElement("option");
+      option.value = target;
+      option.textContent = target === "active" ? "自动选择正在发声的 App" : target;
+      subtitleTargetAppsSelect.appendChild(option);
+    }
+  });
+  Array.from(subtitleTargetAppsSelect.options).forEach((option) => {
+    option.selected = normalizedTargets.includes(option.value);
+  });
 }
 
 /** 读取本地保存的非敏感语音配置。 */
@@ -1482,6 +1528,8 @@ function defaultConfig(): VoiceConfig {
     dictationOutputLanguage: DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: "default",
     systemAudioDeviceId: NATIVE_SYSTEM_AUDIO_DEVICE_ID,
+    subtitleIncludeMicrophone: true,
+    subtitleTargetApps: ["active"],
     interactionSounds: true,
     muteWhileDictating: false,
     launchAtLogin: false,
@@ -1519,6 +1567,9 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
       typeof value.systemAudioDeviceId === "string" && value.systemAudioDeviceId.trim() && value.systemAudioDeviceId !== "auto"
         ? value.systemAudioDeviceId
         : fallback.systemAudioDeviceId,
+    subtitleIncludeMicrophone:
+      typeof value.subtitleIncludeMicrophone === "boolean" ? value.subtitleIncludeMicrophone : fallback.subtitleIncludeMicrophone,
+    subtitleTargetApps: normalizeSubtitleTargetApps(value.subtitleTargetApps, fallback.subtitleTargetApps),
     interactionSounds:
       typeof value.interactionSounds === "boolean" ? value.interactionSounds : fallback.interactionSounds,
     muteWhileDictating:
@@ -1603,6 +1654,18 @@ function normalizeRetention(value: unknown): HistoryRetention {
   return "forever";
 }
 
+/** 规范化实时字幕系统音频 App 目标，避免旧配置或空值导致无法启动。 */
+function normalizeSubtitleTargetApps(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  const targets = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return targets.length ? Array.from(new Set(targets)) : fallback;
+}
+
 /** 从表单收集当前配置。 */
 function readConfigFromForm(): VoiceConfig {
   return {
@@ -1616,6 +1679,8 @@ function readConfigFromForm(): VoiceConfig {
     dictationOutputLanguage: dictationOutputLanguageSelect.value || DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: microphoneSelect.value || "default",
     systemAudioDeviceId: systemAudioSelect.value || "auto",
+    subtitleIncludeMicrophone: subtitleIncludeMicrophoneInput.checked,
+    subtitleTargetApps: readSelectedSubtitleTargetApps(),
     interactionSounds: interactionSoundsInput.checked,
     muteWhileDictating: muteWhileDictatingInput.checked,
     launchAtLogin: launchAtLoginInput.checked,
@@ -2006,10 +2071,13 @@ function createDefaultPermissionSnapshot(): RuntimePermissionSnapshot {
 /** 读取实时字幕系统声音配置状态，用于模式卡片展示而不是藏在全局设置里。 */
 function readSystemAudioDiagnostic(config: VoiceConfig): { text: string; state: DiagnosticState } {
   if (config.systemAudioDeviceId === "none") {
-    return { text: "未采集系统声音", state: "error" };
+    return config.subtitleIncludeMicrophone
+      ? { text: "只采集麦克风", state: "success" }
+      : { text: "未选择音频来源", state: "error" };
   }
   if (config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID) {
-    return { text: "原生系统音频捕获", state: "success" };
+    const targetCount = normalizeSubtitleTargetApps(config.subtitleTargetApps, ["active"]).length;
+    return { text: targetCount > 1 ? `原生捕获 ${targetCount} 个 App` : "原生系统音频捕获", state: "success" };
   }
   if (!config.systemAudioDeviceId || config.systemAudioDeviceId === "auto") {
     return { text: "需要选择系统声音输入", state: "warning" };
@@ -2028,7 +2096,9 @@ function readModeShortcutPermissionText(mode: ShortcutMode): string {
 
 /** 按语音模式生成所需权限列表，避免所有模式共用一张全局权限表。 */
 function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
-  const microphoneReady = lastPermissionSnapshot.microphoneState === "success";
+  const config = readSavedConfig();
+  const microphoneReady =
+    mode === "subtitle" && !config.subtitleIncludeMicrophone ? true : lastPermissionSnapshot.microphoneState === "success";
   const permissions: ModePermissionItem[] = [
     {
       kind: "apiKey",
@@ -2041,8 +2111,8 @@ function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
       kind: "microphone",
       label: mode === "subtitle" ? "麦克风输入" : "麦克风权限",
       ready: microphoneReady,
-      state: lastPermissionSnapshot.microphoneState,
-      description: lastPermissionSnapshot.microphoneText,
+      state: mode === "subtitle" && !config.subtitleIncludeMicrophone ? "success" : lastPermissionSnapshot.microphoneState,
+      description: mode === "subtitle" && !config.subtitleIncludeMicrophone ? "已关闭" : lastPermissionSnapshot.microphoneText,
     },
     {
       kind: "shortcut",
@@ -2812,6 +2882,45 @@ async function populateMicrophones(): Promise<void> {
   }
 }
 
+/** 刷新实时字幕可采集的系统音频 App 列表。 */
+async function populateSubtitleTargetApps(showNotice = false): Promise<void> {
+  const config = readSavedConfig();
+  const selectedTargets = readSelectedSubtitleTargetApps();
+  const desiredTargets = selectedTargets.length ? selectedTargets : config.subtitleTargetApps;
+  subtitleTargetAppsSelect.innerHTML = '<option value="active">自动选择正在发声的 App</option>';
+  if (!isTauriRuntime()) {
+    setSubtitleTargetAppsValue(desiredTargets);
+    return;
+  }
+  try {
+    const apps = await listProcessTapAudioApps();
+    apps
+      .filter((app) => app.pid > 0 && app.name.trim())
+      .sort((left, right) => Number(right.audioActive) - Number(left.audioActive) || left.name.localeCompare(right.name))
+      .forEach((app) => {
+        const option = document.createElement("option");
+        option.value = String(app.pid);
+        option.textContent = `${app.audioActive ? "正在发声 · " : ""}${app.name}${app.bundleId ? ` · ${app.bundleId}` : ""}`;
+        subtitleTargetAppsSelect.appendChild(option);
+      });
+    setSubtitleTargetAppsValue(desiredTargets);
+    if (showNotice) {
+      showHubNotice(`已刷新 ${apps.length} 个音频 App。`, "success");
+    }
+  } catch (error) {
+    setSubtitleTargetAppsValue(desiredTargets);
+    if (showNotice) {
+      showHubNotice(`刷新可采集 App 失败：${formatError(error)}`, "error");
+    }
+  }
+}
+
+/** 调用 Tauri 读取 Core Audio 当前可见的音频进程。 */
+async function listProcessTapAudioApps(): Promise<ProcessTapAudioApp[]> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ProcessTapAudioApp[]>("list_process_tap_audio_apps");
+}
+
 /** 清空本地保存的非敏感配置并恢复默认值，执行前要求二次点击确认。 */
 function clearSavedConfig(button: HTMLButtonElement): void {
   if (
@@ -3230,16 +3339,33 @@ async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
       level: "info",
       category: "subtitle",
       title: "实时字幕使用原生系统音频",
-      message: "已选择 Core Audio Process Tap，将跳过麦克风输入并直接采集当前正在发声的系统应用。",
+      message: config.subtitleIncludeMicrophone
+        ? "已选择 Core Audio Process Tap，并会同时采集麦克风输入。"
+        : "已选择 Core Audio Process Tap，将只采集选定系统应用。",
       mode: "subtitle",
+      details: [`目标 App：${formatSubtitleTargetApps(config)}`],
     });
-    subtitleCurrentSource = "system";
+    if (config.subtitleIncludeMicrophone) {
+      try {
+        subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风");
+      } catch (error) {
+        addDiagnosticLog({
+          level: "warning",
+          category: "subtitle",
+          title: "实时字幕麦克风不可用",
+          message: `麦克风打开失败，本轮仅采集系统声音：${formatError(error)}`,
+          mode: "subtitle",
+        });
+        subtitleMicStream = null;
+      }
+    }
+    subtitleCurrentSource = subtitleMicStream ? "mixed" : "system";
     subtitleRecorderChunkIndex = 0;
     addDiagnosticLog({
       level: "info",
       category: "subtitle",
       title: "实时字幕开始创建录音器",
-      message: "音频输入已准备，开始创建原生系统音频切片。",
+      message: subtitleMicStream ? "音频输入已准备，开始创建原生系统音频和麦克风切片。" : "音频输入已准备，开始创建原生系统音频切片。",
       mode: "subtitle",
       details: [`音频来源：${formatSubtitleSource(subtitleCurrentSource)}`],
     });
@@ -3344,6 +3470,19 @@ async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
   });
 }
 
+/** 格式化实时字幕原生系统音频目标，便于诊断日志和设置卡片展示。 */
+function formatSubtitleTargetApps(config: VoiceConfig): string {
+  return normalizeSubtitleTargetApps(config.subtitleTargetApps, ["active"])
+    .map((target) => (target === "active" ? "自动选择" : target))
+    .join("、");
+}
+
+/** 读取原生系统音频 helper 的目标参数，多个 App 用逗号交给 helper 混合采集。 */
+function readSubtitleNativeTargetKeyword(): string {
+  const config = readSavedConfig();
+  return normalizeSubtitleTargetApps(config.subtitleTargetApps, ["active"]).join(",");
+}
+
 /** 启动一段独立的实时字幕录音，停止后自动转写并进入下一段。 */
 function startSubtitleRecorderSegment(): void {
   const hasAudioInput = isSubtitleUsingNativeSystemAudio || subtitleMicStream !== null;
@@ -3365,12 +3504,20 @@ function startSubtitleRecorderSegment(): void {
   }
   if (isSubtitleUsingNativeSystemAudio) {
     void startSubtitleNativeRecorderSegment();
+    if (subtitleMicStream && !subtitleMediaRecorder) {
+      startSubtitleMediaRecorderSegment(subtitleMicStream, null);
+    }
     return;
   }
   if (!subtitleMicStream) {
     return;
   }
-  const recorder = createSubtitleMediaRecorder(subtitleMicStream, subtitleSystemStream);
+  startSubtitleMediaRecorderSegment(subtitleMicStream, subtitleSystemStream);
+}
+
+/** 启动一段浏览器 MediaRecorder 字幕录音，供麦克风或虚拟系统输入使用。 */
+function startSubtitleMediaRecorderSegment(micStream: MediaStream, systemStream: MediaStream | null): void {
+  const recorder = createSubtitleMediaRecorder(micStream, systemStream);
   const chunks: Blob[] = [];
   const mimeType = recorder.mimeType || "audio/webm";
   subtitleMediaRecorder = recorder;
@@ -3385,6 +3532,7 @@ function startSubtitleRecorderSegment(): void {
       window.clearTimeout(subtitleRecorderStopTimerHandle);
       subtitleRecorderStopTimerHandle = null;
     }
+    subtitleMediaRecorder = null;
     const shouldContinue = isSubtitleListening && subtitleMicStream !== null;
     if (chunks.length) {
       subtitleRecorderChunkIndex += 1;
@@ -3472,7 +3620,7 @@ async function startSubtitleNativeRecorderSegment(): Promise<void> {
         startSubtitleRecorderSegment();
       }
     }, SUBTITLE_NATIVE_CAPTURE_TIMEOUT_MS + 25000);
-    void startProcessTapTranscribeTask(SUBTITLE_NATIVE_CHUNK_MS, "active", chunkIndex).catch((error: unknown) => {
+    void startProcessTapTranscribeTask(SUBTITLE_NATIVE_CHUNK_MS, readSubtitleNativeTargetKeyword(), chunkIndex).catch((error: unknown) => {
       handleSubtitleNativeTranscribeFailure(chunkIndex, formatError(error));
     });
     void pollProcessTapTranscribeOutcome(chunkIndex);
@@ -3525,15 +3673,16 @@ function handleSubtitleNativeTranscribeFailure(chunkIndex: number, message: stri
     window.clearTimeout(subtitleNativeChunkTimeoutHandle);
     subtitleNativeChunkTimeoutHandle = null;
   }
+  const canContinueWithMicrophone = Boolean(subtitleMicStream);
   addDiagnosticLog({
-    level: "error",
+    level: canContinueWithMicrophone ? "warning" : "error",
     category: "subtitle",
-    title: "原生系统音频采集失败",
-    message,
+    title: canContinueWithMicrophone ? "系统声音目标暂不可用" : "原生系统音频采集失败",
+    message: canContinueWithMicrophone ? `系统声音采集失败，已继续使用麦克风监听：${message}` : message,
     mode: "subtitle",
     details: [`序号：${chunkIndex}`],
   });
-  void emitSubtitleHistoryUpdate("系统音频采集失败", true);
+  void emitSubtitleHistoryUpdate(canContinueWithMicrophone ? "系统声音暂不可用，继续麦克风" : "系统音频采集失败", true);
   if (isSubtitleListening && isSubtitleUsingNativeSystemAudio) {
     startSubtitleRecorderSegment();
   }
@@ -4290,7 +4439,8 @@ async function ensureReadyForRecording(mode: ShortcutMode): Promise<boolean> {
     }
     const config = readSavedConfig();
     const isNativeSubtitleMode = mode === "subtitle" && config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID;
-    if (!isNativeSubtitleMode && microphoneDiagnostic.state !== "success") {
+    const needsMicrophone = mode !== "subtitle" || config.subtitleIncludeMicrophone || !isNativeSubtitleMode;
+    if (needsMicrophone && microphoneDiagnostic.state !== "success") {
       await showRequiredModePermission(mode, "microphone", `请设置${SHORTCUT_MODE_LABELS[mode]}的麦克风权限。`);
       return false;
     }
@@ -5051,8 +5201,9 @@ async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
       setStatus(response.message, "ready");
       return;
     }
-    setStatus(response.message, "error");
-    await showResultWindow(text, response.message, response.requiresAccessibility);
+    const fallbackMessage = formatManualResultFallbackMessage(response.message, response.requiresAccessibility);
+    setStatus(fallbackMessage, response.requiresAccessibility ? "error" : "ready");
+    await showResultWindow(text, fallbackMessage, response.requiresAccessibility);
   } catch (error) {
     const message = `${formatError(error)}。结果已保留，可手动复制。`;
     addDiagnosticLog({
@@ -5066,6 +5217,18 @@ async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
     setStatus(message, "error");
     await showResultWindow(text, message, false);
   }
+}
+
+/** 把自动粘贴未完成的原因转成更像兜底结果的用户提示。 */
+function formatManualResultFallbackMessage(message: string, requiresAccessibility: boolean): string {
+  const normalizedMessage = message.trim();
+  if (requiresAccessibility) {
+    return normalizedMessage || "辅助功能未授权，结果已展示，可手动复制。";
+  }
+  if (normalizedMessage.includes("没有可恢复的目标输入框") || normalizedMessage.includes("当前焦点不在外部输入目标")) {
+    return "没有检测到可粘贴的外部输入框，结果已展示，可手动复制。";
+  }
+  return normalizedMessage || "自动粘贴未完成，结果已展示，可手动复制。";
 }
 
 /** 在独立结果窗口展示无法自动粘贴的内容。 */
