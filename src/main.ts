@@ -100,6 +100,13 @@ type IconName = keyof typeof ICON_RENDERERS;
 type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "modes" | "start" | "refresh";
 type PermissionKind = "apiKey" | "microphone" | "accessibility" | "shortcut" | "systemAudio";
 
+interface PasteTranscriptionOptions {
+  /** 是否在系统只确认发出粘贴指令但无法确认写入输入框时展示结果兜底窗口。 */
+  showResultWhenUnverified: boolean;
+  /** 结果兜底窗口使用的动作描述，帮助用户判断当前是转写还是润色。 */
+  actionLabel: string;
+}
+
 interface PendingConfirmation {
   /** 本次等待确认的动作 ID，用于区分不同危险操作。 */
   id: string;
@@ -3394,7 +3401,10 @@ async function polishSelectedText(targetApp = "", keepHubVisible = false): Promi
       return;
     }
     setStatus("正在替换选中文本。", "busy");
-    await pasteTranscription(outputText, contextApp);
+    await pasteTranscription(outputText, contextApp, {
+      showResultWhenUnverified: true,
+      actionLabel: "润色结果",
+    });
   } catch (error) {
     const message = formatError(error);
     addDiagnosticLog({
@@ -5479,7 +5489,11 @@ function readModeStyle(config: VoiceConfig, mode: VoiceMode): string {
 }
 
 /** 转写完成后把结果自动粘贴到当前焦点输入框。 */
-async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
+async function pasteTranscription(
+  text: string,
+  targetApp = "",
+  options: PasteTranscriptionOptions = { showResultWhenUnverified: false, actionLabel: "结果" },
+): Promise<void> {
   if (!isTauriRuntime()) {
     addDiagnosticLog({
       level: "warning",
@@ -5528,6 +5542,12 @@ async function pasteTranscription(text: string, targetApp = ""): Promise<void> {
       ],
     });
     if (response.pasted) {
+      if (options.showResultWhenUnverified && !response.insertionVerified) {
+        const fallbackMessage = `${options.actionLabel}已生成，并已发出粘贴指令；但当前系统无法确认内容已经写入输入框。如果目标输入框没有变化，可以从这里手动复制。`;
+        setStatus(fallbackMessage, "ready");
+        await showResultWindow(text, fallbackMessage, false);
+        return;
+      }
       setStatus(response.message, "ready");
       return;
     }
