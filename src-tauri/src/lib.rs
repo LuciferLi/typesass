@@ -30,6 +30,7 @@ const DEFAULT_TEXT_MODEL: &str = "mimo-v2.5";
 const DEFAULT_DICTATE_SHORTCUT: &str = "ctrl+p";
 const DEFAULT_TRANSLATE_SHORTCUT: &str = "ctrl+t";
 const DEFAULT_ASK_SHORTCUT: &str = "ctrl+space";
+const DEFAULT_POLISH_SHORTCUT: &str = "ctrl+shift+p";
 const DEFAULT_SUBTITLE_SHORTCUT: &str = "ctrl+shift+s";
 const LOGIN_AGENT_LABEL: &str = "asia.aijob.aitool.login";
 const KEYCHAIN_SERVICE: &str = "asia.aijob.aitool";
@@ -139,6 +140,8 @@ struct ShortcutProfile {
     translate: String,
     /// 随便问模式快捷键。
     ask: String,
+    /// 文本润色模式快捷键。
+    polish: String,
     /// 实时字幕监听模式快捷键。
     subtitle: String,
 }
@@ -149,6 +152,7 @@ impl Default for ShortcutProfile {
             dictate: DEFAULT_DICTATE_SHORTCUT.to_string(),
             translate: DEFAULT_TRANSLATE_SHORTCUT.to_string(),
             ask: DEFAULT_ASK_SHORTCUT.to_string(),
+            polish: DEFAULT_POLISH_SHORTCUT.to_string(),
             subtitle: DEFAULT_SUBTITLE_SHORTCUT.to_string(),
         }
     }
@@ -300,6 +304,8 @@ enum ProcessMode {
     Translate,
     /// 随便问。
     Ask,
+    /// 选中文本润色。
+    Polish,
 }
 
 /// 前端提交给 AI 文本处理接口的请求。
@@ -380,6 +386,24 @@ struct PasteResponse {
     focused_element_after_activate: String,
     /// 发送粘贴指令后的系统焦点元素。
     focused_element_after_paste: String,
+}
+
+/// 读取系统当前选中文本后的结果，供文本润色模式使用。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectedTextResponse {
+    /// 通过系统复制快捷键读到的选中文本。
+    text: String,
+    /// 触发读取前的前台 App 名称，用于后续粘贴回原 App。
+    target_app: String,
+    /// 是否检测到辅助功能授权。
+    accessibility_trusted: bool,
+    /// 读取完成后是否恢复了用户原剪贴板。
+    clipboard_restored: bool,
+    /// 剪贴板恢复状态说明，不包含剪贴板正文。
+    clipboard_restore_message: String,
+    /// 本次读取使用的系统触发方式。
+    copy_method: String,
 }
 
 /// 系统级粘贴触发结果，记录具体路径以便前端诊断。
@@ -518,6 +542,7 @@ pub fn run() {
             start_process_tap_transcribe_task,
             take_process_tap_transcribe_outcome,
             process_text,
+            read_selected_text,
             paste_text,
             set_session_api_key,
             save_api_key,
@@ -831,6 +856,8 @@ fn shortcut_to_mode(app: &tauri::AppHandle, shortcut: &str) -> String {
         "translate".to_string()
     } else if normalized == normalize_shortcut(&profile.ask) {
         "ask".to_string()
+    } else if normalized == normalize_shortcut(&profile.polish) {
+        "polish".to_string()
     } else if normalized == normalize_shortcut(&profile.subtitle) {
         "subtitle".to_string()
     } else if normalized == normalize_shortcut(&profile.dictate) {
@@ -1014,6 +1041,7 @@ fn register_shortcut_profile(
         profile.dictate.as_str(),
         profile.translate.as_str(),
         profile.ask.as_str(),
+        profile.polish.as_str(),
         profile.subtitle.as_str(),
     ] {
         let normalized = normalize_shortcut(shortcut);
@@ -1046,6 +1074,7 @@ fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfil
         dictate: normalize_shortcut_or_default(&profile.dictate, DEFAULT_DICTATE_SHORTCUT),
         translate: normalize_shortcut_or_default(&profile.translate, DEFAULT_TRANSLATE_SHORTCUT),
         ask: normalize_shortcut_or_default(&profile.ask, DEFAULT_ASK_SHORTCUT),
+        polish: normalize_shortcut_or_default(&profile.polish, DEFAULT_POLISH_SHORTCUT),
         subtitle: normalize_shortcut_or_default(&profile.subtitle, DEFAULT_SUBTITLE_SHORTCUT),
     };
     let mut seen = std::collections::HashSet::new();
@@ -1053,11 +1082,12 @@ fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfil
         &normalized.dictate,
         &normalized.translate,
         &normalized.ask,
+        &normalized.polish,
         &normalized.subtitle,
     ] {
         let key = normalize_shortcut(shortcut);
         if !seen.insert(key) {
-            return Err("四个模式不能使用同一个快捷键".to_string());
+            return Err("五个模式不能使用同一个快捷键".to_string());
         }
     }
     Ok(normalized)
@@ -2320,6 +2350,66 @@ async fn process_text(
     })
 }
 
+/// 通过系统复制快捷键读取当前外部 App 的选中文本，并尽量恢复用户原剪贴板。
+#[tauri::command]
+fn read_selected_text() -> Result<SelectedTextResponse, String> {
+    let target_app = get_frontmost_app().unwrap_or_default();
+    let normalized_target_app = normalize_target_app_name(&target_app);
+    if normalized_target_app.is_empty() {
+        return Err("没有检测到可读取选中文本的外部应用。".to_string());
+    }
+    let accessibility_trusted = is_accessibility_trusted();
+    if !accessibility_trusted {
+        return Err("读取选中文本需要先给 typesass 开启辅助功能权限。".to_string());
+    }
+    let clipboard_snapshot = capture_clipboard_snapshot()
+        .map_err(|error| format!("备份用户原剪贴板失败：{}", trim_error_message(&error)))?;
+    let marker = format!("typesass-selection-marker-{}", std::process::id());
+    write_clipboard_text(&marker)?;
+    let copy_result = match trigger_system_copy() {
+        Ok(value) => value,
+        Err(error) => {
+            let clipboard_restore_status = build_clipboard_restore_status(
+                Some(()),
+                restore_clipboard_snapshot(&clipboard_snapshot),
+            );
+            return Err(format!("{}；{}", error, clipboard_restore_status.message));
+        }
+    };
+    thread::sleep(Duration::from_millis(120));
+    let selected_text = match read_clipboard_text_raw() {
+        Ok(text) => text,
+        Err(error) => {
+            let clipboard_restore_status = build_clipboard_restore_status(
+                Some(()),
+                restore_clipboard_snapshot(&clipboard_snapshot),
+            );
+            return Err(format!(
+                "读取选中文本失败：{}；{}",
+                trim_error_message(&error),
+                clipboard_restore_status.message
+            ));
+        }
+    };
+    let clipboard_restore_status =
+        build_clipboard_restore_status(Some(()), restore_clipboard_snapshot(&clipboard_snapshot));
+    let normalized_text = selected_text.trim().to_string();
+    if normalized_text.is_empty() || normalized_text == marker {
+        return Err(format!(
+            "没有读到选中文本，请先在外部应用中框选一段文字。{}",
+            clipboard_restore_status.message
+        ));
+    }
+    Ok(SelectedTextResponse {
+        text: normalized_text,
+        target_app: normalized_target_app,
+        accessibility_trusted,
+        clipboard_restored: clipboard_restore_status.restored,
+        clipboard_restore_message: clipboard_restore_status.message,
+        copy_method: copy_result.method,
+    })
+}
+
 /// 根据处理模式和用户词典构造 AI 指令。
 fn build_process_prompt(request: &ProcessTextRequest, text: &str) -> (String, String) {
     let dictionary = request
@@ -2376,6 +2466,13 @@ fn build_process_prompt(request: &ProcessTextRequest, text: &str) -> (String, St
                 .to_string(),
             format!("{}\n{}\n用户问题：{}", glossary_rule, context_rule, text),
         ),
+        ProcessMode::Polish => (
+            "你是桌面文本润色助手。只输出润色后的最终文本，不解释过程，不输出标题。".to_string(),
+            format!(
+                "{}\n{}\n规则：在不改变事实、含义、称谓、数字和专有名词的前提下，优化表达、语序、标点和可读性；删掉多余口语、重复和病句；保留原文语言和段落结构；不要扩写，不要新增信息。\n原文：{}",
+                glossary_rule, context_rule, text
+            ),
+        ),
     }
 }
 
@@ -2384,6 +2481,7 @@ fn calculate_process_max_tokens(request: &ProcessTextRequest, text: &str) -> u32
     let char_count = text.chars().count() as u32;
     match request.mode {
         ProcessMode::Dictate => (char_count.saturating_mul(2) + 160).clamp(192, 800),
+        ProcessMode::Polish => (char_count.saturating_mul(2) + 128).clamp(192, 1000),
         ProcessMode::Translate => {
             let target_count = request
                 .target_languages
@@ -2401,7 +2499,7 @@ fn calculate_process_max_tokens(request: &ProcessTextRequest, text: &str) -> u32
 fn calculate_process_temperature(mode: &ProcessMode) -> f64 {
     match mode {
         ProcessMode::Ask => 0.2,
-        ProcessMode::Dictate | ProcessMode::Translate => 0.0,
+        ProcessMode::Dictate | ProcessMode::Translate | ProcessMode::Polish => 0.0,
     }
 }
 
@@ -2409,6 +2507,7 @@ fn calculate_process_temperature(mode: &ProcessMode) -> f64 {
 fn calculate_process_timeout(mode: &ProcessMode) -> Duration {
     match mode {
         ProcessMode::Dictate => Duration::from_millis(10000),
+        ProcessMode::Polish => Duration::from_millis(12000),
         ProcessMode::Translate => Duration::from_millis(9000),
         ProcessMode::Ask => Duration::from_millis(15000),
     }
@@ -3075,35 +3174,74 @@ fn trigger_system_events_paste(accessibility_ready: bool) -> Result<PasteTrigger
     })
 }
 
+/// 触发系统级 Cmd+C；用于从当前外部 App 读取选中文本。
+#[cfg(target_os = "macos")]
+fn trigger_system_copy() -> Result<PasteTriggerResult, String> {
+    let accessibility_ready = is_accessibility_trusted();
+    match trigger_core_graphics_shortcut("c", accessibility_ready) {
+        Ok(method) => Ok(PasteTriggerResult {
+            accessibility_ready,
+            method,
+        }),
+        Err(_) => {
+            run_osascript(
+                r#"tell application "System Events" to keystroke "c" using command down"#,
+            )?;
+            Ok(PasteTriggerResult {
+                accessibility_ready,
+                method: "System Events".to_string(),
+            })
+        }
+    }
+}
+
 /// 使用 CoreGraphics 触发 Cmd+V，尽量模拟真实键盘粘贴事件。
 #[cfg(target_os = "macos")]
 fn trigger_core_graphics_paste(accessibility_ready: bool) -> Result<PasteTriggerResult, String> {
+    let method = trigger_core_graphics_shortcut("v", accessibility_ready)?;
+    Ok(PasteTriggerResult {
+        accessibility_ready,
+        method,
+    })
+}
+
+/// 使用 CoreGraphics 触发 Command + 指定字母快捷键。
+#[cfg(target_os = "macos")]
+fn trigger_core_graphics_shortcut(key: &str, _accessibility_ready: bool) -> Result<String, String> {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, KeyCode};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
+    let key_code = match key {
+        "c" => KeyCode::ANSI_C,
+        "v" => KeyCode::ANSI_V,
+        _ => return Err("系统快捷键失败：不支持的按键。".to_string()),
+    };
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| "自动粘贴失败：无法创建系统按键事件源".to_string())?;
-    let key_down = CGEvent::new_keyboard_event(source.clone(), KeyCode::ANSI_V, true)
-        .map_err(|_| "自动粘贴失败：无法创建粘贴按下事件".to_string())?;
+        .map_err(|_| "系统快捷键失败：无法创建系统按键事件源".to_string())?;
+    let key_down = CGEvent::new_keyboard_event(source.clone(), key_code, true)
+        .map_err(|_| "系统快捷键失败：无法创建按下事件".to_string())?;
     key_down.set_flags(CGEventFlags::CGEventFlagCommand);
     key_down.post(CGEventTapLocation::HID);
 
     thread::sleep(Duration::from_millis(24));
 
-    let key_up = CGEvent::new_keyboard_event(source, KeyCode::ANSI_V, false)
-        .map_err(|_| "自动粘贴失败：无法创建粘贴松开事件".to_string())?;
+    let key_up = CGEvent::new_keyboard_event(source, key_code, false)
+        .map_err(|_| "系统快捷键失败：无法创建松开事件".to_string())?;
     key_up.set_flags(CGEventFlags::CGEventFlagCommand);
     key_up.post(CGEventTapLocation::HID);
-    Ok(PasteTriggerResult {
-        accessibility_ready,
-        method: "CoreGraphics".to_string(),
-    })
+    Ok("CoreGraphics".to_string())
 }
 
 /// 非 macOS 平台暂不支持系统级自动粘贴。
 #[cfg(not(target_os = "macos"))]
 fn trigger_system_paste() -> Result<PasteTriggerResult, String> {
     Err("自动粘贴失败：当前版本暂时只支持 macOS 自动粘贴".to_string())
+}
+
+/// 非 macOS 平台暂不支持系统级读取选中文本。
+#[cfg(not(target_os = "macos"))]
+fn trigger_system_copy() -> Result<PasteTriggerResult, String> {
+    Err("读取选中文本失败：当前版本暂时只支持 macOS".to_string())
 }
 
 /// 查询当前进程是否已获得 macOS 辅助功能权限。

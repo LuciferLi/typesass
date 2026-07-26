@@ -62,6 +62,7 @@ const DEFAULT_SHORTCUTS: ShortcutConfig = {
   dictate: "ctrl+p",
   translate: "ctrl+t",
   ask: "ctrl+space",
+  polish: "ctrl+shift+p",
   subtitle: "ctrl+shift+s",
 };
 const ICON_RENDERERS = {
@@ -83,7 +84,7 @@ const ICON_RENDERERS = {
   voice: VoiceInput,
 } as const;
 
-type VoiceMode = "dictate" | "translate" | "ask";
+type VoiceMode = "dictate" | "translate" | "ask" | "polish";
 type ShortcutMode = VoiceMode | "subtitle";
 type StatusState = "idle" | "ready" | "recording" | "busy" | "error";
 type HubNoticeState = "idle" | "busy" | "success" | "error";
@@ -133,6 +134,8 @@ interface ShortcutConfig {
   translate: string;
   /** 随便问模式全局快捷键。 */
   ask: string;
+  /** 润色模式全局快捷键。 */
+  polish: string;
   /** 实时字幕监听模式全局快捷键。 */
   subtitle: string;
 }
@@ -189,6 +192,8 @@ interface VoiceConfig {
   translationStyle: string;
   /** 只在随便问时追加的本地回答偏好。 */
   askStyle: string;
+  /** 只在选中文本润色时追加的本地输出偏好。 */
+  polishStyle: string;
 }
 
 interface TranscribeRequest {
@@ -265,6 +270,21 @@ interface ProcessTapTranscribeOutcome {
   response?: ProcessTapTranscribeResponse;
   /** 失败时的错误原因。 */
   error?: string;
+}
+
+interface SelectedTextResponse {
+  /** 从当前外部 App 读到的选中文本。 */
+  text: string;
+  /** 读取选中文本前的前台 App。 */
+  targetApp: string;
+  /** 读取时辅助功能权限是否已授权。 */
+  accessibilityTrusted: boolean;
+  /** 读取完成后是否恢复原剪贴板。 */
+  clipboardRestored: boolean;
+  /** 原剪贴板恢复说明。 */
+  clipboardRestoreMessage: string;
+  /** 触发复制时使用的系统路径。 */
+  copyMethod: string;
 }
 
 interface ProcessTextRequest {
@@ -554,12 +574,14 @@ const MODE_LABELS: Record<VoiceMode, string> = {
   dictate: "口述",
   translate: "翻译",
   ask: "随便问",
+  polish: "润色",
 };
 
 const SHORTCUT_MODE_LABELS: Record<ShortcutMode, string> = {
   dictate: "口述",
   translate: "翻译",
   ask: "随便问",
+  polish: "润色",
   subtitle: "实时字幕",
 };
 
@@ -567,12 +589,14 @@ const MODE_START_LABELS: Record<VoiceMode, string> = {
   dictate: "开始口述",
   translate: "开始翻译",
   ask: "开始提问",
+  polish: "润色选中文本",
 };
 
 const MODE_ACTION_ICONS: Record<VoiceMode, IconName> = {
   dictate: "microphone",
   translate: "translate",
   ask: "message",
+  polish: "check",
 };
 
 const DIAGNOSTIC_LOG_LEVEL_LABELS: Record<DiagnosticLogLevel, string> = {
@@ -595,12 +619,14 @@ const MODE_SETTINGS_VIEWS: Record<VoiceMode, string> = {
   dictate: "dictateSettings",
   translate: "translateSettings",
   ask: "askSettings",
+  polish: "polishSettings",
 };
 
 const MODE_DETAIL_VIEWS: Record<ShortcutMode, string> = {
   dictate: "dictateSettings",
   translate: "translateSettings",
   ask: "askSettings",
+  polish: "polishSettings",
   subtitle: "subtitleSettings",
 };
 
@@ -610,6 +636,7 @@ const VIEW_TITLES: Record<string, { eyebrow: string; title: string }> = {
   dictateSettings: { eyebrow: "只影响口述", title: "口述设置" },
   translateSettings: { eyebrow: "只影响翻译", title: "翻译设置" },
   askSettings: { eyebrow: "只影响随便问", title: "随便问设置" },
+  polishSettings: { eyebrow: "只影响润色", title: "润色设置" },
   subtitleSettings: { eyebrow: "只影响实时字幕", title: "实时字幕设置" },
   shortcuts: { eyebrow: "按一次开始，再按一次结束", title: "快捷键" },
   history: { eyebrow: "只保存在本机", title: "历史记录" },
@@ -661,18 +688,22 @@ const personalStyleInput = getElement<HTMLTextAreaElement>("personalStyleInput")
 const dictationStyleInput = getElement<HTMLTextAreaElement>("dictationStyleInput");
 const translationStyleInput = getElement<HTMLTextAreaElement>("translationStyleInput");
 const askStyleInput = getElement<HTMLTextAreaElement>("askStyleInput");
+const polishStyleInput = getElement<HTMLTextAreaElement>("polishStyleInput");
 const dictateShortcutInput = getElement<HTMLInputElement>("dictateShortcutInput");
 const translateShortcutInput = getElement<HTMLInputElement>("translateShortcutInput");
 const askShortcutInput = getElement<HTMLInputElement>("askShortcutInput");
+const polishShortcutInput = getElement<HTMLInputElement>("polishShortcutInput");
 const subtitleShortcutInput = getElement<HTMLInputElement>("subtitleShortcutInput");
 const shortcutValidationText = getElement<HTMLElement>("shortcutValidationText");
 const dictateShortcutText = getElement<HTMLElement>("dictateShortcutText");
 const translateShortcutText = getElement<HTMLElement>("translateShortcutText");
 const askShortcutText = getElement<HTMLElement>("askShortcutText");
+const polishShortcutText = getElement<HTMLElement>("polishShortcutText");
 const subtitleShortcutText = getElement<HTMLElement>("subtitleShortcutText");
 const homeDictateShortcutText = getElement<HTMLElement>("homeDictateShortcutText");
 const homeTranslateShortcutText = getElement<HTMLElement>("homeTranslateShortcutText");
 const homeAskShortcutText = getElement<HTMLElement>("homeAskShortcutText");
+const homePolishShortcutText = getElement<HTMLElement>("homePolishShortcutText");
 const homeSubtitleShortcutText = getElement<HTMLElement>("homeSubtitleShortcutText");
 const saveShortcutButton = getElement<HTMLButtonElement>("saveShortcutButton");
 const clearConfigButton = getElement<HTMLButtonElement>("clearConfigButton");
@@ -759,6 +790,7 @@ let recordStartedAt = 0;
 let timerHandle: number | null = null;
 let bubbleTimerHandle: number | null = null;
 let isProcessing = false;
+let isPolishingSelection = false;
 let isStartingRecording = false;
 let isSubtitleListening = false;
 let isStartingSubtitleListening = false;
@@ -1322,7 +1354,7 @@ function resetHubNotice(): void {
 
 /** 根据字符串恢复语音模式，非法值回落到听写。 */
 function normalizeMode(value: string | undefined): VoiceMode {
-  if (value === "translate" || value === "ask") {
+  if (value === "translate" || value === "ask" || value === "polish") {
     return value;
   }
   return "dictate";
@@ -1352,7 +1384,7 @@ function switchModeSettingsView(mode: VoiceMode): void {
 
 /** 根据字符串恢复历史筛选值，非法值回落到全部。 */
 function normalizeHistoryFilter(value: string | undefined): VoiceMode | "all" {
-  if (value === "dictate" || value === "translate" || value === "ask") {
+  if (value === "dictate" || value === "translate" || value === "ask" || value === "polish") {
     return value;
   }
   return "all";
@@ -1407,16 +1439,20 @@ function handleShortcutMode(mode: ShortcutMode, targetApp = "", keepHubVisible =
     level: "info",
     category: "system",
     title: "快捷键触发",
-    message: "已收到全局快捷键，准备切换录音状态。",
+    message: mode === "polish" ? "已收到全局快捷键，准备润色选中文本。" : "已收到全局快捷键，准备切换录音状态。",
     mode,
     targetApp,
     details: [
-      `状态：${mode === "subtitle" ? (isSubtitleListening ? "停止字幕监听" : "开始字幕监听") : isRecording ? "停止录音" : "开始录音"}`,
+      `状态：${mode === "subtitle" ? (isSubtitleListening ? "停止字幕监听" : "开始字幕监听") : mode === "polish" ? "润色选中文本" : isRecording ? "停止录音" : "开始录音"}`,
       `保持Hub：${keepHubVisible ? "是" : "否"}`,
     ],
   });
   if (mode === "subtitle") {
     void toggleSubtitleListening();
+    return;
+  }
+  if (mode === "polish") {
+    void polishSelectedText(targetApp, keepHubVisible);
     return;
   }
   if (isSubtitleListening || isStartingSubtitleListening) {
@@ -1459,9 +1495,11 @@ function loadConfigToForm(): void {
   dictationStyleInput.value = config.dictationStyle;
   translationStyleInput.value = config.translationStyle;
   askStyleInput.value = config.askStyle;
+  polishStyleInput.value = config.polishStyle;
   dictateShortcutInput.value = formatShortcutLabel(config.shortcuts.dictate);
   translateShortcutInput.value = formatShortcutLabel(config.shortcuts.translate);
   askShortcutInput.value = formatShortcutLabel(config.shortcuts.ask);
+  polishShortcutInput.value = formatShortcutLabel(config.shortcuts.polish);
   subtitleShortcutInput.value = formatShortcutLabel(config.shortcuts.subtitle);
   renderShortcutLabels(config.shortcuts);
   validateShortcutInputs();
@@ -1539,6 +1577,7 @@ function defaultConfig(): VoiceConfig {
     dictationStyle: "",
     translationStyle: "",
     askStyle: "",
+    polishStyle: "",
   };
 }
 
@@ -1581,16 +1620,18 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
     dictationStyle: typeof value.dictationStyle === "string" ? value.dictationStyle : fallback.dictationStyle,
     translationStyle: typeof value.translationStyle === "string" ? value.translationStyle : fallback.translationStyle,
     askStyle: typeof value.askStyle === "string" ? value.askStyle : fallback.askStyle,
+    polishStyle: typeof value.polishStyle === "string" ? value.polishStyle : fallback.polishStyle,
   };
 }
 
-/** 对三种全局快捷键配置做兜底和去重保护。 */
+/** 对语音和字幕全局快捷键配置做兜底和去重保护。 */
 function normalizeShortcuts(value: unknown, fallback: ShortcutConfig): ShortcutConfig {
   const source = isShortcutConfigLike(value) ? value : fallback;
   return {
     dictate: normalizeShortcutText(source.dictate, fallback.dictate),
     translate: normalizeShortcutText(source.translate, fallback.translate),
     ask: normalizeShortcutText(source.ask, fallback.ask),
+    polish: normalizeShortcutText(source.polish, fallback.polish),
     subtitle: normalizeShortcutText(source.subtitle, fallback.subtitle),
   };
 }
@@ -1640,7 +1681,7 @@ function normalizeShortcutPart(part: string): string {
 
 /** 检查各模式是否配置了重复快捷键，避免保存后系统注册失败。 */
 function hasShortcutConflict(shortcuts: ShortcutConfig): boolean {
-  const values = [shortcuts.dictate, shortcuts.translate, shortcuts.ask, shortcuts.subtitle].map((shortcut) =>
+  const values = [shortcuts.dictate, shortcuts.translate, shortcuts.ask, shortcuts.polish, shortcuts.subtitle].map((shortcut) =>
     normalizeShortcutText(shortcut, ""),
   );
   return new Set(values).size !== values.length;
@@ -1689,12 +1730,14 @@ function readConfigFromForm(): VoiceConfig {
       dictate: normalizeShortcutText(dictateShortcutInput.value, DEFAULT_SHORTCUTS.dictate),
       translate: normalizeShortcutText(translateShortcutInput.value, DEFAULT_SHORTCUTS.translate),
       ask: normalizeShortcutText(askShortcutInput.value, DEFAULT_SHORTCUTS.ask),
+      polish: normalizeShortcutText(polishShortcutInput.value, DEFAULT_SHORTCUTS.polish),
       subtitle: normalizeShortcutText(subtitleShortcutInput.value, DEFAULT_SHORTCUTS.subtitle),
     },
     personalStyle: personalStyleInput.value.trim(),
     dictationStyle: dictationStyleInput.value.trim(),
     translationStyle: translationStyleInput.value.trim(),
     askStyle: askStyleInput.value.trim(),
+    polishStyle: polishStyleInput.value.trim(),
   };
 }
 
@@ -1836,6 +1879,7 @@ async function registerShortcutsFromConfig(config: VoiceConfig): Promise<boolean
     dictateShortcutInput.value = formatShortcutLabel(normalized.dictate);
     translateShortcutInput.value = formatShortcutLabel(normalized.translate);
     askShortcutInput.value = formatShortcutLabel(normalized.ask);
+    polishShortcutInput.value = formatShortcutLabel(normalized.polish);
     subtitleShortcutInput.value = formatShortcutLabel(normalized.subtitle);
     renderShortcutLabels(normalized);
     return true;
@@ -1856,6 +1900,7 @@ async function restoreShortcutInputsFromRuntime(): Promise<void> {
     dictateShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.dictate);
     translateShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.translate);
     askShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.ask);
+    polishShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.polish);
     subtitleShortcutInput.value = formatShortcutLabel(diagnostics.shortcuts.subtitle);
     renderShortcutLabels(diagnostics.shortcuts);
     validateShortcutInputs();
@@ -1899,10 +1944,12 @@ function renderShortcutLabels(shortcuts: ShortcutConfig): void {
   dictateShortcutText.textContent = formatShortcutLabel(shortcuts.dictate);
   translateShortcutText.textContent = formatShortcutLabel(shortcuts.translate);
   askShortcutText.textContent = formatShortcutLabel(shortcuts.ask);
+  polishShortcutText.textContent = formatShortcutLabel(shortcuts.polish);
   subtitleShortcutText.textContent = formatShortcutLabel(shortcuts.subtitle);
   homeDictateShortcutText.textContent = formatShortcutLabel(shortcuts.dictate);
   homeTranslateShortcutText.textContent = formatShortcutLabel(shortcuts.translate);
   homeAskShortcutText.textContent = formatShortcutLabel(shortcuts.ask);
+  homePolishShortcutText.textContent = formatShortcutLabel(shortcuts.polish);
   homeSubtitleShortcutText.textContent = formatShortcutLabel(shortcuts.subtitle);
   updateFloatingShortcutTitle(shortcuts);
 }
@@ -2108,13 +2155,6 @@ function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
       description: lastPermissionSnapshot.apiKeyText,
     },
     {
-      kind: "microphone",
-      label: mode === "subtitle" ? "麦克风输入" : "麦克风权限",
-      ready: microphoneReady,
-      state: mode === "subtitle" && !config.subtitleIncludeMicrophone ? "success" : lastPermissionSnapshot.microphoneState,
-      description: mode === "subtitle" && !config.subtitleIncludeMicrophone ? "已关闭" : lastPermissionSnapshot.microphoneText,
-    },
-    {
       kind: "shortcut",
       label: "快捷键权限",
       ready: lastPermissionSnapshot.shortcutReady,
@@ -2122,13 +2162,22 @@ function readModePermissions(mode: ShortcutMode): ModePermissionItem[] {
       description: readModeShortcutPermissionText(mode),
     },
   ];
-  if (mode === "dictate" || mode === "translate") {
+  if (mode !== "polish") {
+    permissions.splice(1, 0, {
+      kind: "microphone",
+      label: mode === "subtitle" ? "麦克风输入" : "麦克风权限",
+      ready: microphoneReady,
+      state: mode === "subtitle" && !config.subtitleIncludeMicrophone ? "success" : lastPermissionSnapshot.microphoneState,
+      description: mode === "subtitle" && !config.subtitleIncludeMicrophone ? "已关闭" : lastPermissionSnapshot.microphoneText,
+    });
+  }
+  if (mode === "dictate" || mode === "translate" || mode === "polish") {
     permissions.push({
       kind: "accessibility",
-      label: "自动粘贴权限",
+      label: mode === "polish" ? "读取与替换权限" : "自动粘贴权限",
       ready: lastPermissionSnapshot.accessibilityReady,
       state: lastPermissionSnapshot.accessibilityReady ? "success" : "warning",
-      description: lastPermissionSnapshot.accessibilityReady ? "已授权" : "未授权，结果会改为手动复制",
+      description: lastPermissionSnapshot.accessibilityReady ? "已授权" : "未授权，无法自动操作选中文本",
     });
   }
   if (mode === "subtitle") {
@@ -2371,6 +2420,14 @@ function readPermissionDialogCopy(
     };
   }
   if (kind === "accessibility") {
+    if (mode === "polish") {
+      return {
+        title: "设置读取与替换权限",
+        body: "润色模式需要 macOS 辅助功能权限，才能读取外部应用中的选中文本，并在 AI 润色完成后替换原选区。",
+        steps: ["在 macOS 系统设置中打开隐私与安全性。", "进入辅助功能。", "勾选 typesass，回到应用后重新触发润色。"],
+        primaryLabel: "打开辅助功能",
+      };
+    }
     return {
       title: "设置自动粘贴权限",
       body: `${SHORTCUT_MODE_LABELS[mode]}完成转写后如果要自动粘贴，需要 macOS 辅助功能权限。未授权时仍会展示结果窗口，方便手动复制。`,
@@ -2704,6 +2761,7 @@ function clearShortcutRecordingState(): void {
   dictateShortcutInput.removeAttribute("data-recording");
   translateShortcutInput.removeAttribute("data-recording");
   askShortcutInput.removeAttribute("data-recording");
+  polishShortcutInput.removeAttribute("data-recording");
   subtitleShortcutInput.removeAttribute("data-recording");
 }
 
@@ -2740,6 +2798,7 @@ function validateShortcutInputs(): boolean {
     ["dictate", shortcuts.dictate],
     ["translate", shortcuts.translate],
     ["ask", shortcuts.ask],
+    ["polish", shortcuts.polish],
     ["subtitle", shortcuts.subtitle],
   ];
   const invalidEntry = entries.find(([, shortcut]) => !isValidShortcutText(shortcut));
@@ -2831,6 +2890,9 @@ function getShortcutInput(mode: ShortcutMode): HTMLInputElement {
   }
   if (mode === "ask") {
     return askShortcutInput;
+  }
+  if (mode === "polish") {
+    return polishShortcutInput;
   }
   return dictateShortcutInput;
 }
@@ -3018,6 +3080,7 @@ async function requestSubtitleMode(): Promise<void> {
 /** 记录悬浮条本次要执行的模式，仅用于录音开始/停止时的内部状态。 */
 function setFloatingMode(mode: VoiceMode): void {
   activeMode = mode;
+  floatShell.dataset.activeMode = mode;
   updateFloatingShortcutTitle(readConfigFromForm().shortcuts);
 }
 
@@ -3038,12 +3101,17 @@ async function toggleRecording(mode: VoiceMode, targetApp = "", keepHubVisible =
     return;
   }
   activeMode = mode;
+  floatShell.dataset.activeMode = mode;
   updateFloatingShortcutTitle(readSavedConfig().shortcuts);
   await startRecording(mode, targetApp, keepHubVisible);
 }
 
 /** 请求麦克风权限并开始录音。 */
 async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = false): Promise<void> {
+  if (mode === "polish") {
+    await polishSelectedText(targetApp, keepHubVisible);
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) {
     addDiagnosticLog({
       level: "error",
@@ -3125,6 +3193,154 @@ async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = 
   } finally {
     isStartingRecording = false;
   }
+}
+
+/** 对外部 App 当前选中的文字执行 AI 润色，并用系统粘贴快捷键替换原选区。 */
+async function polishSelectedText(targetApp = "", keepHubVisible = false): Promise<void> {
+  if (isPolishingSelection || isProcessing) {
+    flashFloatingNudge();
+    setStatus("正在润色上一段文字，请稍等。", "busy");
+    return;
+  }
+  if (isRecording || isStartingRecording || isSubtitleListening || isStartingSubtitleListening) {
+    flashFloatingNudge();
+    setStatus("请先结束当前语音或字幕任务。", "busy");
+    return;
+  }
+  activeMode = "polish";
+  floatShell.dataset.activeMode = "polish";
+  updateFloatingShortcutTitle(readSavedConfig().shortcuts);
+  if (!isTauriRuntime()) {
+    setStatus("网页预览模式不能读取和替换外部选中文本。", "error");
+    return;
+  }
+  isPolishingSelection = true;
+  isProcessing = true;
+  recordButton.disabled = true;
+  cancelButton.disabled = true;
+  copyButton.disabled = true;
+  resultMeta.textContent = "润色中";
+  resultTextarea.value = "";
+  transcribeDurationText.textContent = "--";
+  processDurationText.textContent = "--";
+  audioSizeText.textContent = "--";
+  setStatus("正在读取选中文本。", "busy");
+  try {
+    const config = readSavedConfig();
+    if (!(await ensureReadyForTextPolish())) {
+      return;
+    }
+    const selection = await readSelectedText();
+    const contextApp = selection.targetApp || normalizeRecordingTargetApp(targetApp) || (await readFrontmostApp());
+    addDiagnosticLog({
+      level: "info",
+      category: "process",
+      title: "开始润色选中文本",
+      message: "已读取当前选中文本，准备发送给 AI 润色。",
+      mode: "polish",
+      targetApp: contextApp,
+      accessibilityTrusted: selection.accessibilityTrusted,
+      clipboardRestoreAttempted: true,
+      clipboardRestored: selection.clipboardRestored,
+      clipboardRestoreMessage: selection.clipboardRestoreMessage,
+      pasteMethod: selection.copyMethod,
+      details: [`原文字数：${countTextUnits(selection.text)}`, `保持Hub：${keepHubVisible ? "是" : "否"}`],
+    });
+    const processed = await processRecognizedText(selection.text, "polish", config, contextApp);
+    const outputText = processed.text.trim();
+    if (!outputText) {
+      throw new Error("AI 润色返回为空，已取消替换。");
+    }
+    resultTextarea.value = outputText;
+    resultMeta.textContent = "润色完成";
+    processDurationText.textContent = formatDuration(processed.elapsedMs);
+    const historyItem = saveHistory({
+      id: createId(),
+      mode: "polish",
+      sourceText: selection.text,
+      outputText,
+      createdAt: Date.now(),
+      recordElapsedMs: 0,
+      transcribeElapsedMs: 0,
+      processElapsedMs: processed.elapsedMs,
+      model: processed.model,
+      contextApp,
+    });
+    updateRecentResult(historyItem);
+    addDiagnosticLog({
+      level: "success",
+      category: "process",
+      title: "选中文本润色完成",
+      message: "最终输出已准备好替换原选区。",
+      mode: "polish",
+      targetApp: contextApp,
+      elapsedMs: processed.elapsedMs,
+      details: [`模型：${processed.model}`, `输出字数：${countTextUnits(outputText)}`],
+    });
+    if (keepHubVisible) {
+      showHubNotice("润色完成，结果已写入最近结果。", "success");
+      setStatus("润色完成，结果已更新到 Hub。", "ready");
+      return;
+    }
+    setStatus("正在替换选中文本。", "busy");
+    await pasteTranscription(outputText, contextApp);
+  } catch (error) {
+    const message = formatError(error);
+    addDiagnosticLog({
+      level: "error",
+      category: "process",
+      title: "润色选中文本失败",
+      message,
+      mode: "polish",
+      targetApp,
+    });
+    setStatus(message, "error");
+    if (message.includes("辅助功能")) {
+      await showHubWindow();
+      await switchHubWindowToModeDetail("polish", "accessibility");
+    }
+  } finally {
+    isPolishingSelection = false;
+    isProcessing = false;
+    recordButton.disabled = false;
+    cancelButton.disabled = false;
+    floatShell.dataset.activeMode = activeMode;
+    if (!keepHubVisible && windowMode === "main" && !isRecording) {
+      window.setTimeout(() => void hideFloatingWindow(), 1200);
+    }
+  }
+}
+
+/** 润色模式启动前检查文本替换所需权限，不要求麦克风。 */
+async function ensureReadyForTextPolish(): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return true;
+  }
+  try {
+    const diagnostics = await readRuntimeDiagnostics();
+    if (!diagnostics.hasSessionApiKey && !diagnostics.hasKeychainApiKey && !diagnostics.hasEnvApiKey) {
+      await showRequiredModePermission("polish", "apiKey", "请设置润色的 Mimo Key。");
+      return false;
+    }
+    if (!diagnostics.shortcutRegistrationReady) {
+      await showRequiredModePermission("polish", "shortcut", "请设置润色的快捷键权限。");
+      return false;
+    }
+    if (!diagnostics.accessibilityTrusted) {
+      await showRequiredModePermission("polish", "accessibility", "请设置润色的读取与替换权限。");
+      return false;
+    }
+    return true;
+  } catch (error) {
+    setStatus(`润色前检查失败：${formatError(error)}`, "error");
+    return false;
+  }
+}
+
+/** 调用桌面端命令读取当前外部应用的选中文本。 */
+async function readSelectedText(): Promise<SelectedTextResponse> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SelectedTextResponse>("read_selected_text");
 }
 
 /** 把浏览器麦克风异常转换成可行动的提示文案。 */
@@ -5065,7 +5281,7 @@ async function processRecognizedText(
   if (!isTauriRuntime()) {
     return { text, elapsedMs: 0, model: config.textModel };
   }
-  setStatus(mode === "dictate" ? "正在 AI 润色。" : `正在执行${MODE_LABELS[mode]}处理。`, "busy");
+  setStatus(mode === "dictate" || mode === "polish" ? "正在 AI 润色。" : `正在执行${MODE_LABELS[mode]}处理。`, "busy");
   const { invoke } = await import("@tauri-apps/api/core");
   const request: ProcessTextRequest = {
     apiKey: "",
@@ -5144,6 +5360,9 @@ function readModeStyle(config: VoiceConfig, mode: VoiceMode): string {
   }
   if (mode === "ask") {
     return config.askStyle.trim();
+  }
+  if (mode === "polish") {
+    return config.polishStyle.trim();
   }
   return config.dictationStyle.trim();
 }
@@ -5786,7 +6005,7 @@ function normalizeDiagnosticLogCategory(value: unknown): DiagnosticLogCategory {
 
 /** 规范化可选语音模式，非法值直接不展示。 */
 function normalizeOptionalMode(value: unknown): ShortcutMode | undefined {
-  if (value === "dictate" || value === "translate" || value === "ask" || value === "subtitle") {
+  if (value === "dictate" || value === "translate" || value === "ask" || value === "polish" || value === "subtitle") {
     return value;
   }
   return undefined;
