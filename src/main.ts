@@ -1238,6 +1238,9 @@ function bindHubEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-mode-settings]").forEach((button) => {
     button.addEventListener("click", () => switchModeSettingsView(normalizeMode(button.dataset.modeSettings)));
   });
+  document.querySelectorAll<HTMLElement>("[data-shortcut-zone]").forEach((zone) => {
+    zone.addEventListener("click", (event) => handleShortcutZoneClick(event, normalizeShortcutMode(zone.dataset.shortcutZone)));
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-history-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       historyFilter = normalizeHistoryFilter(button.dataset.historyFilter);
@@ -1251,7 +1254,7 @@ function bindHubEvents(): void {
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-shortcut-record]").forEach((button) => {
-    button.addEventListener("click", () => startShortcutRecording(normalizeShortcutMode(button.dataset.shortcutRecord)));
+    button.addEventListener("click", () => void startShortcutRecording(normalizeShortcutMode(button.dataset.shortcutRecord)));
   });
   document.querySelectorAll<HTMLButtonElement>("[data-shortcut-reset]").forEach((button) => {
     button.addEventListener("click", () => resetShortcutInput(normalizeShortcutMode(button.dataset.shortcutReset)));
@@ -1354,6 +1357,15 @@ function handleHubPermissionClick(event: MouseEvent): void {
     return;
   }
   openPermissionDialog(normalizeShortcutMode(button.dataset.permissionMode), normalizePermissionKind(button.dataset.permissionKind));
+}
+
+/** 处理模式卡片快捷键区域点击；按钮自己处理，点击文字区域则直接进入录制。 */
+function handleShortcutZoneClick(event: MouseEvent, mode: ShortcutMode): void {
+  const target = event.target;
+  if (target instanceof Element && target.closest("button")) {
+    return;
+  }
+  void startShortcutRecording(mode);
 }
 
 /** 获取指定 DOM 元素，并保留准确类型。 */
@@ -2741,9 +2753,13 @@ function formatShortcutLabel(shortcut: string): string {
     .join(" + ");
 }
 
-/** 进入某个模式的快捷键录制状态。 */
-function startShortcutRecording(mode: ShortcutMode): void {
+/** 进入某个模式的快捷键录制状态，桌面端会先临时暂停全局快捷键，避免按键被系统注册器拦截。 */
+async function startShortcutRecording(mode: ShortcutMode): Promise<void> {
   restoreShortcutRecordingSnapshot();
+  const isSuspended = await suspendShortcutsForRecording();
+  if (!isSuspended) {
+    return;
+  }
   shortcutRecordingMode = mode;
   clearShortcutRecordingState();
   const input = getShortcutInput(mode);
@@ -2755,6 +2771,22 @@ function startShortcutRecording(mode: ShortcutMode): void {
   label.dataset.recording = "true";
   setShortcutValidation("按下包含 Control、Command、Option 或 Shift 的组合键；Esc 可取消。", "busy", true);
   showHubNotice(`正在录制${SHORTCUT_MODE_LABELS[mode]}快捷键。`, "busy");
+}
+
+/** 暂停桌面端当前已注册快捷键，让 WebView 可以收到接下来这次组合键输入。 */
+async function suspendShortcutsForRecording(): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return true;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("suspend_shortcuts_for_recording");
+    return true;
+  } catch (error) {
+    showHubNotice(`进入快捷键录制失败：${formatError(error)}`, "error");
+    await registerShortcutsFromConfig(readSavedConfig());
+    return false;
+  }
 }
 
 /** 将某个模式的快捷键恢复为默认值。 */
@@ -2830,6 +2862,7 @@ function cancelShortcutRecording(): void {
   renderShortcutLabels(readConfigFromForm().shortcuts);
   validateShortcutInputs();
   showHubNotice("已取消快捷键录制。", "idle");
+  void registerShortcutsFromConfig(readSavedConfig());
 }
 
 /** 如果存在快捷键录制草稿，则恢复对应输入框的原值。 */

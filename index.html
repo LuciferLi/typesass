@@ -195,7 +195,7 @@
               </div>
               <p>录音结束后转成可直接粘贴的文字；是否等待 AI 润色在口述设置里单独控制。</p>
               <div class="modePermissionList" data-mode-permissions="dictate" aria-label="口述权限状态"></div>
-              <div class="modeCardShortcut">
+              <div class="modeCardShortcut" data-shortcut-zone="dictate">
                 <span>快捷键 <strong id="dictateShortcutText">Control + P</strong></span>
                 <div>
                   <button type="button" data-shortcut-record="dictate">录制</button>
@@ -221,7 +221,7 @@
               </div>
               <p>录音结束后先转写，再翻译到翻译设置里的目标语言。</p>
               <div class="modePermissionList" data-mode-permissions="translate" aria-label="翻译权限状态"></div>
-              <div class="modeCardShortcut">
+              <div class="modeCardShortcut" data-shortcut-zone="translate">
                 <span>快捷键 <strong id="translateShortcutText">Control + T</strong></span>
                 <div>
                   <button type="button" data-shortcut-record="translate">录制</button>
@@ -247,7 +247,7 @@
               </div>
               <p>把语音问题交给 AI 回答，结果展示在 Hub 中，不自动粘贴。</p>
               <div class="modePermissionList" data-mode-permissions="ask" aria-label="随便问权限状态"></div>
-              <div class="modeCardShortcut">
+              <div class="modeCardShortcut" data-shortcut-zone="ask">
                 <span>快捷键 <strong id="askShortcutText">Control + Space</strong></span>
                 <div>
                   <button type="button" data-shortcut-record="ask">录制</button>
@@ -273,7 +273,7 @@
               </div>
               <p>框选电脑上的一段文字，按快捷键后由 AI 优化表达，并直接替换原选中文本。</p>
               <div class="modePermissionList" data-mode-permissions="polish" aria-label="润色权限状态"></div>
-              <div class="modeCardShortcut">
+              <div class="modeCardShortcut" data-shortcut-zone="polish">
                 <span>快捷键 <strong id="polishShortcutText">Control + Shift + P</strong></span>
                 <div>
                   <button type="button" data-shortcut-record="polish">录制</button>
@@ -299,7 +299,7 @@
               </div>
               <p>持续监听音频输入，识别后在屏幕底部显示字幕，并在右上角保留历史。</p>
               <div class="modePermissionList" data-mode-permissions="subtitle" aria-label="实时字幕权限状态"></div>
-              <div class="modeCardShortcut">
+              <div class="modeCardShortcut" data-shortcut-zone="subtitle">
                 <span>快捷键 <strong id="subtitleShortcutText">Control + Shift + S</strong></span>
                 <div>
                   <button type="button" data-shortcut-record="subtitle">录制</button>

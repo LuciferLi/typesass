@@ -563,6 +563,7 @@ pub fn run() {
             toggle_subtitle_mode,
             get_last_result_window_payload,
             register_shortcuts,
+            suspend_shortcuts_for_recording,
             get_runtime_diagnostics,
             open_accessibility_settings,
             open_microphone_settings,
@@ -929,6 +930,12 @@ fn register_shortcuts(
     }
 }
 
+/// 进入快捷键录制态前临时注销全局快捷键，避免当前快捷键拦截 WebView 的按键回显。
+#[tauri::command]
+fn suspend_shortcuts_for_recording(app: tauri::AppHandle) -> Result<(), String> {
+    suspend_shortcut_profile(&app)
+}
+
 /// 读取当前桌面端能力状态，供设置页展示真实诊断结果。
 #[tauri::command]
 fn get_runtime_diagnostics(
@@ -1062,12 +1069,28 @@ fn register_shortcut_profile(
     Ok(())
 }
 
+/// 注销当前全局快捷键；仅用于前端录制新快捷键的短暂窗口。
+#[cfg(desktop)]
+fn suspend_shortcut_profile(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|error| format!("暂停快捷键失败：{}", error))
+}
+
 /// 非桌面环境不注册系统级快捷键。
 #[cfg(not(desktop))]
 fn register_shortcut_profile(
     _app: &tauri::AppHandle,
     _profile: &ShortcutProfile,
 ) -> Result<(), String> {
+    Ok(())
+}
+
+/// 非桌面环境没有系统级快捷键需要暂停。
+#[cfg(not(desktop))]
+fn suspend_shortcut_profile(_app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
