@@ -677,6 +677,8 @@ const microphoneSelect = getElement<HTMLSelectElement>("microphoneSelect");
 const systemAudioSelect = getElement<HTMLSelectElement>("systemAudioSelect");
 const subtitleIncludeMicrophoneInput = getElement<HTMLInputElement>("subtitleIncludeMicrophoneInput");
 const subtitleTargetAppsSelect = getElement<HTMLSelectElement>("subtitleTargetAppsSelect");
+const subtitleTargetAppsSummary = getElement<HTMLElement>("subtitleTargetAppsSummary");
+const openSubtitleAppsDialogButton = getElement<HTMLButtonElement>("openSubtitleAppsDialogButton");
 const refreshSubtitleAppsButton = getElement<HTMLButtonElement>("refreshSubtitleAppsButton");
 const refreshMicrophonesButton = getElement<HTMLButtonElement>("refreshMicrophonesButton");
 const interactionSoundsInput = getElement<HTMLInputElement>("interactionSoundsInput");
@@ -765,6 +767,11 @@ const permissionDialogSteps = getElement<HTMLOListElement>("permissionDialogStep
 const permissionDialogPrimaryButton = getElement<HTMLButtonElement>("permissionDialogPrimaryButton");
 const permissionDialogSecondaryButton = getElement<HTMLButtonElement>("permissionDialogSecondaryButton");
 const permissionDialogCloseButton = getElement<HTMLButtonElement>("permissionDialogCloseButton");
+const subtitleAppsDialog = getElement<HTMLElement>("subtitleAppsDialog");
+const subtitleAppsDialogList = getElement<HTMLElement>("subtitleAppsDialogList");
+const subtitleAppsDialogCloseButton = getElement<HTMLButtonElement>("subtitleAppsDialogCloseButton");
+const subtitleAppsDialogCancelButton = getElement<HTMLButtonElement>("subtitleAppsDialogCancelButton");
+const subtitleAppsDialogConfirmButton = getElement<HTMLButtonElement>("subtitleAppsDialogConfirmButton");
 const subtitleBubble = getElement<HTMLElement>("subtitleBubble");
 const subtitleText = getElement<HTMLElement>("subtitleText");
 const subtitleHistoryStatus = getElement<HTMLElement>("subtitleHistoryStatus");
@@ -810,6 +817,8 @@ let isRefreshingDiagnostics = false;
 let configAutoSaveHandle: number | null = null;
 let isConfigAutoSaving = false;
 let activePermissionDialog: { mode: ShortcutMode; kind: PermissionKind } | null = null;
+let subtitleAudioAppsCache: ProcessTapAudioApp[] = [];
+let subtitleAppsDraftTargets: string[] = ["active"];
 let lastPermissionSnapshot: RuntimePermissionSnapshot = createDefaultPermissionSnapshot();
 let subtitleMicStream: MediaStream | null = null;
 let subtitleSystemStream: MediaStream | null = null;
@@ -1287,6 +1296,7 @@ function bindHubEvents(): void {
   retryHubResultButton.addEventListener("click", () => void retryLatestHistory());
   authorizeMicrophoneButton.addEventListener("click", () => void authorizeMicrophoneAccess());
   refreshMicrophonesButton.addEventListener("click", () => void populateMicrophones());
+  openSubtitleAppsDialogButton.addEventListener("click", () => void openSubtitleAppsDialog());
   refreshSubtitleAppsButton.addEventListener("click", () => void populateSubtitleTargetApps(true));
   importDictionaryButton.addEventListener("click", () => dictionaryImportInput.click());
   exportDictionaryButton.addEventListener("click", exportDictionaryCsv);
@@ -1300,6 +1310,14 @@ function bindHubEvents(): void {
   permissionDialog.addEventListener("click", (event) => {
     if (event.target === permissionDialog) {
       closePermissionDialog();
+    }
+  });
+  subtitleAppsDialogCloseButton.addEventListener("click", closeSubtitleAppsDialog);
+  subtitleAppsDialogCancelButton.addEventListener("click", closeSubtitleAppsDialog);
+  subtitleAppsDialogConfirmButton.addEventListener("click", confirmSubtitleAppsDialog);
+  subtitleAppsDialog.addEventListener("click", (event) => {
+    if (event.target === subtitleAppsDialog) {
+      closeSubtitleAppsDialog();
     }
   });
   dictionaryImportInput.addEventListener("change", () => void importDictionaryCsv());
@@ -1578,6 +1596,132 @@ function setSubtitleTargetAppsValue(targets: string[]): void {
   Array.from(subtitleTargetAppsSelect.options).forEach((option) => {
     option.selected = normalizedTargets.includes(option.value);
   });
+  renderSubtitleTargetAppsSummary();
+}
+
+/** 生成实时字幕 App 的友好名称，避免直接暴露 Unknown、PID 和 bundleId 为主要信息。 */
+function formatSubtitleAudioAppName(app: ProcessTapAudioApp): string {
+  const trimmedName = app.name.trim();
+  if (!trimmedName || /^unknown\b/i.test(trimmedName)) {
+    return `未命名音频进程 ${app.pid}`;
+  }
+  return trimmedName;
+}
+
+/** 读取某个已保存采集目标的展示名称，列表未刷新时保留可识别的兜底文案。 */
+function readSubtitleTargetLabel(target: string): string {
+  if (target === "active") {
+    return "自动选择正在发声的 App";
+  }
+  const app = subtitleAudioAppsCache.find((item) => String(item.pid) === target);
+  if (app) {
+    return formatSubtitleAudioAppName(app);
+  }
+  const option = Array.from(subtitleTargetAppsSelect.options).find((item) => item.value === target);
+  return option?.textContent?.trim() || `已保存 App ${target}`;
+}
+
+/** 刷新实时字幕设置行的已选 App 摘要。 */
+function renderSubtitleTargetAppsSummary(): void {
+  const targets = readSelectedSubtitleTargetApps();
+  const labels = targets.map(readSubtitleTargetLabel);
+  subtitleTargetAppsSummary.textContent = labels.join("、");
+  subtitleTargetAppsSummary.title = labels.join("、");
+}
+
+/** 打开实时字幕 App 选择弹窗，并按当前配置回显勾选状态。 */
+async function openSubtitleAppsDialog(): Promise<void> {
+  subtitleAppsDraftTargets = readSelectedSubtitleTargetApps();
+  subtitleAppsDialog.dataset.open = "true";
+  renderSubtitleAppsDialogList();
+  openSubtitleAppsDialogButton.blur();
+  if (!subtitleAudioAppsCache.length) {
+    await populateSubtitleTargetApps(false);
+    subtitleAppsDraftTargets = readSelectedSubtitleTargetApps();
+    renderSubtitleAppsDialogList();
+  }
+  subtitleAppsDialogConfirmButton.focus();
+}
+
+/** 关闭实时字幕 App 选择弹窗并丢弃未确认的勾选改动。 */
+function closeSubtitleAppsDialog(): void {
+  subtitleAppsDialog.dataset.open = "false";
+  subtitleAppsDraftTargets = readSelectedSubtitleTargetApps();
+}
+
+/** 切换弹窗里的临时 App 选择，自动模式与手动 App 模式保持互斥。 */
+function toggleSubtitleAppsDraftTarget(target: string, checked: boolean): void {
+  const currentTargets = new Set(subtitleAppsDraftTargets);
+  if (target === "active") {
+    subtitleAppsDraftTargets = checked ? ["active"] : [];
+    renderSubtitleAppsDialogList();
+    return;
+  }
+  currentTargets.delete("active");
+  if (checked) {
+    currentTargets.add(target);
+  } else {
+    currentTargets.delete(target);
+  }
+  subtitleAppsDraftTargets = Array.from(currentTargets);
+  renderSubtitleAppsDialogList();
+}
+
+/** 创建实时字幕 App 弹窗中的单个勾选项。 */
+function createSubtitleAppOption(target: string, title: string, description: string, checked: boolean): HTMLLabelElement {
+  const item = document.createElement("label");
+  item.className = "subtitleAppOption";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.value = target;
+  input.checked = checked;
+  input.addEventListener("change", () => toggleSubtitleAppsDraftTarget(target, input.checked));
+  const text = document.createElement("span");
+  const strong = document.createElement("strong");
+  strong.textContent = title;
+  const small = document.createElement("small");
+  small.textContent = description;
+  text.append(strong, small);
+  item.append(input, text);
+  return item;
+}
+
+/** 渲染实时字幕 App 选择弹窗列表。 */
+function renderSubtitleAppsDialogList(): void {
+  subtitleAppsDialogList.innerHTML = "";
+  const normalizedDraftTargets = normalizeSubtitleTargetApps(subtitleAppsDraftTargets, ["active"]);
+  subtitleAppsDialogList.appendChild(
+    createSubtitleAppOption(
+      "active",
+      "自动选择正在发声的 App",
+      "适合临时切换播放来源，系统会优先采集当前有声音的进程。",
+      normalizedDraftTargets.includes("active"),
+    ),
+  );
+  const apps = subtitleAudioAppsCache
+    .filter((app) => app.pid > 0)
+    .sort((left, right) => Number(right.audioActive) - Number(left.audioActive) || formatSubtitleAudioAppName(left).localeCompare(formatSubtitleAudioAppName(right)));
+  apps.forEach((app) => {
+    const target = String(app.pid);
+    const descriptionParts = [app.audioActive ? "正在发声" : "当前静音", app.bundleId || `PID ${app.pid}`];
+    subtitleAppsDialogList.appendChild(
+      createSubtitleAppOption(target, formatSubtitleAudioAppName(app), descriptionParts.join(" · "), normalizedDraftTargets.includes(target)),
+    );
+  });
+  normalizedDraftTargets
+    .filter((target) => target !== "active" && !apps.some((app) => String(app.pid) === target))
+    .forEach((target) => {
+      subtitleAppsDialogList.appendChild(createSubtitleAppOption(target, `已保存 App ${target}`, "当前未在可采集列表中，确认后仍会保留。", true));
+    });
+}
+
+/** 确认实时字幕 App 选择，回填隐藏配置控件并立即保存。 */
+function confirmSubtitleAppsDialog(): void {
+  const targets = normalizeSubtitleTargetApps(subtitleAppsDraftTargets, ["active"]);
+  const normalizedTargets = targets.includes("active") ? ["active"] : targets;
+  setSubtitleTargetAppsValue(normalizedTargets);
+  closeSubtitleAppsDialog();
+  scheduleConfigAutoSave("实时字幕采集 App 已自动生效。", 0);
 }
 
 /** 读取本地保存的非敏感语音配置。 */
@@ -3069,26 +3213,31 @@ async function populateSubtitleTargetApps(showNotice = false): Promise<void> {
   const desiredTargets = selectedTargets.length ? selectedTargets : config.subtitleTargetApps;
   subtitleTargetAppsSelect.innerHTML = '<option value="active">自动选择正在发声的 App</option>';
   if (!isTauriRuntime()) {
+    subtitleAudioAppsCache = [];
     setSubtitleTargetAppsValue(desiredTargets);
+    renderSubtitleAppsDialogList();
     return;
   }
   try {
     const apps = await listProcessTapAudioApps();
+    subtitleAudioAppsCache = apps.filter((app) => app.pid > 0);
     apps
       .filter((app) => app.pid > 0 && app.name.trim())
       .sort((left, right) => Number(right.audioActive) - Number(left.audioActive) || left.name.localeCompare(right.name))
       .forEach((app) => {
         const option = document.createElement("option");
         option.value = String(app.pid);
-        option.textContent = `${app.audioActive ? "正在发声 · " : ""}${app.name}${app.bundleId ? ` · ${app.bundleId}` : ""}`;
+        option.textContent = `${app.audioActive ? "正在发声 · " : ""}${formatSubtitleAudioAppName(app)}${app.bundleId ? ` · ${app.bundleId}` : ""}`;
         subtitleTargetAppsSelect.appendChild(option);
       });
     setSubtitleTargetAppsValue(desiredTargets);
+    renderSubtitleAppsDialogList();
     if (showNotice) {
       showHubNotice(`已刷新 ${apps.length} 个音频 App。`, "success");
     }
   } catch (error) {
     setSubtitleTargetAppsValue(desiredTargets);
+    renderSubtitleAppsDialogList();
     if (showNotice) {
       showHubNotice(`刷新可采集 App 失败：${formatError(error)}`, "error");
     }

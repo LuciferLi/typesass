@@ -605,15 +605,16 @@
                 <span>同时采集麦克风</span>
                 <input id="subtitleIncludeMicrophoneInput" type="checkbox" />
               </label>
-              <label class="settingsRow">
+              <div class="settingsRow">
                 <span>采集 App</span>
-                <div class="inlineControl">
-                  <select id="subtitleTargetAppsSelect" class="multiSelect" multiple size="5">
+                <div class="subtitleAppPickerControl">
+                  <select id="subtitleTargetAppsSelect" class="multiSelect" multiple size="5" hidden aria-hidden="true">
                     <option value="active">自动选择正在发声的 App</option>
                   </select>
-                  <button id="refreshSubtitleAppsButton" type="button">刷新</button>
+                  <div id="subtitleTargetAppsSummary" class="subtitleAppSummary">自动选择正在发声的 App</div>
+                  <button id="openSubtitleAppsDialogButton" type="button">修改</button>
                 </div>
-              </label>
+              </div>
               <label class="settingsRow">
                 <span>系统声音方式</span>
                 <select id="subtitleSystemAudioMirrorSelect" data-mirror-control="systemAudioSelect" disabled>
@@ -766,6 +767,27 @@
             <span>打开设置</span>
           </button>
           <button id="permissionDialogSecondaryButton" class="plainButton" type="button">稍后处理</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="subtitleAppsDialog" class="permissionDialog" data-open="false" role="dialog" aria-modal="true" aria-labelledby="subtitleAppsDialogTitle" aria-describedby="subtitleAppsDialogBody">
+      <section class="permissionDialogCard subtitleAppsDialogCard">
+        <header>
+          <div>
+            <div class="permissionDialogEyebrow">实时字幕音频来源</div>
+            <h1 id="subtitleAppsDialogTitle">选择采集 App</h1>
+          </div>
+          <button id="subtitleAppsDialogCloseButton" class="smallIconButton" type="button" aria-label="关闭采集 App 选择" title="关闭">
+            <span data-icon="close" aria-hidden="true"></span>
+          </button>
+        </header>
+        <p id="subtitleAppsDialogBody">勾选需要混合采集的 App。确认后会立即生效。</p>
+        <div id="subtitleAppsDialogList" class="subtitleAppsDialogList" aria-label="可采集 App 列表"></div>
+        <div class="permissionDialogActions">
+          <button id="refreshSubtitleAppsButton" class="plainButton" type="button">刷新列表</button>
+          <button id="subtitleAppsDialogCancelButton" class="plainButton" type="button">取消</button>
+          <button id="subtitleAppsDialogConfirmButton" class="primaryAction" type="button">确定</button>
         </div>
       </section>
     </div>

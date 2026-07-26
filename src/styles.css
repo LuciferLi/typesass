@@ -1942,6 +1942,50 @@ textarea::placeholder {
   padding: 6px 8px;
 }
 
+.subtitleAppPickerControl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px;
+  align-items: center;
+  gap: 8px;
+}
+
+.subtitleAppSummary {
+  min-height: 38px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radiusControl);
+  padding: 9px 11px;
+  color: #e8e8ee;
+  background: #151519;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitleAppPickerControl button {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: var(--radiusControl);
+  padding: 0 12px;
+  color: #f4f4f5;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 760;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    transform 150ms ease;
+}
+
+.subtitleAppPickerControl button:hover {
+  border-color: rgba(45, 212, 191, 0.38);
+  background: rgba(45, 212, 191, 0.11);
+  transform: translateY(-1px);
+}
+
 .apiKeyControl {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 92px;
@@ -2203,6 +2247,72 @@ textarea::placeholder {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 18px;
+}
+
+.subtitleAppsDialogCard {
+  width: min(560px, 100%);
+}
+
+.subtitleAppsDialogList {
+  display: grid;
+  gap: 8px;
+  max-height: min(380px, 52vh);
+  margin-top: 14px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.subtitleAppOption {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--lineSoft);
+  border-radius: var(--radiusControl);
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.035);
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease;
+}
+
+.subtitleAppOption:hover {
+  border-color: rgba(45, 212, 191, 0.32);
+  background: rgba(45, 212, 191, 0.08);
+}
+
+.subtitleAppOption input {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: #2dd4bf;
+}
+
+.subtitleAppOption span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.subtitleAppOption strong {
+  overflow: hidden;
+  color: #f4f4f5;
+  font-size: 13px;
+  font-weight: 780;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitleAppOption small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settingsBlock {
