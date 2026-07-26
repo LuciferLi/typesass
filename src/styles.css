@@ -936,6 +936,7 @@ body[data-window-mode="toast"] .floatShell {
 .inlineForm button,
 .inlineControl button,
 .shortcutEditorGrid button,
+.modeShortcutEditor button,
 .primaryAction {
   display: inline-flex;
   min-height: 32px;
@@ -968,7 +969,8 @@ body[data-window-mode="toast"] .floatShell {
 .plainButton,
 .rowActions button,
 .inlineControl button,
-.shortcutEditorGrid button {
+.shortcutEditorGrid button,
+.modeShortcutEditor button {
   border: 1px solid transparent;
   color: #d4d4d8;
   background: transparent;
@@ -979,7 +981,8 @@ body[data-window-mode="toast"] .floatShell {
 .plainButton:hover,
 .rowActions button:hover,
 .inlineControl button:hover,
-.shortcutEditorGrid button:hover {
+.shortcutEditorGrid button:hover,
+.modeShortcutEditor button:hover {
   color: #ffffff;
   background: var(--surfaceHover);
 }
@@ -1006,7 +1009,8 @@ button:disabled,
 .rowActions button:disabled,
 .plainButton:disabled,
 .inlineForm button:disabled,
-.shortcutEditorGrid button:disabled {
+.shortcutEditorGrid button:disabled,
+.modeShortcutEditor button:disabled {
   cursor: not-allowed;
   opacity: 0.42;
   transform: none;
@@ -1115,6 +1119,7 @@ button[data-confirming="true"] {
 .historyMeta,
 .settingsRow > span,
 .shortcutEditorGrid label span,
+.modeShortcutEditor .shortcutCard > span,
 .wideLabel span,
 .diagnosticCard span {
   color: var(--muted);
@@ -1845,7 +1850,8 @@ textarea::placeholder {
 .searchInput,
 .settingsRows input,
 .settingsRows select,
-.shortcutEditorGrid input {
+.shortcutEditorGrid input,
+.modeShortcutEditor input {
   width: 100%;
   height: 38px;
   border: 1px solid var(--line);
@@ -1896,7 +1902,8 @@ textarea::placeholder {
   transform: translateY(-1px);
 }
 
-.shortcutEditorGrid input[data-recording="true"] {
+.shortcutEditorGrid input[data-recording="true"],
+.modeShortcutEditor input[data-recording="true"] {
   border-color: rgba(139, 92, 246, 0.72);
   color: #ffffff;
   background: rgba(139, 92, 246, 0.12);
@@ -1907,6 +1914,7 @@ textarea::placeholder {
 .settingsRows input:focus,
 .settingsRows select:focus,
 .shortcutEditorGrid input:focus,
+.modeShortcutEditor input:focus,
 #hubResultTextarea:focus,
 .wideLabel textarea:focus {
   border-color: rgba(139, 92, 246, 0.76);
@@ -2181,6 +2189,28 @@ textarea::placeholder {
 
 .shortcutEditorGrid label span {
   grid-column: 1 / -1;
+}
+
+.modeShortcutEditor {
+  display: grid;
+  gap: 10px;
+  padding: 0 20px 16px;
+}
+
+.modeShortcutEditor .shortcutCard {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.modeShortcutEditor .shortcutCard > span {
+  grid-column: 1 / -1;
+}
+
+.modeShortcutEditor button {
+  border: 1px solid var(--line);
+  background: var(--surfaceSoft);
 }
 
 .shortcutValidationText {
@@ -2752,6 +2782,10 @@ textarea::placeholder {
   }
 
   .shortcutEditorGrid label {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+
+  .modeShortcutEditor .shortcutCard {
     grid-template-columns: minmax(0, 1fr) auto auto;
   }
 

@@ -57,10 +57,6 @@
             <span class="navIcon" data-icon="voice" aria-hidden="true"></span>
             <span>语音模式</span>
           </button>
-          <button class="hubNavButton" type="button" data-view-target="shortcuts">
-            <span class="navIcon" data-icon="keyboard" aria-hidden="true"></span>
-            <span>快捷键</span>
-          </button>
           <button class="hubNavButton" type="button" data-view-target="history">
             <span class="navIcon" data-icon="history" aria-hidden="true"></span>
             <span>历史记录</span>
@@ -96,10 +92,6 @@
             <div class="runtimePill" id="systemStateText">本机运行中</div>
             <button id="refreshStatusButton" class="smallIconButton" type="button" title="刷新状态" aria-label="刷新状态">
               <span data-icon="refresh" aria-hidden="true"></span>
-            </button>
-            <button id="quickStartButton" class="toolbarPrimary" type="button">
-              <span class="buttonIcon" data-icon="play" aria-hidden="true"></span>
-              <span data-action-label>开始口述</span>
             </button>
           </div>
         </header>
@@ -163,7 +155,7 @@
                   <div class="sectionTitle">快捷键动作</div>
                   <p class="sectionHint">短按一次开始录音，再短按一次停止并处理。</p>
                 </div>
-                <button class="plainButton" type="button" data-view-jump="shortcuts">编辑</button>
+                <button class="plainButton" type="button" data-view-jump="modes">编辑</button>
               </div>
               <div class="shortcutHealthRows">
                 <span>口述 <strong id="homeDictateShortcutText">Control + P</strong></span>
@@ -306,53 +298,6 @@
           </div>
         </section>
 
-        <section id="shortcutsView" class="hubView" data-view="shortcuts">
-          <section class="settingsBlock shortcutLead">
-            <div>
-              <div class="sectionTitle">全局快捷键</div>
-              <p class="sectionHint">点击录制后按下新的组合键，保存后会重新注册到系统。</p>
-            </div>
-            <button id="saveShortcutButton" class="primaryAction" type="button">
-              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
-              <span>保存快捷键</span>
-            </button>
-          </section>
-
-          <div class="shortcutEditorGrid">
-            <label class="shortcutCard">
-              <span>口述</span>
-              <input id="dictateShortcutInput" type="text" readonly />
-              <button type="button" data-shortcut-record="dictate">录制</button>
-              <button type="button" data-shortcut-reset="dictate">默认</button>
-            </label>
-            <label class="shortcutCard">
-              <span>翻译</span>
-              <input id="translateShortcutInput" type="text" readonly />
-              <button type="button" data-shortcut-record="translate">录制</button>
-              <button type="button" data-shortcut-reset="translate">默认</button>
-            </label>
-            <label class="shortcutCard">
-              <span>随便问</span>
-              <input id="askShortcutInput" type="text" readonly />
-              <button type="button" data-shortcut-record="ask">录制</button>
-              <button type="button" data-shortcut-reset="ask">默认</button>
-            </label>
-            <label class="shortcutCard">
-              <span>润色</span>
-              <input id="polishShortcutInput" type="text" readonly />
-              <button type="button" data-shortcut-record="polish">录制</button>
-              <button type="button" data-shortcut-reset="polish">默认</button>
-            </label>
-            <label class="shortcutCard">
-              <span>实时字幕</span>
-              <input id="subtitleShortcutInput" type="text" readonly />
-              <button type="button" data-shortcut-record="subtitle">录制</button>
-              <button type="button" data-shortcut-reset="subtitle">默认</button>
-            </label>
-          </div>
-          <div id="shortcutValidationText" class="shortcutValidationText" data-state="success">快捷键没有冲突。</div>
-        </section>
-
         <section id="historyView" class="hubView" data-view="history">
           <div class="toolbarLine">
             <div class="segmentedControl" role="tablist">
@@ -419,6 +364,19 @@
           </div>
 
           <div class="settingsSection">
+            <div class="settingsSectionTitle">口述快捷键</div>
+            <div class="modeShortcutEditor">
+              <label class="shortcutCard">
+                <span>启动和结束口述</span>
+                <input id="dictateShortcutInput" type="text" readonly />
+                <button type="button" data-shortcut-record="dictate">录制</button>
+                <button type="button" data-shortcut-reset="dictate">默认</button>
+              </label>
+              <div class="shortcutValidationText" data-shortcut-validation data-state="success">快捷键没有冲突。</div>
+            </div>
+          </div>
+
+          <div class="settingsSection">
             <div class="settingsSectionTitle">口述处理</div>
             <div class="settingsRows">
               <label class="settingsRow switchRow">
@@ -456,12 +414,6 @@
             </label>
           </div>
 
-          <div class="settingsActions">
-            <button class="primaryAction" type="button" data-save-config>
-              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
-              <span>保存口述设置</span>
-            </button>
-          </div>
         </section>
 
         <section id="translateSettingsView" class="hubView" data-view="translateSettings">
@@ -476,6 +428,19 @@
           <div class="settingsSection">
             <div class="settingsSectionTitle">翻译权限</div>
             <div class="modePermissionList isDetail" data-mode-permissions="translate" aria-label="翻译权限详情"></div>
+          </div>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">翻译快捷键</div>
+            <div class="modeShortcutEditor">
+              <label class="shortcutCard">
+                <span>启动和结束翻译</span>
+                <input id="translateShortcutInput" type="text" readonly />
+                <button type="button" data-shortcut-record="translate">录制</button>
+                <button type="button" data-shortcut-reset="translate">默认</button>
+              </label>
+              <div class="shortcutValidationText" data-shortcut-validation data-state="success">快捷键没有冲突。</div>
+            </div>
           </div>
 
           <div class="settingsSection">
@@ -511,12 +476,6 @@
             </label>
           </div>
 
-          <div class="settingsActions">
-            <button class="primaryAction" type="button" data-save-config>
-              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
-              <span>保存翻译设置</span>
-            </button>
-          </div>
         </section>
 
         <section id="askSettingsView" class="hubView" data-view="askSettings">
@@ -533,6 +492,19 @@
             <div class="modePermissionList isDetail" data-mode-permissions="ask" aria-label="随便问权限详情"></div>
           </div>
 
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">随便问快捷键</div>
+            <div class="modeShortcutEditor">
+              <label class="shortcutCard">
+                <span>启动和结束提问</span>
+                <input id="askShortcutInput" type="text" readonly />
+                <button type="button" data-shortcut-record="ask">录制</button>
+                <button type="button" data-shortcut-reset="ask">默认</button>
+              </label>
+              <div class="shortcutValidationText" data-shortcut-validation data-state="success">快捷键没有冲突。</div>
+            </div>
+          </div>
+
           <div class="settingsBlock">
             <label class="wideLabel">
               <span>回答偏好</span>
@@ -540,12 +512,6 @@
             </label>
           </div>
 
-          <div class="settingsActions">
-            <button class="primaryAction" type="button" data-save-config>
-              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
-              <span>保存随便问设置</span>
-            </button>
-          </div>
         </section>
 
         <section id="polishSettingsView" class="hubView" data-view="polishSettings">
@@ -562,6 +528,19 @@
             <div class="modePermissionList isDetail" data-mode-permissions="polish" aria-label="润色权限详情"></div>
           </div>
 
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">润色快捷键</div>
+            <div class="modeShortcutEditor">
+              <label class="shortcutCard">
+                <span>润色选中文本</span>
+                <input id="polishShortcutInput" type="text" readonly />
+                <button type="button" data-shortcut-record="polish">录制</button>
+                <button type="button" data-shortcut-reset="polish">默认</button>
+              </label>
+              <div class="shortcutValidationText" data-shortcut-validation data-state="success">快捷键没有冲突。</div>
+            </div>
+          </div>
+
           <div class="settingsBlock">
             <label class="wideLabel">
               <span>润色偏好</span>
@@ -569,12 +548,6 @@
             </label>
           </div>
 
-          <div class="settingsActions">
-            <button class="primaryAction" type="button" data-save-config>
-              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
-              <span>保存润色设置</span>
-            </button>
-          </div>
         </section>
 
         <section id="subtitleSettingsView" class="hubView" data-view="subtitleSettings">
@@ -589,6 +562,19 @@
           <div class="settingsSection">
             <div class="settingsSectionTitle">实时字幕权限</div>
             <div class="modePermissionList isDetail" data-mode-permissions="subtitle" aria-label="实时字幕权限详情"></div>
+          </div>
+
+          <div class="settingsSection">
+            <div class="settingsSectionTitle">实时字幕快捷键</div>
+            <div class="modeShortcutEditor">
+              <label class="shortcutCard">
+                <span>开启和关闭字幕</span>
+                <input id="subtitleShortcutInput" type="text" readonly />
+                <button type="button" data-shortcut-record="subtitle">录制</button>
+                <button type="button" data-shortcut-reset="subtitle">默认</button>
+              </label>
+              <div class="shortcutValidationText" data-shortcut-validation data-state="success">快捷键没有冲突。</div>
+            </div>
           </div>
 
           <div class="settingsSection">
@@ -734,10 +720,6 @@
           </div>
 
           <div class="settingsActions">
-            <button id="saveConfigButton" class="primaryAction" type="button" data-save-config>
-              <span class="buttonIcon" data-icon="check" aria-hidden="true"></span>
-              <span>保存设置</span>
-            </button>
             <button id="clearConfigButton" class="plainButton" type="button">恢复默认</button>
           </div>
         </section>

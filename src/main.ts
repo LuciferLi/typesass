@@ -97,7 +97,7 @@ type DiagnosticLogCategory = "recording" | "transcribe" | "process" | "paste" | 
 type SubtitleAudioSource = "microphone" | "system" | "mixed";
 type SubtitleOverlayState = "hidden" | "listening" | "text" | "error";
 type IconName = keyof typeof ICON_RENDERERS;
-type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "start" | "refresh";
+type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "modes" | "start" | "refresh";
 type PermissionKind = "apiKey" | "microphone" | "accessibility" | "shortcut" | "systemAudio";
 
 interface PendingConfirmation {
@@ -615,13 +615,6 @@ const DIAGNOSTIC_LOG_CATEGORY_LABELS: Record<DiagnosticLogCategory, string> = {
   system: "系统",
 };
 
-const MODE_SETTINGS_VIEWS: Record<VoiceMode, string> = {
-  dictate: "dictateSettings",
-  translate: "translateSettings",
-  ask: "askSettings",
-  polish: "polishSettings",
-};
-
 const MODE_DETAIL_VIEWS: Record<ShortcutMode, string> = {
   dictate: "dictateSettings",
   translate: "translateSettings",
@@ -638,7 +631,6 @@ const VIEW_TITLES: Record<string, { eyebrow: string; title: string }> = {
   askSettings: { eyebrow: "只影响随便问", title: "随便问设置" },
   polishSettings: { eyebrow: "只影响润色", title: "润色设置" },
   subtitleSettings: { eyebrow: "只影响实时字幕", title: "实时字幕设置" },
-  shortcuts: { eyebrow: "按一次开始，再按一次结束", title: "快捷键" },
   history: { eyebrow: "只保存在本机", title: "历史记录" },
   dictionary: { eyebrow: "专有名词更准确", title: "词典" },
   diagnosticsLog: { eyebrow: "定位自动粘贴问题", title: "诊断日志" },
@@ -694,7 +686,7 @@ const translateShortcutInput = getElement<HTMLInputElement>("translateShortcutIn
 const askShortcutInput = getElement<HTMLInputElement>("askShortcutInput");
 const polishShortcutInput = getElement<HTMLInputElement>("polishShortcutInput");
 const subtitleShortcutInput = getElement<HTMLInputElement>("subtitleShortcutInput");
-const shortcutValidationText = getElement<HTMLElement>("shortcutValidationText");
+const shortcutValidationTexts = Array.from(document.querySelectorAll<HTMLElement>("[data-shortcut-validation]"));
 const dictateShortcutText = getElement<HTMLElement>("dictateShortcutText");
 const translateShortcutText = getElement<HTMLElement>("translateShortcutText");
 const askShortcutText = getElement<HTMLElement>("askShortcutText");
@@ -705,9 +697,8 @@ const homeTranslateShortcutText = getElement<HTMLElement>("homeTranslateShortcut
 const homeAskShortcutText = getElement<HTMLElement>("homeAskShortcutText");
 const homePolishShortcutText = getElement<HTMLElement>("homePolishShortcutText");
 const homeSubtitleShortcutText = getElement<HTMLElement>("homeSubtitleShortcutText");
-const saveShortcutButton = getElement<HTMLButtonElement>("saveShortcutButton");
 const clearConfigButton = getElement<HTMLButtonElement>("clearConfigButton");
-const quickStartButton = getElement<HTMLButtonElement>("quickStartButton");
+const quickStartButton = document.getElementById("quickStartButton") as HTMLButtonElement | null;
 const refreshStatusButton = getElement<HTMLButtonElement>("refreshStatusButton");
 const hubTitle = getElement<HTMLElement>("hubTitle");
 const hubEyebrow = getElement<HTMLElement>("hubEyebrow");
@@ -809,6 +800,8 @@ let shortcutRecordingSnapshot: ShortcutRecordingSnapshot | null = null;
 let accessibilityWatchHandle: number | null = null;
 let hubDiagnosticsRefreshHandle: number | null = null;
 let isRefreshingDiagnostics = false;
+let configAutoSaveHandle: number | null = null;
+let isConfigAutoSaving = false;
 let activePermissionDialog: { mode: ShortcutMode; kind: PermissionKind } | null = null;
 let lastPermissionSnapshot: RuntimePermissionSnapshot = createDefaultPermissionSnapshot();
 let subtitleMicStream: MediaStream | null = null;
@@ -1272,13 +1265,9 @@ function bindHubEvents(): void {
     );
   });
   hubShell.addEventListener("click", handleHubPermissionClick);
-  quickStartButton.addEventListener("click", () => void requestFloatingMode("dictate"));
-  postProcessDictationInput.addEventListener("change", () => setDictationPolishEnabled(postProcessDictationInput.checked));
+  quickStartButton?.addEventListener("click", () => void requestFloatingMode("dictate"));
+  bindConfigAutoSaveEvents();
   refreshStatusButton.addEventListener("click", () => void refreshHubRuntimeState());
-  document.querySelectorAll<HTMLButtonElement>("[data-save-config]").forEach((button) => {
-    button.addEventListener("click", () => void saveConfigFromForm());
-  });
-  saveShortcutButton.addEventListener("click", () => void saveConfigFromForm("快捷键已保存并重新生效。"));
   clearConfigButton.addEventListener("click", () => clearSavedConfig(clearConfigButton));
   clearApiKeyButton.addEventListener("click", () => void clearSavedApiKey());
   clearHistoryButton.addEventListener("click", () => clearHistory(clearHistoryButton));
@@ -1309,6 +1298,49 @@ function bindHubEvents(): void {
   historyList.addEventListener("click", handleHistoryAction);
   dictionaryList.addEventListener("click", handleDictionaryAction);
   window.addEventListener("keydown", captureShortcutKeys, true);
+}
+
+/** 绑定设置控件的即时生效逻辑，用户修改后自动保存本地配置并同步桌面端偏好。 */
+function bindConfigAutoSaveEvents(): void {
+  const textControls: Array<HTMLInputElement | HTMLTextAreaElement> = [
+    baseUrlInput,
+    modelInput,
+    textModelInput,
+    personalStyleInput,
+    dictationStyleInput,
+    translationStyleInput,
+    askStyleInput,
+    polishStyleInput,
+  ];
+  const instantControls: Array<HTMLInputElement | HTMLSelectElement> = [
+    languageSelect,
+    targetLanguagesSelect,
+    historyRetentionSelect,
+    postProcessDictationInput,
+    dictationOutputLanguageSelect,
+    microphoneSelect,
+    systemAudioSelect,
+    subtitleIncludeMicrophoneInput,
+    subtitleTargetAppsSelect,
+    interactionSoundsInput,
+    muteWhileDictatingInput,
+    launchAtLoginInput,
+    showInDockInput,
+  ];
+  textControls.forEach((control) => {
+    control.addEventListener("input", () => scheduleConfigAutoSave("设置已自动生效。", 520));
+    control.addEventListener("change", () => scheduleConfigAutoSave("设置已自动生效。", 0));
+  });
+  apiKeyInput.addEventListener("change", () => scheduleConfigAutoSave("Mimo Key 已自动生效。", 0));
+  apiKeyInput.addEventListener("blur", () => scheduleConfigAutoSave("Mimo Key 已自动生效。", 0));
+  instantControls.forEach((control) => {
+    control.addEventListener("change", () => {
+      if (control === postProcessDictationInput) {
+        syncDictationPolishSwitches(postProcessDictationInput.checked);
+      }
+      scheduleConfigAutoSave("设置已自动生效。", 0);
+    });
+  });
 }
 
 /** 处理动态渲染出的模式权限按钮点击，打开该模式自己的权限说明。 */
@@ -1376,10 +1408,10 @@ function normalizePermissionKind(value: string | undefined): PermissionKind {
   return "microphone";
 }
 
-/** 从模式卡片进入对应设置页，模式设置不改变任何录音触发状态。 */
-function switchModeSettingsView(mode: VoiceMode): void {
-  switchHubView(MODE_SETTINGS_VIEWS[mode]);
-  showHubNotice(`正在编辑${MODE_LABELS[mode]}设置。`, "idle");
+/** 从模式卡片或权限入口进入对应设置页，模式设置不改变任何录音触发状态。 */
+function switchModeSettingsView(mode: ShortcutMode): void {
+  switchHubView(MODE_DETAIL_VIEWS[mode]);
+  showHubNotice(`正在编辑${SHORTCUT_MODE_LABELS[mode]}设置。`, "idle");
 }
 
 /** 根据字符串恢复历史筛选值，非法值回落到全部。 */
@@ -1679,7 +1711,7 @@ function normalizeShortcutPart(part: string): string {
   return part;
 }
 
-/** 检查各模式是否配置了重复快捷键，避免保存后系统注册失败。 */
+/** 检查各模式是否配置了重复快捷键，避免即时注册时系统失败。 */
 function hasShortcutConflict(shortcuts: ShortcutConfig): boolean {
   const values = [shortcuts.dictate, shortcuts.translate, shortcuts.ask, shortcuts.polish, shortcuts.subtitle].map((shortcut) =>
     normalizeShortcutText(shortcut, ""),
@@ -1759,42 +1791,49 @@ function setSelectValueWithLegacyOption(select: HTMLSelectElement, value: string
   select.value = value;
 }
 
+/** 延迟自动保存当前设置，避免用户连续输入时反复注册快捷键或写入系统偏好。 */
+function scheduleConfigAutoSave(successMessage = "设置已自动生效。", delayMs = 360): void {
+  if (configAutoSaveHandle !== null) {
+    window.clearTimeout(configAutoSaveHandle);
+  }
+  configAutoSaveHandle = window.setTimeout(() => {
+    configAutoSaveHandle = null;
+    void saveConfigFromForm(successMessage);
+  }, delayMs);
+}
+
 /** 保存配置；Mimo Key 只写入 macOS 钥匙串，不进入 localStorage。 */
-async function saveConfigFromForm(successMessage = "设置已保存。"): Promise<void> {
+async function saveConfigFromForm(successMessage = "设置已自动生效。"): Promise<void> {
+  if (isConfigAutoSaving) {
+    scheduleConfigAutoSave(successMessage, 260);
+    return;
+  }
   const config = readConfigFromForm();
   if (!validateShortcutInputs() || hasShortcutConflict(config.shortcuts)) {
     showHubNotice("快捷键配置需要处理后才能保存。", "error");
     return;
   }
-  showHubNotice("正在保存设置。", "busy");
-  const apiKeyReady = await syncSavedApiKey();
-  if (!apiKeyReady) {
-    return;
-  }
-  const desktopReady = await syncDesktopPreferences(config);
-  if (!desktopReady) {
+  isConfigAutoSaving = true;
+  showHubNotice("正在应用设置。", "busy");
+  try {
+    const apiKeyReady = await syncSavedApiKey();
+    if (!apiKeyReady) {
+      return;
+    }
+    const desktopReady = await syncDesktopPreferences(config);
+    if (!desktopReady) {
+      await refreshDiagnostics();
+      showHubNotice("设置未生效，部分系统设置需要检查权限。", "error");
+      return;
+    }
+    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
+    syncDictationPolishSwitches(config.postProcessDictation);
+    renderHub();
     await refreshDiagnostics();
-    showHubNotice("设置未保存，部分系统设置需要检查权限。", "error");
-    return;
+    showHubNotice(successMessage, "success");
+  } finally {
+    isConfigAutoSaving = false;
   }
-  localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
-  syncDictationPolishSwitches(config.postProcessDictation);
-  renderHub();
-  await refreshDiagnostics();
-  showHubNotice(successMessage, "success");
-}
-
-/** 只切换口述 AI 润色开关，不触碰 Mimo Key、快捷键和桌面系统偏好。 */
-function setDictationPolishEnabled(enabled: boolean): void {
-  const config = readSavedConfig();
-  config.postProcessDictation = enabled;
-  localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
-  syncDictationPolishSwitches(enabled);
-  renderHub();
-  showHubNotice(
-    enabled ? "AI 润色已开启，口述后会润色再粘贴。" : "AI 润色已关闭，口述后会直接粘贴原始转写。",
-    "success",
-  );
 }
 
 /** 同步顶部快捷开关和设置页开关，确保同一配置没有两个状态。 */
@@ -2267,7 +2306,7 @@ function updateReadinessSummary(
     updateNextStepPanel(
       "warning",
       "先保存 Mimo Key",
-      "保存后 Key 会进入 macOS 钥匙串，不会写入本地配置文件。",
+      "粘贴后 Key 会进入 macOS 钥匙串，不会写入本地配置文件。",
       "配置 Key",
       "apiKey",
       "setting",
@@ -2310,17 +2349,17 @@ function updateReadinessSummary(
   updateReadyNextStepPanel();
 }
 
-/** 所有准备项就绪时，把首页下一步切成默认口述入口，避免 Hub 存在“当前模式”概念。 */
+/** 所有准备项就绪时，把首页下一步指向语音模式，避免其它页面出现具体模式的开始按钮。 */
 function updateReadyNextStepPanel(): void {
   const shortcuts = readSavedConfig().shortcuts;
   const shortcutLabel = formatShortcutLabel(shortcuts.dictate);
   updateNextStepPanel(
     "success",
-    "可以开始口述",
-    `点击开始或按 ${shortcutLabel}，说完再按一次停止并处理。`,
-    MODE_START_LABELS.dictate,
-    "start",
-    "play",
+    "语音模式已就绪",
+    `进入语音模式选择口述、翻译、随便问或实时字幕，也可以直接按 ${shortcutLabel}。`,
+    "打开语音模式",
+    "modes",
+    "voice",
   );
 }
 
@@ -2352,6 +2391,10 @@ async function handleNextStepAction(): Promise<void> {
     await refreshHubRuntimeState();
     return;
   }
+  if (nextReadinessAction === "modes") {
+    switchHubView("modes");
+    return;
+  }
   await handleReadinessAction(nextReadinessAction);
 }
 
@@ -2360,7 +2403,7 @@ async function handleReadinessAction(action: ReadinessAction | string): Promise<
   if (action === "apiKey") {
     switchHubView("settings");
     focusSettingControl(apiKeyInput);
-    showHubNotice("在这里粘贴 Mimo Key，保存后会进入 macOS 钥匙串。", "busy");
+    showHubNotice("在这里粘贴 Mimo Key，离开输入时会进入 macOS 钥匙串。", "busy");
     return;
   }
   if (action === "microphone") {
@@ -2373,7 +2416,7 @@ async function handleReadinessAction(action: ReadinessAction | string): Promise<
     return;
   }
   if (action === "shortcut") {
-    switchHubView("shortcuts");
+    switchModeSettingsView("dictate");
     focusSettingControl(dictateShortcutInput);
   }
 }
@@ -2407,7 +2450,7 @@ function readPermissionDialogCopy(
     return {
       title: "设置 Mimo Key",
       body: `${SHORTCUT_MODE_LABELS[mode]}需要 Mimo Key 才能调用 ASR 或 AI 服务。Key 只保存在本机钥匙串或当前会话里。`,
-      steps: ["打开系统设置页的模型与识别区域。", "粘贴 Mimo Key。", "点击保存设置后重新检查权限状态。"],
+      steps: ["打开系统设置页的模型与识别区域。", "粘贴 Mimo Key。", "离开输入框后会自动写入钥匙串，再重新检查权限状态。"],
       primaryLabel: "去填写 Key",
     };
   }
@@ -2439,7 +2482,7 @@ function readPermissionDialogCopy(
     return {
       title: "设置快捷键权限",
       body: `${SHORTCUT_MODE_LABELS[mode]}需要全局快捷键注册成功，才能在其他应用里直接启动。`,
-      steps: ["打开快捷键页。", "为当前模式录制一个未被系统占用的组合键。", "保存后重新注册快捷键。"],
+      steps: ["打开当前模式的设置页。", "为当前模式录制一个未被系统占用的组合键。", "录制完成后会自动重新注册快捷键。"],
       primaryLabel: "编辑快捷键",
     };
   }
@@ -2465,7 +2508,7 @@ async function handlePermissionDialogPrimaryAction(): Promise<void> {
   if (kind === "apiKey") {
     switchHubView("settings");
     focusSettingControl(apiKeyInput);
-    showHubNotice("在这里填写 Mimo Key，保存后回到模式卡片检查状态。", "busy");
+    showHubNotice("在这里填写 Mimo Key，自动生效后回到模式卡片检查状态。", "busy");
     return;
   }
   if (kind === "microphone") {
@@ -2477,7 +2520,7 @@ async function handlePermissionDialogPrimaryAction(): Promise<void> {
     return;
   }
   if (kind === "shortcut") {
-    switchHubView("shortcuts");
+    switchModeSettingsView(mode);
     focusSettingControl(getShortcutInput(mode));
     showHubNotice(`正在编辑${SHORTCUT_MODE_LABELS[mode]}快捷键。`, "busy");
     return;
@@ -2720,9 +2763,12 @@ function resetShortcutInput(mode: ShortcutMode): void {
   renderShortcutLabels(readConfigFromForm().shortcuts);
   const isValid = validateShortcutInputs();
   showHubNotice(
-    isValid ? `${SHORTCUT_MODE_LABELS[mode]}快捷键已恢复默认，保存后生效。` : "恢复默认后出现快捷键冲突，请调整后保存。",
+    isValid ? `${SHORTCUT_MODE_LABELS[mode]}快捷键已恢复默认，正在生效。` : "恢复默认后出现快捷键冲突，请调整后再生效。",
     isValid ? "success" : "error",
   );
+  if (isValid) {
+    scheduleConfigAutoSave(`${SHORTCUT_MODE_LABELS[mode]}快捷键已生效。`, 0);
+  }
 }
 
 /** 捕获用户按下的快捷键组合并写入当前录制输入框。 */
@@ -2750,10 +2796,13 @@ function captureShortcutKeys(event: KeyboardEvent): void {
   const isValid = validateShortcutInputs();
   showHubNotice(
     isValid
-      ? `${SHORTCUT_MODE_LABELS[mode]}快捷键已设为 ${formatShortcutLabel(shortcut)}，保存后生效。`
-      : "这个快捷键和其它模式冲突，请重新录制后保存。",
+      ? `${SHORTCUT_MODE_LABELS[mode]}快捷键已设为 ${formatShortcutLabel(shortcut)}，正在生效。`
+      : "这个快捷键和其它模式冲突，请重新录制。",
     isValid ? "success" : "error",
   );
+  if (isValid) {
+    scheduleConfigAutoSave(`${SHORTCUT_MODE_LABELS[mode]}快捷键已生效。`, 0);
+  }
 }
 
 /** 清除快捷键输入框的录制态。 */
@@ -2813,15 +2862,17 @@ function validateShortcutInputs(): boolean {
     setShortcutValidation(`${formatShortcutLabel(repeated[1])} 已被多个模式使用，请换一个组合键。`, "error", true);
     return false;
   }
-  setShortcutValidation("快捷键没有冲突，保存后会立即重新注册。", "success", false);
+  setShortcutValidation("快捷键没有冲突，修改后会自动重新注册。", "success", false);
   return true;
 }
 
-/** 更新快捷键校验提示，并控制保存快捷键按钮是否可用。 */
+/** 更新所有模式详情里的快捷键校验提示。 */
 function setShortcutValidation(message: string, state: HubNoticeState, shouldDisableSave: boolean): void {
-  shortcutValidationText.textContent = message;
-  shortcutValidationText.dataset.state = state;
-  saveShortcutButton.disabled = shouldDisableSave;
+  shortcutValidationTexts.forEach((element) => {
+    element.textContent = message;
+    element.dataset.state = state;
+    element.dataset.disabled = shouldDisableSave ? "true" : "false";
+  });
 }
 
 /** 判断快捷键文本是否包含至少一个修饰键和一个实际按键。 */
@@ -5616,7 +5667,7 @@ function switchHubView(view: string): void {
 
 /** 子设置页仍归属语音模式导航，避免侧边栏出现不存在的当前模式状态。 */
 function readNavViewForHubView(view: string): string {
-  if (Object.values(MODE_SETTINGS_VIEWS).includes(view)) {
+  if (Object.values(MODE_DETAIL_VIEWS).includes(view)) {
     return "modes";
   }
   return view;
@@ -5647,9 +5698,11 @@ function updateActionButtonIcon(button: HTMLButtonElement, iconName: IconName): 
 function syncStartActionButtons(): void {
   const isDictateReady = isModePermissionReady("dictate");
   const quickLabel = isDictateReady ? MODE_START_LABELS.dictate : "继续配置";
-  updateActionButtonLabel(quickStartButton, quickLabel);
-  updateActionButtonIcon(quickStartButton, isDictateReady ? "play" : "setting");
-  quickStartButton.title = isDictateReady ? quickLabel : "继续完成口述需要的权限";
+  if (quickStartButton) {
+    updateActionButtonLabel(quickStartButton, quickLabel);
+    updateActionButtonIcon(quickStartButton, isDictateReady ? "play" : "setting");
+    quickStartButton.title = isDictateReady ? quickLabel : "继续完成口述需要的权限";
+  }
   document.querySelectorAll<HTMLButtonElement>("[data-mode-start]").forEach((button) => {
     const mode = normalizeMode(button.dataset.modeStart);
     const isReady = isModePermissionReady(mode);
