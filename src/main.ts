@@ -33,6 +33,12 @@ const DICTIONARY_STORAGE_KEY = "aiToolDictionaryV1";
 const DIAGNOSTIC_LOG_STORAGE_KEY = "aiToolDiagnosticLogV1";
 const DEFAULT_HUB_NOTICE = "所有设置和历史都只保存在本机。";
 const MIN_RECORDING_MS = 800;
+const MIN_SPEECH_RMS = 0.006;
+const MIN_SPEECH_PEAK = 0.035;
+const MIN_SPEECH_FRAME_RATIO = 0.008;
+const RECORDING_AUDIO_BUFFER_SIZE = 1024;
+const RECORDING_READY_FRAME_COUNT = 12;
+const RECORDING_READY_PREROLL_TIMEOUT_MS = 1600;
 const SUBTITLE_CHUNK_MS = 1800;
 const SUBTITLE_NATIVE_CHUNK_MS = 8000;
 const SUBTITLE_OVERLAP_MS = 450;
@@ -50,6 +56,10 @@ const NATIVE_SYSTEM_AUDIO_DEVICE_ID = "native-process-tap";
 const MAX_SUBTITLE_HISTORY_ITEMS = 160;
 const HUB_DIAGNOSTICS_REFRESH_INTERVAL_MS = 4000;
 const MAX_DIAGNOSTIC_LOG_ITEMS = 160;
+const MAX_RECORDING_MS = 5 * 60 * 1000;
+const SHORTCUT_RECORDING_TIMEOUT_MS = 30 * 1000;
+const TRAY_HISTORY_MAX_ITEMS = 8;
+const HISTORY_PAGE_SIZE = 20;
 const EMPTY_TRANSCRIPTION_MARKERS = [
   "无实际内容输出",
   "没有实际内容输出",
@@ -57,6 +67,10 @@ const EMPTY_TRANSCRIPTION_MARKERS = [
   "未识别到语音",
   "无语音内容",
   "无内容输出",
+  "原文",
+  "原文如下",
+  "原始文本",
+  "转写文本",
 ];
 const DEFAULT_SHORTCUTS: ShortcutConfig = {
   dictate: "ctrl+p",
@@ -95,6 +109,7 @@ type DiagnosticState = "idle" | "success" | "warning" | "error";
 type DiagnosticLogLevel = "info" | "success" | "warning" | "error";
 type DiagnosticLogCategory = "recording" | "transcribe" | "process" | "paste" | "subtitle" | "system";
 type SubtitleAudioSource = "microphone" | "system" | "mixed";
+type MicrophoneProcessingMode = "enhanced" | "natural";
 type SubtitleOverlayState = "hidden" | "listening" | "text" | "error";
 type IconName = keyof typeof ICON_RENDERERS;
 type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "modes" | "start" | "refresh";
@@ -123,6 +138,22 @@ interface ShortcutRecordingSnapshot {
   mode: ShortcutMode;
   /** 进入录制态之前输入框展示的快捷键文本。 */
   label: string;
+}
+
+interface RecordingAudioAnalysis {
+  /** 整段录音的均方根音量，用于判断是否真的有人声输入。 */
+  rms: number;
+  /** 整段录音的最大峰值，避免只靠均方根误判短促语音。 */
+  peak: number;
+  /** 超过语音阈值的采样比例，用于过滤持续静音和环境底噪。 */
+  speechFrameRatio: number;
+}
+
+interface RecordingWavResult {
+  /** 编码后的 WAV 音频，只有通过静音门禁后才会发送给 ASR。 */
+  audioBlob: Blob;
+  /** 本次录音的本地音量分析结果，用于 ASR 前置门禁和诊断。 */
+  analysis: RecordingAudioAnalysis;
 }
 
 interface ShortcutTriggerPayload {
@@ -175,6 +206,8 @@ interface VoiceConfig {
   dictationOutputLanguage: string;
   /** 选定的麦克风设备 ID，default 表示系统默认设备。 */
   microphoneDeviceId: string;
+  /** 麦克风采集处理模式，enhanced 使用浏览器降噪/回声消除/自动增益，natural 保留原声。 */
+  microphoneProcessingMode: MicrophoneProcessingMode;
   /** 实时字幕使用的系统音频输入设备，auto 表示自动检测虚拟声卡，none 表示只采集麦克风。 */
   systemAudioDeviceId: string;
   /** 实时字幕是否同时采集麦克风输入。 */
@@ -225,6 +258,24 @@ interface TranscribeResponse {
   elapsedMs: number;
   /** 实际返回的模型名称。 */
   model: string;
+}
+
+interface SaveHistoryAudioResponse {
+  /** 写入后的本地文件绝对路径，历史记录用它生成播放地址。 */
+  filePath: string;
+  /** 实际写入的音频字节数。 */
+  bytes: number;
+  /** 音频 MIME 类型。 */
+  contentType: string;
+}
+
+interface ReadHistoryAudioResponse {
+  /** WAV 音频 base64 内容，不包含 data URL 头。 */
+  audioBase64: string;
+  /** 音频 MIME 类型。 */
+  contentType: string;
+  /** 实际读取的音频字节数。 */
+  bytes: number;
 }
 
 interface ProcessTapCaptureResponse {
@@ -305,6 +356,8 @@ interface ProcessTextRequest {
   mode: VoiceMode;
   /** ASR 原文或用户输入文本。 */
   text: string;
+  /** 口述模式对应的录音时长，非录音来源传 0。 */
+  audioDurationMs: number;
   /** 本地词典术语。 */
   dictionary: string[];
   /** 翻译目标语言。 */
@@ -497,6 +550,21 @@ interface HistoryItem {
   model: string;
   /** 触发录音时的前台应用名称。 */
   contextApp: string;
+  /** 本次录音音频文件路径；非录音来源或旧历史为空。 */
+  audioFilePath?: string;
+  /** 本次录音音频 MIME 类型。 */
+  audioContentType?: string;
+  /** 本次录音音频大小，单位字节。 */
+  audioSizeBytes?: number;
+}
+
+interface TrayHistoryItem {
+  /** 历史记录 ID，用于 Rust 托盘菜单按下标复制时辅助定位。 */
+  id: string;
+  /** 托盘菜单展示的短标题。 */
+  title: string;
+  /** 点击托盘菜单后复制到剪切板的完整文本。 */
+  text: string;
 }
 
 interface DictionaryItem {
@@ -674,6 +742,7 @@ const postProcessDictationInput = getElement<HTMLInputElement>("postProcessDicta
 const dictationOutputLanguageRow = getElement<HTMLLabelElement>("dictationOutputLanguageRow");
 const dictationOutputLanguageSelect = getElement<HTMLSelectElement>("dictationOutputLanguageSelect");
 const microphoneSelect = getElement<HTMLSelectElement>("microphoneSelect");
+const microphoneProcessingSelect = getElement<HTMLSelectElement>("microphoneProcessingSelect");
 const systemAudioSelect = getElement<HTMLSelectElement>("systemAudioSelect");
 const subtitleIncludeMicrophoneInput = getElement<HTMLInputElement>("subtitleIncludeMicrophoneInput");
 const subtitleTargetAppsSelect = getElement<HTMLSelectElement>("subtitleTargetAppsSelect");
@@ -757,6 +826,7 @@ const openAccessibilityButton = getElement<HTMLButtonElement>("openAccessibility
 const resultReason = getElement<HTMLElement>("resultReason");
 const resultWindowTextarea = getElement<HTMLTextAreaElement>("resultWindowTextarea");
 const resultCopyButton = getElement<HTMLButtonElement>("resultCopyButton");
+const resultRetryButton = getElement<HTMLButtonElement>("resultRetryButton");
 const resultOpenAccessibilityButton = getElement<HTMLButtonElement>("resultOpenAccessibilityButton");
 const resultCloseButton = getElement<HTMLButtonElement>("resultCloseButton");
 const permissionDialog = getElement<HTMLElement>("permissionDialog");
@@ -789,19 +859,24 @@ let audioProcessor: ScriptProcessorNode | null = null;
 let audioSink: GainNode | null = null;
 let recordedSamples: Float32Array[] = [];
 let recordedSampleLength = 0;
+let recordedAudioFrameCount = 0;
 let recordedSampleRate = 0;
+let recordingFirstAudioFrameResolve: (() => void) | null = null;
 let isRecording = false;
 let recordStartedAt = 0;
 let timerHandle: number | null = null;
 let bubbleTimerHandle: number | null = null;
+let shortcutRecordingTimeoutHandle: number | null = null;
 let isProcessing = false;
 let isPolishingSelection = false;
 let isStartingRecording = false;
+let cancelStartingRecordingRequested = false;
 let isSubtitleListening = false;
 let isStartingSubtitleListening = false;
 let lastShortcutAt = 0;
 let activeMode: VoiceMode = "dictate";
 let historyFilter: VoiceMode | "all" = "all";
+let historyPage = 1;
 let dictionaryFilter: DictionaryFilter = "all";
 let shortcutRecordingMode: ShortcutMode | null = null;
 let previousSystemMuteState: boolean | null = null;
@@ -810,6 +885,7 @@ let recordingKeepsHubVisible = false;
 let resultCopyFeedbackTimer: number | null = null;
 let nextReadinessAction: ReadinessAction = "apiKey";
 let pendingConfirmation: PendingConfirmation | null = null;
+const historyAudioObjectUrls = new Map<string, string>();
 let shortcutRecordingSnapshot: ShortcutRecordingSnapshot | null = null;
 let accessibilityWatchHandle: number | null = null;
 let hubDiagnosticsRefreshHandle: number | null = null;
@@ -965,6 +1041,7 @@ function initFloatingWindow(): void {
   bindFloatingEvents();
   void registerShortcutsFromConfig(readSavedConfig());
   void applyDockPreference(readSavedConfig());
+  void syncTrayDictationHistory();
   setStatus("按快捷键开始录音。", "ready");
   void bindHubStartEvent();
 }
@@ -980,6 +1057,7 @@ function initHubWindow(): void {
   void populateMicrophones();
   void populateSubtitleTargetApps();
   void syncDesktopPreferences(readSavedConfig());
+  void syncTrayDictationHistory();
   renderHub();
   void refreshDiagnostics();
   startHubDiagnosticsRefresh();
@@ -1204,11 +1282,30 @@ function bindFloatingEvents(): void {
   recordButton.addEventListener("click", () => void toggleRecording(activeMode));
   soundStage.addEventListener("click", () => void toggleRecording(activeMode));
   copyButton.addEventListener("click", () => void copyText(resultTextarea.value));
+  window.addEventListener("keydown", handleFloatingEscapeKeydown);
+}
+
+/** 录音准备中或录音中按 Escape 直接退出，不进入转写流程。 */
+function handleFloatingEscapeKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Escape" || isProcessing || (!isRecording && !isStartingRecording)) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (isStartingRecording && !isRecording) {
+    cancelStartingRecordingRequested = true;
+    stopStream();
+    void restoreSystemMute();
+    setStatus("已取消录音。", "ready");
+    return;
+  }
+  cancelRecordingOrReset();
 }
 
 /** 绑定结果窗口复制、权限和关闭操作。 */
 function bindResultWindowEvents(): void {
   resultCopyButton.addEventListener("click", () => void copyResultWindowText());
+  resultRetryButton.addEventListener("click", () => void retryLatestHistoryFromResultWindow());
   resultOpenAccessibilityButton.addEventListener("click", () => void openAccessibilityFromResult());
   resultCloseButton.addEventListener("click", () => void hideResultWindow());
   window.addEventListener("keydown", handleResultWindowKeydown);
@@ -1260,6 +1357,7 @@ function bindHubEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-history-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       historyFilter = normalizeHistoryFilter(button.dataset.historyFilter);
+      historyPage = 1;
       renderHistory();
     });
   });
@@ -1324,6 +1422,7 @@ function bindHubEvents(): void {
   dictionaryForm.addEventListener("submit", addDictionaryWord);
   dictionarySearchInput.addEventListener("input", renderDictionary);
   historyList.addEventListener("click", handleHistoryAction);
+  historyList.addEventListener("play", handleHistoryAudioNativePlay, true);
   dictionaryList.addEventListener("click", handleDictionaryAction);
   window.addEventListener("keydown", captureShortcutKeys, true);
 }
@@ -1347,6 +1446,7 @@ function bindConfigAutoSaveEvents(): void {
     postProcessDictationInput,
     dictationOutputLanguageSelect,
     microphoneSelect,
+    microphoneProcessingSelect,
     systemAudioSelect,
     subtitleIncludeMicrophoneInput,
     subtitleTargetAppsSelect,
@@ -1553,6 +1653,7 @@ function loadConfigToForm(): void {
   setSelectValueWithLegacyOption(dictationOutputLanguageSelect, config.dictationOutputLanguage);
   syncDictationOutputLanguageState(config.postProcessDictation);
   microphoneSelect.value = config.microphoneDeviceId;
+  microphoneProcessingSelect.value = config.microphoneProcessingMode;
   systemAudioSelect.value = config.systemAudioDeviceId;
   subtitleIncludeMicrophoneInput.checked = config.subtitleIncludeMicrophone;
   setSubtitleTargetAppsValue(config.subtitleTargetApps);
@@ -1760,6 +1861,7 @@ function defaultConfig(): VoiceConfig {
     postProcessDictation: true,
     dictationOutputLanguage: DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: "default",
+    microphoneProcessingMode: "enhanced",
     systemAudioDeviceId: NATIVE_SYSTEM_AUDIO_DEVICE_ID,
     subtitleIncludeMicrophone: true,
     subtitleTargetApps: ["active"],
@@ -1797,6 +1899,7 @@ function normalizeConfig(value: Partial<VoiceConfig>, fallback: VoiceConfig): Vo
       typeof value.microphoneDeviceId === "string" && value.microphoneDeviceId.trim()
         ? value.microphoneDeviceId
         : fallback.microphoneDeviceId,
+    microphoneProcessingMode: normalizeMicrophoneProcessingMode(value.microphoneProcessingMode),
     systemAudioDeviceId:
       typeof value.systemAudioDeviceId === "string" && value.systemAudioDeviceId.trim() && value.systemAudioDeviceId !== "auto"
         ? value.systemAudioDeviceId
@@ -1890,6 +1993,11 @@ function normalizeRetention(value: unknown): HistoryRetention {
   return "forever";
 }
 
+/** 对麦克风采集处理模式做枚举兜底，旧配置默认沿用增强模式。 */
+function normalizeMicrophoneProcessingMode(value: unknown): MicrophoneProcessingMode {
+  return value === "natural" ? "natural" : "enhanced";
+}
+
 /** 规范化实时字幕系统音频 App 目标，避免旧配置或空值导致无法启动。 */
 function normalizeSubtitleTargetApps(value: unknown, fallback: string[]): string[] {
   if (!Array.isArray(value)) {
@@ -1914,6 +2022,7 @@ function readConfigFromForm(): VoiceConfig {
     postProcessDictation: postProcessDictationInput.checked,
     dictationOutputLanguage: dictationOutputLanguageSelect.value || DEFAULT_DICTATION_OUTPUT_LANGUAGE,
     microphoneDeviceId: microphoneSelect.value || "default",
+    microphoneProcessingMode: normalizeMicrophoneProcessingMode(microphoneProcessingSelect.value),
     systemAudioDeviceId: systemAudioSelect.value || "auto",
     subtitleIncludeMicrophone: subtitleIncludeMicrophoneInput.checked,
     subtitleTargetApps: readSelectedSubtitleTargetApps(),
@@ -2922,6 +3031,7 @@ async function startShortcutRecording(mode: ShortcutMode): Promise<void> {
   label.dataset.recording = "true";
   setShortcutValidation("按下包含 Control、Command、Option 或 Shift 的组合键；Esc 可取消。", "busy", true);
   showHubNotice(`正在录制${SHORTCUT_MODE_LABELS[mode]}快捷键。`, "busy");
+  startShortcutRecordingTimeout();
 }
 
 /** 暂停桌面端当前已注册快捷键，让 WebView 可以收到接下来这次组合键输入。 */
@@ -2944,6 +3054,7 @@ async function suspendShortcutsForRecording(): Promise<boolean> {
 function resetShortcutInput(mode: ShortcutMode): void {
   shortcutRecordingMode = null;
   shortcutRecordingSnapshot = null;
+  clearShortcutRecordingTimeout();
   clearShortcutRecordingState();
   getShortcutInput(mode).value = formatShortcutLabel(DEFAULT_SHORTCUTS[mode]);
   renderShortcutLabels(readConfigFromForm().shortcuts);
@@ -2978,6 +3089,7 @@ function captureShortcutKeys(event: KeyboardEvent): void {
   clearShortcutRecordingState();
   shortcutRecordingMode = null;
   shortcutRecordingSnapshot = null;
+  clearShortcutRecordingTimeout();
   renderShortcutLabels(readConfigFromForm().shortcuts);
   const isValid = validateShortcutInputs();
   showHubNotice(
@@ -3009,11 +3121,38 @@ function clearShortcutRecordingState(): void {
 function cancelShortcutRecording(): void {
   restoreShortcutRecordingSnapshot();
   shortcutRecordingMode = null;
+  clearShortcutRecordingTimeout();
   clearShortcutRecordingState();
   renderShortcutLabels(readConfigFromForm().shortcuts);
   validateShortcutInputs();
   showHubNotice("已取消快捷键录制。", "idle");
   void registerShortcutsFromConfig(readSavedConfig());
+}
+
+/** 限制快捷键录制停留时间，避免全局快捷键一直处于暂停状态。 */
+function startShortcutRecordingTimeout(): void {
+  clearShortcutRecordingTimeout();
+  shortcutRecordingTimeoutHandle = window.setTimeout(() => {
+    if (!shortcutRecordingMode) {
+      return;
+    }
+    restoreShortcutRecordingSnapshot();
+    shortcutRecordingMode = null;
+    clearShortcutRecordingState();
+    renderShortcutLabels(readConfigFromForm().shortcuts);
+    validateShortcutInputs();
+    showHubNotice("快捷键录制已超时取消，原快捷键已恢复。", "error");
+    void registerShortcutsFromConfig(readSavedConfig());
+  }, SHORTCUT_RECORDING_TIMEOUT_MS);
+}
+
+/** 清除快捷键录制超时定时器。 */
+function clearShortcutRecordingTimeout(): void {
+  if (shortcutRecordingTimeoutHandle === null) {
+    return;
+  }
+  window.clearTimeout(shortcutRecordingTimeoutHandle);
+  shortcutRecordingTimeoutHandle = null;
 }
 
 /** 如果存在快捷键录制草稿，则恢复对应输入框的原值。 */
@@ -3392,54 +3531,110 @@ async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = 
     return;
   }
 
+  const config = readSavedConfig();
+  if (!(await ensureReadyForRecording(mode))) {
+    return;
+  }
   isStartingRecording = true;
+  cancelStartingRecordingRequested = false;
+  setFloatingDisabled(true);
+  setStatus("正在准备录音，出现录音状态后再开始说话。", "busy");
   try {
-    const config = readSavedConfig();
-    if (!(await ensureReadyForRecording(mode))) {
-      return;
-    }
     recordingKeepsHubVisible = keepHubVisible;
     recordingTargetApp = keepHubVisible ? "" : normalizeRecordingTargetApp(targetApp);
-    addDiagnosticLog({
-      level: "info",
-      category: "recording",
-      title: "开始录音",
-      message: "已通过权限和 Key 检查，开始采集麦克风音频。",
-      mode,
-      targetApp: recordingTargetApp || targetApp,
-      details: [
-        `麦克风：${config.microphoneDeviceId || "default"}`,
-        `AI润色：${config.postProcessDictation ? "开启" : "关闭"}`,
-        `保持Hub：${recordingKeepsHubVisible ? "是" : "否"}`,
-      ],
-    });
     recordedSamples = [];
     recordedSampleLength = 0;
-    if (config.muteWhileDictating) {
-      previousSystemMuteState = await setSystemOutputMuted(true);
-    }
+    recordedAudioFrameCount = 0;
     recordingStream = await navigator.mediaDevices.getUserMedia({ audio: buildAudioConstraints(config) });
-    audioContext = new AudioContext();
+    if (cancelStartingRecordingRequested) {
+      stopStream();
+      setStatus("已取消录音。", "ready");
+      return;
+    }
+    isRecording = true;
+    recordStartedAt = Date.now();
+    audioContext = new AudioContext({ latencyHint: "interactive" });
     recordedSampleRate = audioContext.sampleRate;
     audioSource = audioContext.createMediaStreamSource(recordingStream);
-    audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+    audioProcessor = audioContext.createScriptProcessor(RECORDING_AUDIO_BUFFER_SIZE, 1, 1);
     audioSink = audioContext.createGain();
     audioSink.gain.value = 0;
     audioProcessor.onaudioprocess = collectAudioSamples;
     audioSource.connect(audioProcessor);
     audioProcessor.connect(audioSink);
     audioSink.connect(audioContext.destination);
-    isRecording = true;
+    await audioContext.resume();
+    const firstFrameWaitStartedAt = Date.now();
+    setStatus("正在预热麦克风，出现录音状态后再开始说话。", "busy");
+    const firstFrameReady = await waitForFirstRecordingAudioFrame(1200);
+    const prerollReady = await waitForRecordingReadyFrames(RECORDING_READY_FRAME_COUNT, RECORDING_READY_PREROLL_TIMEOUT_MS);
+    if (cancelStartingRecordingRequested) {
+      isRecording = false;
+      stopStream();
+      recordedSamples = [];
+      recordedSampleLength = 0;
+      recordedAudioFrameCount = 0;
+      setStatus("已取消录音。", "ready");
+      return;
+    }
     recordStartedAt = Date.now();
     startTimer();
     recordButton.title = `停止并${MODE_LABELS[mode]}`;
     recordButton.setAttribute("aria-label", `停止并${MODE_LABELS[mode]}`);
+    setFloatingDisabled(false);
     copyButton.disabled = true;
     resultMeta.textContent = `${MODE_LABELS[mode]}中`;
     updateVoiceLevelVisual(0.24);
+    addDiagnosticLog({
+      level: "info",
+      category: "recording",
+      title: "开始录音",
+      message:
+        firstFrameReady && prerollReady
+          ? "麦克风预卷音频进入后开始录音计时。"
+          : "等待麦克风预卷超时后继续录音。",
+      mode,
+      targetApp: recordingTargetApp || targetApp,
+      details: [
+        `麦克风：${config.microphoneDeviceId || "default"}`,
+        `麦克风处理：${formatMicrophoneProcessingMode(config.microphoneProcessingMode)}`,
+        `采样率：${recordedSampleRate || 0}`,
+        `采样缓冲：${RECORDING_AUDIO_BUFFER_SIZE}`,
+        `首帧等待：${Date.now() - firstFrameWaitStartedAt}ms`,
+        `提示音前采样帧：${recordedAudioFrameCount}`,
+        `提示音前实际采样：${formatDuration(readCapturedAudioDurationMs())}`,
+        `AI润色：${config.postProcessDictation ? "开启" : "关闭"}`,
+        `保持Hub：${recordingKeepsHubVisible ? "是" : "否"}`,
+      ],
+    });
+    if (config.muteWhileDictating) {
+      const muteRecordingStartedAt = recordStartedAt;
+      void setSystemOutputMuted(true)
+        .then((muted) => {
+          if (typeof muted !== "boolean") {
+            return;
+          }
+          if (isRecording && recordStartedAt === muteRecordingStartedAt) {
+            previousSystemMuteState = muted;
+            return;
+          }
+          void setSystemOutputMuted(muted);
+        })
+        .catch((error) => {
+          addDiagnosticLog({
+            level: "warning",
+            category: "recording",
+            title: "录音静音系统输出失败",
+            message: formatError(error),
+            mode,
+            targetApp: recordingTargetApp || targetApp,
+          });
+        });
+    }
     playInteractionSound("start", config);
     setStatus(`${MODE_LABELS[mode]}中，说完后再次按快捷键。`, "recording");
   } catch (error) {
+    isRecording = false;
     recordingKeepsHubVisible = false;
     stopStream();
     void restoreSystemMute();
@@ -3459,6 +3654,10 @@ async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = 
     }
   } finally {
     isStartingRecording = false;
+    cancelStartingRecordingRequested = false;
+    if (!isProcessing) {
+      setFloatingDisabled(false);
+    }
   }
 }
 
@@ -3492,6 +3691,7 @@ async function polishSelectedText(targetApp = "", keepHubVisible = false): Promi
   processDurationText.textContent = "--";
   audioSizeText.textContent = "--";
   setStatus("正在读取选中文本。", "busy");
+  let sourceHistoryItem: HistoryItem | null = null;
   try {
     const config = readSavedConfig();
     if (!(await ensureReadyForTextPolish())) {
@@ -3513,6 +3713,19 @@ async function polishSelectedText(targetApp = "", keepHubVisible = false): Promi
       pasteMethod: selection.copyMethod,
       details: [`原文字数：${countTextUnits(selection.text)}`, `保持Hub：${keepHubVisible ? "是" : "否"}`],
     });
+    sourceHistoryItem = saveHistory({
+      id: createId(),
+      mode: "polish",
+      sourceText: selection.text,
+      outputText: selection.text,
+      createdAt: Date.now(),
+      recordElapsedMs: 0,
+      transcribeElapsedMs: 0,
+      processElapsedMs: 0,
+      model: config.textModel,
+      contextApp,
+    });
+    updateRecentResult(sourceHistoryItem);
     const processed = await processRecognizedText(selection.text, "polish", config, contextApp);
     const outputText = processed.text.trim();
     if (!outputText) {
@@ -3522,7 +3735,7 @@ async function polishSelectedText(targetApp = "", keepHubVisible = false): Promi
     resultMeta.textContent = "润色完成";
     processDurationText.textContent = formatDuration(processed.elapsedMs);
     const historyItem = saveHistory({
-      id: createId(),
+      id: sourceHistoryItem.id,
       mode: "polish",
       sourceText: selection.text,
       outputText,
@@ -3565,6 +3778,16 @@ async function polishSelectedText(targetApp = "", keepHubVisible = false): Promi
       targetApp,
     });
     setStatus(message, "error");
+    if (sourceHistoryItem) {
+      resultTextarea.value = sourceHistoryItem.sourceText;
+      resultMeta.textContent = "润色失败，已保留原文";
+      updateRecentResult(sourceHistoryItem);
+      await showResultWindow(
+        sourceHistoryItem.sourceText,
+        `AI 润色失败，原文已保存到历史记录。可以点击重试再次润色。原因：${message}`,
+        false,
+      );
+    }
     if (message.includes("辅助功能")) {
       await showHubWindow();
       await switchHubWindowToModeDetail("polish", "accessibility");
@@ -3629,15 +3852,21 @@ function isMicrophonePermissionError(error: unknown): boolean {
 
 /** 根据设置创建浏览器录音约束。 */
 function buildAudioConstraints(config: VoiceConfig): MediaTrackConstraints {
+  const useBrowserEnhancement = config.microphoneProcessingMode === "enhanced";
   const constraints: MediaTrackConstraints = {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
+    echoCancellation: useBrowserEnhancement,
+    noiseSuppression: useBrowserEnhancement,
+    autoGainControl: useBrowserEnhancement,
   };
   if (config.microphoneDeviceId && config.microphoneDeviceId !== "default") {
     constraints.deviceId = { exact: config.microphoneDeviceId };
   }
   return constraints;
+}
+
+/** 格式化麦克风采集处理模式，用于诊断日志展示。 */
+function formatMicrophoneProcessingMode(mode: MicrophoneProcessingMode): string {
+  return mode === "natural" ? "原声" : "增强";
 }
 
 /** 为实时字幕的系统音频输入创建录音约束，避免浏览器降噪破坏电脑播放声。 */
@@ -3873,7 +4102,10 @@ async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
     title: "实时字幕开始申请麦克风",
     message: "准备打开实时字幕麦克风输入。",
     mode: "subtitle",
-    details: [`麦克风：${config.microphoneDeviceId || "default"}`],
+    details: [
+      `麦克风：${config.microphoneDeviceId || "default"}`,
+      `麦克风处理：${formatMicrophoneProcessingMode(config.microphoneProcessingMode)}`,
+    ],
   });
   subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风");
   addDiagnosticLog({
@@ -4915,27 +5147,10 @@ async function ensureReadyForRecording(mode: ShortcutMode): Promise<boolean> {
   try {
     const diagnostics = await readRuntimeDiagnostics();
     const microphoneDiagnostic = await readMicrophoneDiagnostic();
-    if (!diagnostics.hasSessionApiKey && !diagnostics.hasKeychainApiKey && !diagnostics.hasEnvApiKey) {
-      await showRequiredModePermission(mode, "apiKey", `请设置${SHORTCUT_MODE_LABELS[mode]}的 Mimo Key。`);
-      return false;
-    }
-    if (!diagnostics.shortcutRegistrationReady) {
-      await showRequiredModePermission(mode, "shortcut", `请设置${SHORTCUT_MODE_LABELS[mode]}的快捷键权限。`);
-      return false;
-    }
     const config = readSavedConfig();
-    const isNativeSubtitleMode = mode === "subtitle" && config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID;
-    const needsMicrophone = mode !== "subtitle" || config.subtitleIncludeMicrophone || !isNativeSubtitleMode;
-    if (needsMicrophone && microphoneDiagnostic.state !== "success") {
-      await showRequiredModePermission(mode, "microphone", `请设置${SHORTCUT_MODE_LABELS[mode]}的麦克风权限。`);
-      return false;
-    }
-    if ((mode === "dictate" || mode === "translate") && !diagnostics.accessibilityTrusted) {
-      await showRequiredModePermission(mode, "accessibility", `请设置${SHORTCUT_MODE_LABELS[mode]}的自动粘贴权限。`);
-      return false;
-    }
-    if (mode === "subtitle" && readSystemAudioDiagnostic(config).state !== "success") {
-      await showRequiredModePermission(mode, "systemAudio", "请设置实时字幕的系统声音来源。");
+    const missingPermissions = readMissingRecordingPermissions(mode, diagnostics, microphoneDiagnostic, config);
+    if (missingPermissions.length) {
+      await showRequiredModePermission(mode, missingPermissions[0].kind, formatMissingModePermissionMessage(mode, missingPermissions));
       return false;
     }
     return true;
@@ -4943,6 +5158,70 @@ async function ensureReadyForRecording(mode: ShortcutMode): Promise<boolean> {
     setStatus(`录音前检查失败：${formatError(error)}`, "error");
     return false;
   }
+}
+
+/** 根据实时诊断结果汇总本次录音前缺失的所有配置项，避免用户逐个触发才知道缺什么。 */
+function readMissingRecordingPermissions(
+  mode: ShortcutMode,
+  diagnostics: RuntimeDiagnostics,
+  microphoneDiagnostic: { text: string; state: DiagnosticState },
+  config: VoiceConfig,
+): ModePermissionItem[] {
+  const permissions: ModePermissionItem[] = [];
+  if (!diagnostics.hasSessionApiKey && !diagnostics.hasKeychainApiKey && !diagnostics.hasEnvApiKey) {
+    permissions.push({
+      kind: "apiKey",
+      label: "Mimo Key",
+      ready: false,
+      state: "error",
+      description: "未检测到 Mimo Key，无法调用 ASR 或 AI 服务",
+    });
+  }
+  if (!diagnostics.shortcutRegistrationReady) {
+    permissions.push({
+      kind: "shortcut",
+      label: "快捷键权限",
+      ready: false,
+      state: "error",
+      description: diagnostics.shortcutRegistrationMessage || "快捷键未注册成功",
+    });
+  }
+  const isNativeSubtitleMode = mode === "subtitle" && config.systemAudioDeviceId === NATIVE_SYSTEM_AUDIO_DEVICE_ID;
+  const needsMicrophone = mode !== "subtitle" || config.subtitleIncludeMicrophone || !isNativeSubtitleMode;
+  if (needsMicrophone && microphoneDiagnostic.state !== "success") {
+    permissions.push({
+      kind: "microphone",
+      label: mode === "subtitle" ? "麦克风输入" : "麦克风权限",
+      ready: false,
+      state: microphoneDiagnostic.state,
+      description: microphoneDiagnostic.text,
+    });
+  }
+  if ((mode === "dictate" || mode === "translate") && !diagnostics.accessibilityTrusted) {
+    permissions.push({
+      kind: "accessibility",
+      label: "自动粘贴权限",
+      ready: false,
+      state: "warning",
+      description: "未授权，无法自动粘贴到外部输入框",
+    });
+  }
+  if (mode === "subtitle" && readSystemAudioDiagnostic(config).state !== "success") {
+    permissions.push({
+      kind: "systemAudio",
+      label: "系统声音来源",
+      ready: false,
+      state: "error",
+      description: "未设置实时字幕的系统声音来源",
+    });
+  }
+  return permissions;
+}
+
+/** 生成缺失配置汇总提示，让快捷键触发失败时一次说清需要补哪些内容。 */
+function formatMissingModePermissionMessage(mode: ShortcutMode, permissions: ModePermissionItem[]): string {
+  const labels = permissions.map((permission) => permission.label).join("、");
+  return `${SHORTCUT_MODE_LABELS[mode]}配置未完成：请先设置${labels}。`;
 }
 
 /** 缺少模式权限时展示明确提示，并把 Hub 带到对应模式详情。 */
@@ -4955,28 +5234,31 @@ async function showRequiredModePermission(mode: ShortcutMode, kind: PermissionKi
   }
   setStatus(message, "error");
   await showHubWindow();
-  await switchHubWindowToModeDetail(mode, kind);
+  await switchHubWindowToModeDetail(mode, kind, message);
   window.setTimeout(() => void hideFloatingWindow(), 1800);
 }
 
 /** Hub 中点击模式启动但权限不足时，打开第一项缺失权限说明。 */
 async function showFirstMissingModePermission(mode: ShortcutMode): Promise<void> {
-  const missingPermission = readModePermissions(mode).find((permission) => !permission.ready);
-  if (!missingPermission) {
+  const missingPermissions = readModePermissions(mode).filter((permission) => !permission.ready);
+  if (!missingPermissions.length) {
     return;
   }
   await showRequiredModePermission(
     mode,
-    missingPermission.kind,
-    `请设置${SHORTCUT_MODE_LABELS[mode]}的${missingPermission.label}。`,
+    missingPermissions[0].kind,
+    formatMissingModePermissionMessage(mode, missingPermissions),
   );
 }
 
 /** 请求 Hub 切换到指定模式详情页，用于快捷键权限缺失时减少用户寻找路径。 */
-async function switchHubWindowToModeDetail(mode: ShortcutMode, kind: PermissionKind): Promise<void> {
+async function switchHubWindowToModeDetail(mode: ShortcutMode, kind: PermissionKind, message = ""): Promise<void> {
   if (windowMode === "hub") {
     switchHubView(MODE_DETAIL_VIEWS[mode]);
     openPermissionDialog(mode, kind);
+    if (message) {
+      showHubNotice(message, "error");
+    }
     return;
   }
   if (!isTauriRuntime()) {
@@ -4985,6 +5267,9 @@ async function switchHubWindowToModeDetail(mode: ShortcutMode, kind: PermissionK
   try {
     const { emitTo } = await import("@tauri-apps/api/event");
     await emitTo("hub", "hub-switch-view", MODE_DETAIL_VIEWS[mode]);
+    if (message) {
+      await emitTo("hub", "hub-show-notice", { message, state: "error" });
+    }
   } catch {
     // Hub 已经打开时，事件失败不影响错误提示本身。
   }
@@ -5032,7 +5317,7 @@ async function stopRecordingAndTranscribe(): Promise<void> {
   setStatus("正在停止录音并准备转写。", "busy");
 
   try {
-    const audioBlob = stopRecordingToWav();
+    const { audioBlob, analysis } = stopRecordingToWav();
     stopStream();
     await restoreSystemMute();
     stopTimer();
@@ -5047,7 +5332,12 @@ async function stopRecordingAndTranscribe(): Promise<void> {
       mode: activeMode,
       targetApp: recordingTargetApp,
       elapsedMs: recordElapsedMs,
-      details: [`音频大小：${formatBytes(audioBlob.size)}`],
+      details: [
+        `音频大小：${formatBytes(audioBlob.size)}`,
+        `RMS：${analysis.rms.toFixed(4)}`,
+        `峰值：${analysis.peak.toFixed(4)}`,
+        `有效采样比例：${(analysis.speechFrameRatio * 100).toFixed(2)}%`,
+      ],
     });
     recordButton.title = "开始录音";
     recordButton.setAttribute("aria-label", "开始录音");
@@ -5065,6 +5355,26 @@ async function stopRecordingAndTranscribe(): Promise<void> {
         elapsedMs: recordElapsedMs,
       });
       setStatus("录音太短了，请说完一句话后再停止。", "error");
+      return;
+    }
+    if (!hasSpeechLikeAudio(analysis)) {
+      resultMeta.textContent = "没有识别到语音";
+      copyButton.disabled = true;
+      addDiagnosticLog({
+        level: "warning",
+        category: "recording",
+        title: "录音接近静音",
+        message: "本次录音没有检测到有效人声，已在 ASR 前停止处理。",
+        mode: activeMode,
+        targetApp: recordingTargetApp,
+        elapsedMs: recordElapsedMs,
+        details: [
+          `RMS：${analysis.rms.toFixed(4)}`,
+          `峰值：${analysis.peak.toFixed(4)}`,
+          `有效采样比例：${(analysis.speechFrameRatio * 100).toFixed(2)}%`,
+        ],
+      });
+      setStatus("没有检测到有效语音，本次不会转写或 AI 润色。", "error");
       return;
     }
     await transcribeAudio(audioBlob, activeMode, recordElapsedMs);
@@ -5101,11 +5411,13 @@ function cancelRecordingOrReset(): void {
   }
   if (isRecording) {
     isRecording = false;
+    cancelStartingRecordingRequested = false;
     stopStream();
     void restoreSystemMute();
     stopTimer();
     recordedSamples = [];
     recordedSampleLength = 0;
+    recordedAudioFrameCount = 0;
     addDiagnosticLog({
       level: "warning",
       category: "recording",
@@ -5149,6 +5461,69 @@ function collectAudioSamples(event: AudioProcessingEvent): void {
   sampleCopy.set(input);
   recordedSamples.push(sampleCopy);
   recordedSampleLength += sampleCopy.length;
+  recordedAudioFrameCount += 1;
+  if (recordingFirstAudioFrameResolve) {
+    recordingFirstAudioFrameResolve();
+    recordingFirstAudioFrameResolve = null;
+  }
+}
+
+/** 等待录音首帧进入采样队列，避免 UI 过早提示导致开头语音被测试回放抢跑。 */
+function waitForFirstRecordingAudioFrame(timeoutMs: number): Promise<boolean> {
+  if (recordedSampleLength > 0) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    const timeoutHandle = window.setTimeout(() => {
+      if (recordingFirstAudioFrameResolve === finishWithFrame) {
+        recordingFirstAudioFrameResolve = null;
+      }
+      resolve(false);
+    }, timeoutMs);
+    const finishWithFrame = (): void => {
+      window.clearTimeout(timeoutHandle);
+      resolve(true);
+    };
+    recordingFirstAudioFrameResolve = finishWithFrame;
+  });
+}
+
+/** 等待提示音前收到足够多的真实采样回调，避免固定墙钟时间和设备采样节奏脱节。 */
+async function waitForRecordingReadyFrames(frameCount: number, timeoutMs: number): Promise<boolean> {
+  const startedAt = Date.now();
+  while (recordedAudioFrameCount < frameCount) {
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      return false;
+    }
+    await waitForNextRecordingAudioFrame(Math.min(remainingMs, 180));
+  }
+  return true;
+}
+
+/** 等待下一帧录音样本进入队列，供预卷阶段按真实采样进度推进。 */
+function waitForNextRecordingAudioFrame(timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timeoutHandle = window.setTimeout(() => {
+      if (recordingFirstAudioFrameResolve === finishWithFrame) {
+        recordingFirstAudioFrameResolve = null;
+      }
+      resolve(false);
+    }, timeoutMs);
+    const finishWithFrame = (): void => {
+      window.clearTimeout(timeoutHandle);
+      resolve(true);
+    };
+    recordingFirstAudioFrameResolve = finishWithFrame;
+  });
+}
+
+/** 读取当前已经进入录音队列的音频时长，用于诊断开始提示音前的实际预卷量。 */
+function readCapturedAudioDurationMs(): number {
+  if (!recordedSampleRate) {
+    return 0;
+  }
+  return Math.round((recordedSampleLength / recordedSampleRate) * 1000);
 }
 
 /** 从音频采样中估算当前音量等级，驱动悬浮条的实时波形。 */
@@ -5184,17 +5559,52 @@ function resetVoiceLevelVisual(): void {
   });
 }
 
-/** 停止 WebAudio 录音管线并把 PCM 样本编码成 WAV。 */
-function stopRecordingToWav(): Blob {
+/** 停止 WebAudio 录音管线并把 PCM 样本编码成 WAV，同时返回本地音量分析结果。 */
+function stopRecordingToWav(): RecordingWavResult {
   isRecording = false;
   disconnectAudioNodes();
   if (!recordedSampleLength || !recordedSampleRate) {
     throw new Error("录音内容为空");
   }
-  const wavBuffer = encodeWav(mergeSamples(recordedSamples, recordedSampleLength), recordedSampleRate);
+  const samples = mergeSamples(recordedSamples, recordedSampleLength);
+  const analysis = analyzeRecordingAudio(samples);
+  const wavBuffer = encodeWav(samples, recordedSampleRate);
   recordedSamples = [];
   recordedSampleLength = 0;
-  return new Blob([wavBuffer], { type: "audio/wav" });
+  recordedAudioFrameCount = 0;
+  return {
+    audioBlob: new Blob([wavBuffer], { type: "audio/wav" }),
+    analysis,
+  };
+}
+
+/** 分析整段录音音量，作为 ASR 前置静音门禁，避免空音频触发 ASR 幻觉文本。 */
+function analyzeRecordingAudio(samples: Float32Array): RecordingAudioAnalysis {
+  let sumSquares = 0;
+  let peak = 0;
+  let speechFrameCount = 0;
+  for (const sample of samples) {
+    const amplitude = Math.abs(sample);
+    sumSquares += sample * sample;
+    peak = Math.max(peak, amplitude);
+    if (amplitude >= MIN_SPEECH_PEAK) {
+      speechFrameCount += 1;
+    }
+  }
+  return {
+    rms: Math.sqrt(sumSquares / samples.length),
+    peak,
+    speechFrameRatio: speechFrameCount / samples.length,
+  };
+}
+
+/** 判断录音是否具备人声特征；静音或纯底噪不允许进入 ASR。 */
+function hasSpeechLikeAudio(analysis: RecordingAudioAnalysis): boolean {
+  return (
+    analysis.rms >= MIN_SPEECH_RMS &&
+    analysis.peak >= MIN_SPEECH_PEAK &&
+    analysis.speechFrameRatio >= MIN_SPEECH_FRAME_RATIO
+  );
 }
 
 /** 合并分片采样，生成连续的 Float32 PCM 数据。 */
@@ -5315,6 +5725,22 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
 
   const contextApp = recordingTargetApp || (await readFrontmostApp());
   const shouldProcess = mode !== "dictate" || config.postProcessDictation;
+  const historyId = createId();
+  const audioMetadata = await saveHistoryAudioBlob(audioBlob, historyId, mode, contextApp);
+  const sourceHistoryItem = saveHistory({
+    id: historyId,
+    mode,
+    sourceText,
+    outputText: sourceText,
+    createdAt: Date.now(),
+    recordElapsedMs,
+    transcribeElapsedMs: response.elapsedMs,
+    processElapsedMs: 0,
+    model: response.model,
+    contextApp,
+    ...audioMetadata,
+  });
+  updateRecentResult(sourceHistoryItem);
   let usedSourceFallback = false;
   let sourceFallbackReason = "";
   let processed: { text: string; elapsedMs: number; model: string };
@@ -5329,7 +5755,7 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
         targetApp: contextApp,
         details: [`模型：${config.textModel}`, `原文字数：${countTextUnits(sourceText)}`],
       });
-      processed = await processRecognizedText(sourceText, mode, config, contextApp);
+      processed = await processRecognizedText(sourceText, mode, config, contextApp, recordElapsedMs);
       if (mode === "dictate" && !processed.text.trim()) {
         usedSourceFallback = true;
         sourceFallbackReason = "AI 润色返回为空";
@@ -5381,7 +5807,7 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
   copyButton.disabled = !outputText;
 
   const historyItem = saveHistory({
-    id: createId(),
+    id: historyId,
     mode,
     sourceText,
     outputText,
@@ -5391,6 +5817,7 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
     processElapsedMs: processed.elapsedMs,
     model: processed.model || response.model,
     contextApp,
+    ...audioMetadata,
   });
   updateRecentResult(historyItem);
 
@@ -5402,7 +5829,22 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
   }
 
   if (usedSourceFallback) {
-    setStatus(formatAiFallbackMessage(sourceFallbackReason), "error");
+    const fallbackMessage = formatAiFallbackMessage(sourceFallbackReason);
+    setStatus(fallbackMessage, "error");
+    if (mode === "dictate" && config.postProcessDictation) {
+      addDiagnosticLog({
+        level: "warning",
+        category: "paste",
+        title: "阻止自动粘贴",
+        message: "口述 AI 润色未完成，本次只展示 ASR 原文供用户确认。",
+        mode,
+        targetApp: contextApp,
+        details: [`原因：${sourceFallbackReason || "未知"}`],
+      });
+      await showResultWindow(outputText, fallbackMessage, false);
+      await hideFloatingWindow();
+      return;
+    }
   }
   if (recordingKeepsHubVisible) {
     addDiagnosticLog({
@@ -5420,16 +5862,54 @@ async function transcribeAudio(audioBlob: Blob, mode: VoiceMode, recordElapsedMs
   await pasteTranscription(outputText, contextApp);
 }
 
+/** 保存本次录音音频到 Tauri 本地目录，并返回可写入历史记录的音频元信息。 */
+async function saveHistoryAudioBlob(
+  audioBlob: Blob,
+  historyId: string,
+  mode: VoiceMode,
+  contextApp: string,
+): Promise<Pick<HistoryItem, "audioFilePath" | "audioContentType" | "audioSizeBytes">> {
+  if (!isTauriRuntime()) {
+    return {};
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const response = await invoke<SaveHistoryAudioResponse>("save_history_audio", {
+      request: {
+        historyId,
+        audioBase64: await blobToBase64(audioBlob),
+        contentType: audioBlob.type || "audio/wav",
+      },
+    });
+    return {
+      audioFilePath: response.filePath,
+      audioContentType: response.contentType,
+      audioSizeBytes: response.bytes,
+    };
+  } catch (error) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "recording",
+      title: "保存历史音频失败",
+      message: formatError(error),
+      mode,
+      targetApp: contextApp,
+      details: [`音频大小：${formatBytes(audioBlob.size)}`],
+    });
+    return {};
+  }
+}
+
 /** 把 AI 润色回退原因整理成用户能判断的提示，避免把超时误解成转写失败。 */
 function formatAiFallbackMessage(reason: string): string {
   const normalizedReason = reason.trim();
   if (isAiTimeoutReason(normalizedReason)) {
-    return "AI 润色超时，本次已先使用 ASR 原文。";
+    return "AI 润色超时，本次已展示 ASR 原文并保存到历史记录，可在弹窗或历史记录中重试。";
   }
   if (normalizedReason) {
-    return `AI 润色未完成，本次已先使用 ASR 原文。原因：${normalizedReason}`;
+    return `AI 润色未完成，本次已展示 ASR 原文并保存到历史记录，可在弹窗或历史记录中重试。原因：${normalizedReason}`;
   }
-  return "AI 润色未产出可用内容，本次已先使用 ASR 原文。";
+  return "AI 润色未产出可用内容，本次已展示 ASR 原文并保存到历史记录，可在弹窗或历史记录中重试。";
 }
 
 /** 判断 Mimo 文本处理错误是否属于等待超时，便于诊断日志展示真实原因。 */
@@ -5547,6 +6027,7 @@ async function processRecognizedText(
   mode: VoiceMode,
   config: VoiceConfig,
   contextApp = "",
+  audioDurationMs = 0,
 ): Promise<{ text: string; elapsedMs: number; model: string }> {
   if (!isTauriRuntime()) {
     return { text, elapsedMs: 0, model: config.textModel };
@@ -5559,17 +6040,108 @@ async function processRecognizedText(
     textModel: config.textModel,
     mode,
     text,
+    audioDurationMs,
     dictionary: readDictionary(),
     targetLanguages: config.targetLanguages,
     contextApp,
     styleInstruction: buildStyleInstruction(config, mode),
   };
   const response = await invoke<ProcessTextResponse>("process_text", { request });
+  const processedText = response.processedText.trim();
+  assertNoInternalPromptLeak(processedText);
   return {
-    text: response.processedText,
+    text: sanitizeProcessedText(processedText, text, mode),
     elapsedMs: response.elapsedMs,
     model: response.model,
   };
+}
+
+/** 清理 AI 处理结果；口述短句被误当成请求回答时回退 ASR 原文。 */
+function sanitizeProcessedText(outputText: string, sourceText: string, mode: VoiceMode): string {
+  const sanitizedText = sanitizePromptLeakFromProcessedText(outputText, sourceText, mode);
+  if (mode === "dictate" && shouldFallbackDictationResponse(sanitizedText, sourceText)) {
+    return sourceText.trim();
+  }
+  return sanitizedText;
+}
+
+/** 判断口述短句是否被模型误处理成助手回复。 */
+function shouldFallbackDictationResponse(outputText: string, sourceText: string): boolean {
+  const source = sourceText.trim();
+  const output = outputText.trim();
+  if (!source || !output || countTextUnits(source) > 12) {
+    return false;
+  }
+  const normalizedOutput = output.replace(/\s+/g, "");
+  const assistantReplyMarkers = [
+    "好的，请",
+    "可以，请",
+    "当然，请",
+    "没问题，请",
+    "请发送",
+    "请提供",
+    "我可以帮",
+    "我来帮",
+  ];
+  return assistantReplyMarkers.some((marker) => normalizedOutput.startsWith(marker));
+}
+
+/** AI 输出包含内部提示结构时直接阻断后续粘贴，避免提示词进入用户输入框。 */
+function assertNoInternalPromptLeak(outputText: string): void {
+  if (!hasInternalPromptLeak(outputText)) {
+    return;
+  }
+  throw new Error("AI 输出包含内部提示结构，已阻止进入粘贴流程。");
+}
+
+/** 清理 AI 偶发复述的内部提示词，避免把词典、规则和 ASR 标签粘贴到用户输入框。 */
+function sanitizePromptLeakFromProcessedText(outputText: string, sourceText: string, mode: VoiceMode): string {
+  const normalizedOutput = outputText.trim();
+  if (!normalizedOutput || !hasInternalPromptLeak(normalizedOutput)) {
+    return normalizedOutput;
+  }
+  if (mode === "dictate") {
+    return readTextAfterLastMarker(normalizedOutput, ["ASR：", "ASR:"]) || sourceText.trim();
+  }
+  if (mode === "polish" || mode === "translate") {
+    return readTextAfterLastMarker(normalizedOutput, ["原文：", "原文:"]) || sourceText.trim();
+  }
+  return normalizedOutput;
+}
+
+/** 判断 AI 输出是否混入了只应存在于内部请求里的提示词结构。 */
+function hasInternalPromptLeak(text: string): boolean {
+  const promptMarkers = ["词典：", "应用：", "规则：", "ASR：", "ASR:", "原文：", "用户问题："];
+  const matchedCount = promptMarkers.filter((marker) => text.includes(marker)).length;
+  return matchedCount >= 2 || (text.includes("规则：") && (text.includes("ASR") || text.includes("原文"))) || hasRuleDescriptionOutput(text);
+}
+
+/** 判断 AI 是否把内部口述整理规则改写成用户可见说明。 */
+function hasRuleDescriptionOutput(text: string): boolean {
+  const normalizedText = text.replace(/\s+/g, "");
+  const titleMarkers = ["通用的规则描述如下", "通用规则描述如下", "规则描述如下", "整理规则如下", "处理规则如下"];
+  if (titleMarkers.some((marker) => normalizedText.includes(marker))) {
+    return true;
+  }
+  const bodyMarkers = ["删除无意义语气词", "合并断裂句", "修正ASR误识别", "修正asr误识别", "保留主观和限定词", "保持原意和语气"];
+  return bodyMarkers.filter((marker) => normalizedText.includes(marker)).length >= 2;
+}
+
+/** 从最后一个指定标签后读取正文，标签不存在或正文为空时返回空字符串。 */
+function readTextAfterLastMarker(text: string, markers: string[]): string {
+  let markerIndex = -1;
+  let markerLength = 0;
+  for (const marker of markers) {
+    const index = text.lastIndexOf(marker);
+    if (index > markerIndex) {
+      markerIndex = index;
+      markerLength = marker.length;
+    }
+  }
+  if (markerIndex < 0) {
+    return "";
+  }
+  return text.slice(markerIndex + markerLength).trim();
 }
 
 /** 读取用户开始录音前所在的前台 App，作为个性化上下文。 */
@@ -5779,6 +6351,7 @@ function renderResultWindow(payload: ResultWindowPayload): void {
   resultReason.textContent = payload.reason || "自动粘贴没有完成，结果未覆盖原剪贴板。";
   resultReason.dataset.state = payload.requiresAccessibility ? "warning" : "idle";
   resultCopyButton.disabled = !text;
+  resultRetryButton.disabled = !canRetryLatestHistory();
   resultOpenAccessibilityButton.disabled = false;
   resultOpenAccessibilityButton.textContent = "打开辅助功能设置";
   resultOpenAccessibilityButton.hidden = !payload.requiresAccessibility;
@@ -6001,13 +6574,36 @@ function renderHistory(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-history-filter]").forEach((button) => {
     button.classList.toggle("isActive", button.dataset.historyFilter === historyFilter);
   });
-  const history = readHistory().filter((item) => historyFilter === "all" || item.mode === historyFilter);
-  clearHistoryButton.disabled = readHistory().length === 0;
+  const allHistory = readHistory();
+  const history = allHistory.filter((item) => historyFilter === "all" || item.mode === historyFilter);
+  clearHistoryButton.disabled = allHistory.length === 0;
   if (!history.length) {
     historyList.innerHTML = '<div class="emptyState">还没有历史记录。</div>';
     return;
   }
-  historyList.innerHTML = history.map(renderHistoryItem).join("");
+  const totalPages = Math.max(1, Math.ceil(history.length / HISTORY_PAGE_SIZE));
+  historyPage = Math.min(Math.max(historyPage, 1), totalPages);
+  const pageStart = (historyPage - 1) * HISTORY_PAGE_SIZE;
+  const pageItems = history.slice(pageStart, pageStart + HISTORY_PAGE_SIZE);
+  historyList.innerHTML = pageItems.map(renderHistoryItem).join("") + renderHistoryPagination(history.length, totalPages);
+}
+
+/** 渲染历史记录分页控件，避免一次性创建大量历史卡片导致 Hub 卡顿。 */
+function renderHistoryPagination(totalItems: number, totalPages: number): string {
+  if (totalPages <= 1) {
+    return `<div class="historyPagination"><span>共 ${totalItems} 条</span></div>`;
+  }
+  const pageStart = (historyPage - 1) * HISTORY_PAGE_SIZE + 1;
+  const pageEnd = Math.min(historyPage * HISTORY_PAGE_SIZE, totalItems);
+  return `
+    <div class="historyPagination">
+      <span>${pageStart}-${pageEnd} / 共 ${totalItems} 条</span>
+      <div class="historyPaginationActions">
+        <button type="button" data-history-page-action="prev" ${historyPage <= 1 ? "disabled" : ""}>上一页</button>
+        <strong>${historyPage} / ${totalPages}</strong>
+        <button type="button" data-history-page-action="next" ${historyPage >= totalPages ? "disabled" : ""}>下一页</button>
+      </div>
+    </div>`;
 }
 
 /** 把单条历史记录渲染为列表项。 */
@@ -6017,6 +6613,7 @@ function renderHistoryItem(item: HistoryItem): string {
     item.sourceText.trim() && item.sourceText.trim() !== item.outputText.trim()
       ? `<details class="historySourceDisclosure"><summary>查看原文</summary><p>${escapeHtml(item.sourceText)}</p></details>`
       : "";
+  const audioPlayer = renderHistoryAudioPlayer(item);
   return `
     <article class="historyItem">
       <div class="historyMeta">
@@ -6026,6 +6623,7 @@ function renderHistoryItem(item: HistoryItem): string {
       <div class="historyTimingGrid">${formatHistoryTimingChips(item)}</div>
       ${context}
       <p>${escapeHtml(item.outputText)}</p>
+      ${audioPlayer}
       ${sourceDetail}
       <div class="rowActions">
         <button type="button" data-history-action="copy" data-history-id="${item.id}">复制</button>
@@ -6035,10 +6633,138 @@ function renderHistoryItem(item: HistoryItem): string {
     </article>`;
 }
 
+/** 渲染历史录音播放器，旧历史或非录音来源没有音频时不展示。 */
+function renderHistoryAudioPlayer(item: HistoryItem): string {
+  if (!item.audioFilePath || !isTauriRuntime()) {
+    return "";
+  }
+  const audioSize = item.audioSizeBytes ? ` · ${formatBytes(item.audioSizeBytes)}` : "";
+  const cachedAudioUrl = historyAudioObjectUrls.get(item.id) || "";
+  return `
+    <div class="historyAudioPlayer" data-history-audio-id="${item.id}">
+      <span>录音${audioSize}</span>
+      <div class="historyAudioControls">
+        <button type="button" data-history-audio-action="play" data-history-id="${item.id}">${cachedAudioUrl ? "重新播放" : "播放录音"}</button>
+        <audio controls preload="none" data-history-audio-control-id="${item.id}" ${cachedAudioUrl ? `src="${escapeHtml(cachedAudioUrl)}"` : ""}></audio>
+      </div>
+      <small data-history-audio-status></small>
+    </div>`;
+}
+
+/** 读取并绑定历史录音 Blob URL，供自定义按钮和原生 audio 控件共用。 */
+async function ensureHistoryAudioLoaded(item: HistoryItem, audio: HTMLAudioElement): Promise<string> {
+  const audioFilePath = item.audioFilePath;
+  if (!audioFilePath) {
+    throw new Error("历史录音文件不存在。");
+  }
+  let audioUrl = historyAudioObjectUrls.get(item.id);
+  if (!audioUrl) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const response = await invoke<ReadHistoryAudioResponse>("read_history_audio", {
+      request: { filePath: audioFilePath },
+    });
+    const audioBlob = base64ToBlob(response.audioBase64, response.contentType || item.audioContentType || "audio/wav");
+    audioUrl = URL.createObjectURL(audioBlob);
+    historyAudioObjectUrls.set(item.id, audioUrl);
+  }
+  if (audio.src !== audioUrl) {
+    audio.src = audioUrl;
+    audio.load();
+  }
+  return audioUrl;
+}
+
+/** 播放已加载好的历史录音，并同步按钮与提示状态。 */
+async function playLoadedHistoryAudio(item: HistoryItem, audio: HTMLAudioElement, container: HTMLElement): Promise<void> {
+  const status = container.querySelector<HTMLElement>("[data-history-audio-status]");
+  const button = container.querySelector<HTMLButtonElement>("[data-history-audio-action='play']");
+  if (!status) {
+    return;
+  }
+  status.textContent = "正在读取录音。";
+  try {
+    await ensureHistoryAudioLoaded(item, audio);
+    await audio.play();
+    if (button) {
+      button.textContent = "重新播放";
+    }
+    status.textContent = "";
+  } catch (error) {
+    status.textContent = `录音播放失败：${formatError(error)}`;
+    throw error;
+  }
+}
+
+/** 懒加载并播放单条历史录音，避免本地资源协议异常导致 audio 控件显示 Error。 */
+async function playHistoryAudio(button: HTMLButtonElement): Promise<void> {
+  const historyId = button.dataset.historyId || "";
+  const item = readHistory().find((historyItem) => historyItem.id === historyId);
+  const container = button.closest<HTMLElement>("[data-history-audio-id]");
+  const audio = container?.querySelector<HTMLAudioElement>("audio");
+  if (!item?.audioFilePath || !audio || !container) {
+    return;
+  }
+  button.disabled = true;
+  try {
+    await playLoadedHistoryAudio(item, audio, container);
+  } catch {
+    // 失败提示已在播放器状态区展示。
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/** 处理原生 audio 控件的首次播放，首次点击时也懒加载历史录音。 */
+function handleHistoryAudioNativePlay(event: Event): void {
+  const audio = event.target;
+  if (!(audio instanceof HTMLAudioElement) || audio.src) {
+    return;
+  }
+  const historyId = audio.dataset.historyAudioControlId || "";
+  const item = readHistory().find((historyItem) => historyItem.id === historyId);
+  const container = audio.closest<HTMLElement>("[data-history-audio-id]");
+  if (!item?.audioFilePath || !container) {
+    return;
+  }
+  event.preventDefault();
+  audio.pause();
+  void playLoadedHistoryAudio(item, audio, container).catch(() => {
+    // 失败提示已在播放器状态区展示。
+  });
+}
+
+/** 释放单条历史录音的临时 Blob URL，避免删除历史后继续占用内存。 */
+function revokeHistoryAudioObjectUrl(historyId: string): void {
+  const audioUrl = historyAudioObjectUrls.get(historyId);
+  if (!audioUrl) {
+    return;
+  }
+  URL.revokeObjectURL(audioUrl);
+  historyAudioObjectUrls.delete(historyId);
+}
+
+/** 释放所有已加载历史录音的临时 Blob URL。 */
+function revokeAllHistoryAudioObjectUrls(): void {
+  historyAudioObjectUrls.forEach((audioUrl) => URL.revokeObjectURL(audioUrl));
+  historyAudioObjectUrls.clear();
+}
+
 /** 处理历史列表里的复制、重试和删除。 */
 function handleHistoryAction(event: MouseEvent): void {
   const target = event.target;
   if (!(target instanceof HTMLElement)) {
+    return;
+  }
+  const pageButton = target.closest<HTMLButtonElement>("[data-history-page-action]");
+  if (pageButton) {
+    const action = pageButton.dataset.historyPageAction || "";
+    historyPage += action === "next" ? 1 : -1;
+    renderHistory();
+    return;
+  }
+  const audioButton = target.closest<HTMLButtonElement>("[data-history-audio-action]");
+  if (audioButton) {
+    void playHistoryAudio(audioButton);
     return;
   }
   const button = target.closest<HTMLButtonElement>("[data-history-action]");
@@ -6057,7 +6783,11 @@ function handleHistoryAction(event: MouseEvent): void {
     if (!confirmDangerousAction(`deleteHistory:${id}`, button, "再次点击删除", "再次点击将删除这条历史记录。")) {
       return;
     }
-    writeHistory(readHistory().filter((historyItem) => historyItem.id !== id));
+    const currentHistory = readHistory();
+    const nextHistory = currentHistory.filter((historyItem) => historyItem.id !== id);
+    writeHistory(nextHistory);
+    revokeHistoryAudioObjectUrl(id);
+    void deleteUnreferencedHistoryAudioFiles(currentHistory, nextHistory);
     resetPendingConfirmation();
     renderHub();
   } else if (action === "retry") {
@@ -6066,10 +6796,10 @@ function handleHistoryAction(event: MouseEvent): void {
 }
 
 /** 用现有 ASR 原文重新执行 AI 处理。 */
-async function reprocessHistoryItem(item: HistoryItem): Promise<void> {
+async function reprocessHistoryItem(item: HistoryItem): Promise<HistoryItem | null> {
   try {
     const config = readSavedConfig();
-    const processed = await processRecognizedText(item.sourceText, item.mode, config, item.contextApp);
+    const processed = await processRecognizedText(item.sourceText, item.mode, config, item.contextApp, item.recordElapsedMs);
     const nextItem: HistoryItem = {
       ...item,
       id: createId(),
@@ -6080,9 +6810,12 @@ async function reprocessHistoryItem(item: HistoryItem): Promise<void> {
     };
     saveHistory(nextItem);
     renderHub();
+    updateRecentResult(nextItem);
     showHubNotice("已基于原文重新整理。", "success");
+    return nextItem;
   } catch (error) {
     showHubNotice(`重新整理失败：${formatError(error)}`, "error");
+    return null;
   }
 }
 
@@ -6096,6 +6829,37 @@ async function retryLatestHistory(): Promise<void> {
   showHubNotice("没有可重新整理的历史记录。", "error");
 }
 
+/** 最近历史是否可以作为结果窗口中的 AI 重试来源。 */
+function canRetryLatestHistory(): boolean {
+  return Boolean(readHistory()[0]?.sourceText.trim());
+}
+
+/** 在结果兜底窗口中基于最近历史重新执行 AI 处理。 */
+async function retryLatestHistoryFromResultWindow(): Promise<void> {
+  const latest = readHistory()[0];
+  if (!latest?.sourceText.trim()) {
+    resultReason.textContent = "没有可重试的原文历史。";
+    resultReason.dataset.state = "error";
+    resultRetryButton.disabled = true;
+    return;
+  }
+  resultRetryButton.disabled = true;
+  resultReason.textContent = "正在基于已保存原文重试 AI 润色。";
+  resultReason.dataset.state = "warning";
+  const nextItem = await reprocessHistoryItem(latest);
+  if (!nextItem) {
+    resultReason.textContent = "重试 AI 润色失败，原文仍保存在历史记录中。";
+    resultReason.dataset.state = "error";
+    resultRetryButton.disabled = !canRetryLatestHistory();
+    return;
+  }
+  resultWindowTextarea.value = nextItem.outputText;
+  resultCopyButton.disabled = !nextItem.outputText.trim();
+  resultRetryButton.disabled = !canRetryLatestHistory();
+  resultReason.textContent = "AI 润色重试成功，结果已更新。";
+  resultReason.dataset.state = "success";
+}
+
 /** 清空历史记录，执行前要求二次点击确认。 */
 function clearHistory(button: HTMLButtonElement): void {
   if (!readHistory().length) {
@@ -6106,6 +6870,9 @@ function clearHistory(button: HTMLButtonElement): void {
     return;
   }
   localStorage.removeItem(HISTORY_STORAGE_KEY);
+  revokeAllHistoryAudioObjectUrls();
+  void clearHistoryAudioFiles();
+  void syncTrayDictationHistory([]);
   resetPendingConfirmation();
   renderHub();
   showHubNotice("历史记录已清空。", "success");
@@ -6412,6 +7179,9 @@ function normalizeHistoryItem(value: Partial<HistoryItem>): HistoryItem | null {
     processElapsedMs: typeof value.processElapsedMs === "number" ? value.processElapsedMs : 0,
     model: typeof value.model === "string" ? value.model : "",
     contextApp: typeof value.contextApp === "string" ? value.contextApp : "",
+    audioFilePath: typeof value.audioFilePath === "string" ? value.audioFilePath : "",
+    audioContentType: typeof value.audioContentType === "string" ? value.audioContentType : "",
+    audioSizeBytes: typeof value.audioSizeBytes === "number" ? value.audioSizeBytes : 0,
   };
 }
 
@@ -6434,7 +7204,7 @@ function saveHistory(item: HistoryItem): HistoryItem {
   if (readSavedConfig().historyRetention === "never") {
     return item;
   }
-  const history = [item, ...readHistory()].slice(0, 300);
+  const history = [item, ...readHistory().filter((historyItem) => historyItem.id !== item.id)].slice(0, 300);
   writeHistory(history);
   return item;
 }
@@ -6442,6 +7212,93 @@ function saveHistory(item: HistoryItem): HistoryItem {
 /** 写入历史记录。 */
 function writeHistory(history: HistoryItem[]): void {
   localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history));
+  void syncTrayDictationHistory(history);
+}
+
+/** 删除旧历史中已经不再被新历史引用的音频文件。 */
+async function deleteUnreferencedHistoryAudioFiles(previousHistory: HistoryItem[], nextHistory: HistoryItem[]): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const nextAudioPaths = new Set(
+    nextHistory.map((item) => item.audioFilePath).filter((path): path is string => typeof path === "string" && path.length > 0),
+  );
+  const removedAudioPaths = previousHistory
+    .map((item) => item.audioFilePath)
+    .filter((path): path is string => typeof path === "string" && path.length > 0 && !nextAudioPaths.has(path));
+  if (!removedAudioPaths.length) {
+    return;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("delete_history_audio_files", { request: { filePaths: Array.from(new Set(removedAudioPaths)) } });
+  } catch (error) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "system",
+      title: "删除历史音频失败",
+      message: formatError(error),
+    });
+  }
+}
+
+/** 清空所有历史录音文件，用于用户清空历史记录时同步释放磁盘空间。 */
+async function clearHistoryAudioFiles(): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("clear_history_audio_files");
+  } catch (error) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "system",
+      title: "清空历史音频失败",
+      message: formatError(error),
+    });
+  }
+}
+
+/** 同步最近口述历史到原生托盘菜单，供托盘子菜单一键复制。 */
+async function syncTrayDictationHistory(history = readHistory()): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  const items = history
+    .filter((item) => item.mode === "dictate" && item.outputText.trim())
+    .slice(0, TRAY_HISTORY_MAX_ITEMS)
+    .map(buildTrayHistoryItem);
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("sync_tray_dictation_history", { items });
+  } catch (error) {
+    addDiagnosticLog({
+      level: "warning",
+      category: "system",
+      title: "同步托盘口述历史失败",
+      message: formatError(error),
+    });
+  }
+}
+
+/** 把完整历史记录转换成托盘菜单需要的短标题和完整复制文本。 */
+function buildTrayHistoryItem(item: HistoryItem): TrayHistoryItem {
+  return {
+    id: item.id,
+    title: makeTrayHistoryTitle(item.outputText),
+    text: item.outputText.trim(),
+  };
+}
+
+/** 生成托盘历史标题，避免长文本撑开系统菜单。 */
+function makeTrayHistoryTitle(text: string): string {
+  const normalizedText = text.trim().replace(/\s+/g, " ");
+  const chars = Array.from(normalizedText);
+  if (chars.length <= 32) {
+    return normalizedText;
+  }
+  return `${chars.slice(0, 32).join("")}...`;
 }
 
 /** 读取本地字幕历史，异常时返回空数组。 */
@@ -6785,7 +7642,20 @@ async function copyText(text: string): Promise<void> {
 function startTimer(): void {
   stopTimer();
   const tick = (): void => {
-    recordTimer.textContent = formatDuration(Date.now() - recordStartedAt);
+    const elapsedMs = Date.now() - recordStartedAt;
+    recordTimer.textContent = formatDuration(elapsedMs);
+    if (elapsedMs >= MAX_RECORDING_MS && isRecording && !isProcessing) {
+      addDiagnosticLog({
+        level: "warning",
+        category: "recording",
+        title: "达到最长录音时长",
+        message: "录音已达到最长时长，自动停止并进入转写。",
+        mode: activeMode,
+        targetApp: recordingTargetApp,
+        elapsedMs,
+      });
+      void stopRecordingAndTranscribe();
+    }
   };
   tick();
   timerHandle = window.setInterval(tick, 250);

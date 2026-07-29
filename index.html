@@ -674,6 +674,13 @@
                 </div>
               </label>
               <label class="settingsRow">
+                <span>麦克风处理</span>
+                <select id="microphoneProcessingSelect">
+                  <option value="enhanced">增强：降噪、回声消除、自动增益</option>
+                  <option value="natural">原声：关闭浏览器音频处理</option>
+                </select>
+              </label>
+              <label class="settingsRow">
                 <span>系统声音</span>
                 <select id="systemAudioSelect">
                   <option value="auto">自动检测系统音频输入</option>
@@ -809,6 +816,10 @@
           <button id="resultCopyButton" class="primaryAction" type="button" disabled>
             <span class="buttonIcon" data-icon="copy" aria-hidden="true"></span>
             <span>复制结果</span>
+          </button>
+          <button id="resultRetryButton" class="plainButton" type="button" disabled>
+            <span class="buttonIcon" data-icon="refresh" aria-hidden="true"></span>
+            <span>重试 AI 润色</span>
           </button>
           <button id="resultOpenAccessibilityButton" class="plainButton" type="button" hidden>打开辅助功能设置</button>
         </div>
