@@ -1,24 +1,39 @@
 # typesass
 
-轻量语音转文字桌面工具。当前版本已经具备 Typeless 风格核心闭环：
+![typesass logo](src/assets/typesass-logo.png)
 
-- 填写小米 Mimo API Key
-- 全局快捷键唤起录音
-- 停止后自动转写、整理、翻译或问答
-- 口述/翻译结果自动粘贴到当前输入框
-- 口述可一键关闭 AI 润色，直接粘贴原始转写
-- 无法粘贴或随便问时在 Hub 展示结果
-- 本地历史、词典、设置和 Typeless 风格托盘菜单
+typesass is a lightweight desktop speech-to-text assistant for dictation,
+translation, quick Q&A, and automatic paste workflows. It is built with Tauri,
+Vite, and TypeScript, and currently uses Xiaomi Mimo-compatible OpenAI-style
+API endpoints for ASR and text generation.
 
-默认快捷键：
+## Features
 
-- 口述：`Control + P`
-- 翻译：`Control + T`
-- 随便问：`Control + Space`
+- Start recording from a global shortcut.
+- Transcribe speech, then optionally polish the dictated text with AI.
+- Translate spoken content and paste the result into the active input field.
+- Ask quick voice questions and view the answer in the local hub.
+- Keep local history, dictionary entries, settings, and tray-menu workflows.
+- Store API credentials outside the source code.
 
-## 本地预览
+## Default Shortcuts
 
-当前机器如果还没有 Rust/Cargo，可以先用网页预览模式验证转写效果：
+| Action | Shortcut |
+| --- | --- |
+| Dictation | `Control + P` |
+| Translation | `Control + T` |
+| Ask | `Control + Space` |
+
+## Requirements
+
+- Node.js 20 or later
+- npm
+- Rust and Cargo for the Tauri desktop app
+- A Xiaomi Mimo API key
+
+## Web Preview
+
+Use the web preview when Rust/Cargo is not installed yet:
 
 ```bash
 npm install
@@ -26,42 +41,62 @@ npm run build
 npm run preview:web
 ```
 
-打开终端里显示的地址后，在页面输入 Mimo API Key 再录音。
+Open the URL printed in the terminal, enter your Mimo API key, and start
+recording.
 
-也可以用环境变量提供密钥：
+You can also provide the key through an environment variable:
 
 ```bash
-MIMO_API_KEY=你的密钥 npm run preview:web
+MIMO_API_KEY=your_api_key npm run preview:web
 ```
 
-## Tauri 桌面端
+## Desktop Development
 
-安装 Rust 后运行：
+Install Rust first, then run the Tauri app:
 
 ```bash
 npm install
 npm run dev
 ```
 
-也可以用环境变量提供密钥，避免把 Key 填进界面：
+You can also provide the key through an environment variable:
 
 ```bash
-MIMO_API_KEY=你的密钥 npm run dev
+MIMO_API_KEY=your_api_key npm run dev
 ```
 
-打包：
+Build the desktop app:
 
 ```bash
 npm run tauri:build
 ```
 
-## 默认配置
+## Default Model Configuration
 
-- Base URL: `https://token-plan-cn.xiaomimimo.com/v1`
-- ASR 模型: `mimo-v2.5-asr`
-- AI 模型: `mimo-v2.5`
-- 语言: 自动识别
+| Setting | Value |
+| --- | --- |
+| Base URL | `https://token-plan-cn.xiaomimimo.com/v1` |
+| ASR model | `mimo-v2.5-asr` |
+| AI model | `mimo-v2.5` |
+| Language | Auto detect |
 
-## 安全说明
+## Privacy And Security
 
-当前版本不会把 API Key 写死在代码里，也不会保存到 localStorage。桌面端设置页输入的 Key 会写入 macOS 钥匙串；也可以通过 `MIMO_API_KEY` 环境变量提供。
+typesass does not hard-code API keys and does not store them in `localStorage`.
+On macOS, keys entered in the desktop settings page are stored in Keychain. You
+can also provide `MIMO_API_KEY` at runtime if you prefer environment-based
+configuration.
+
+## Repository Mirrors
+
+This project is mirrored as:
+
+- GitHub: `typesass`
+- Alibaba Cloud Codeup: `aiTool`
+
+The local `origin` remote is configured to keep the Codeup repository as the
+fetch source and push to both Codeup and GitHub.
+
+## License
+
+MIT
