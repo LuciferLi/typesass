@@ -2,7 +2,7 @@
 
 ![typesass logo](src/assets/typesass-logo.png)
 
-Official website: <https://lucifer.tolern.com/>
+Official website: <https://typesass.tolern.com/>
 
 typesass is a lightweight desktop speech-to-text assistant for dictation,
 translation, quick Q&A, and automatic paste workflows. It is built with Tauri,
