@@ -43,6 +43,7 @@ jspm_packages/
 dist/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/binaries/
 .playwright-cli/
 
 # Snowpack dependency directory (https://snowpack.dev/)

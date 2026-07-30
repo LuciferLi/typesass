@@ -2,10 +2,30 @@
 
 ![typesass logo](src/assets/typesass-logo.png)
 
+Official website: <https://lucifer.tolern.com/>
+
 typesass is a lightweight desktop speech-to-text assistant for dictation,
 translation, quick Q&A, and automatic paste workflows. It is built with Tauri,
 Vite, and TypeScript, and currently uses Xiaomi Mimo-compatible OpenAI-style
 API endpoints for ASR and text generation.
+
+## 中文说明
+
+typesass 是一款轻量级桌面语音转文字助手，面向日常口述输入、语音翻译、随口提问和自动粘贴工作流。当前版本基于 Tauri、Vite 和 TypeScript 构建，并使用兼容 OpenAI 风格的小米 Mimo API 端点完成语音识别和文本生成。
+
+### 功能特性
+
+- 通过全局快捷键开始录音。
+- 语音转文字后，可选择使用 AI 自动润色口述内容。
+- 支持语音翻译，并把结果自动粘贴到当前输入框。
+- 支持语音提问，结果在本地 Hub 中展示。
+- 支持本地历史、词典、设置和托盘菜单。
+- API Key 不写入源码，桌面端可存储到 macOS 钥匙串。
+
+### 下载状态
+
+- macOS: 已提供 `0.0.1` 版本安装包。
+- Windows: 开发中。
 
 ## Features
 
@@ -30,6 +50,11 @@ API endpoints for ASR and text generation.
 - npm
 - Rust and Cargo for the Tauri desktop app
 - A Xiaomi Mimo API key
+
+## Downloads
+
+- macOS: `0.0.1` is available from GitHub Releases.
+- Windows: in development.
 
 ## Web Preview
 

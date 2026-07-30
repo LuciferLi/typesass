@@ -1,6 +1,6 @@
 {
   "name": "typesass",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -11,7 +11,7 @@
   "bugs": {
     "url": "https://github.com/LuciferLi/typesass/issues"
   },
-  "homepage": "https://github.com/LuciferLi/typesass#readme",
+  "homepage": "https://lucifer.tolern.com/",
   "scripts": {
     "dev": "tauri dev",
     "dev:frontend": "vite --host 127.0.0.1",
