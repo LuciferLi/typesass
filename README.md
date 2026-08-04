@@ -24,7 +24,7 @@ typesass 是一款轻量级桌面语音转文字助手，面向日常口述输�
 
 ### 下载状态
 
-- macOS: 已提供 `0.0.1` 版本安装包。
+- macOS: 已提供 `0.0.2` 版本安装包。
 - Windows: 开发中。
 
 ## Features
@@ -53,7 +53,7 @@ typesass 是一款轻量级桌面语音转文字助手，面向日常口述输�
 
 ## Downloads
 
-- macOS: `0.0.1` is available from GitHub Releases.
+- macOS: `0.0.2` is available from GitHub Releases.
 - Windows: in development.
 
 ## Web Preview
