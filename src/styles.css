@@ -1053,6 +1053,9 @@ button[data-confirming="true"] {
 .shortcutGrid article,
 .resultPanel,
 .historyItem,
+.codexThreadPanel,
+.codexDetailPanel,
+.codexThreadItem,
 .settingsSection,
 .settingsBlock,
 .settingsRow,
@@ -1801,6 +1804,7 @@ textarea::placeholder {
 }
 
 .historyItem,
+.codexThreadItem,
 .diagnosticLogItem {
   padding: 14px 16px;
   animation: cardIn 300ms var(--motion) both;
@@ -1811,6 +1815,8 @@ textarea::placeholder {
 }
 
 .historyItem:hover,
+.codexThreadItem:hover,
+.codexThreadItem.isActive,
 .diagnosticLogItem:hover {
   border-color: rgba(139, 92, 246, 0.3);
   background: #24242a;
@@ -1832,6 +1838,195 @@ textarea::placeholder {
   line-height: 1.6;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
+}
+
+.codexStatusPill {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--lineSoft);
+  border-radius: 999px;
+  padding: 0 12px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.codexStatusPill span {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--faint);
+  box-shadow: 0 0 0 4px rgba(113, 113, 122, 0.12);
+}
+
+.codexStatusPill[data-state="success"] {
+  border-color: rgba(16, 185, 129, 0.28);
+  color: #bbf7d0;
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.codexStatusPill[data-state="success"] span {
+  background: #22c55e;
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.14);
+}
+
+.codexStatusPill[data-state="warning"] {
+  border-color: rgba(245, 158, 11, 0.32);
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.codexStatusPill[data-state="warning"] span {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.14);
+}
+
+.codexStatusPill[data-state="error"] {
+  border-color: rgba(239, 68, 68, 0.35);
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.codexStatusPill[data-state="error"] span {
+  background: #ef4444;
+  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.14);
+}
+
+.codexAssistantLayout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1.5fr);
+  gap: 14px;
+  min-height: 560px;
+}
+
+.codexThreadPanel,
+.codexDetailPanel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+  padding: 14px;
+}
+
+.codexDetailPanel {
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+}
+
+.codexPanelHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.codexThreadPanel .listSurface,
+.codexMessageList {
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.codexThreadItem {
+  width: 100%;
+  cursor: pointer;
+  text-align: left;
+}
+
+.codexThreadItem h2 {
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 780;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codexThreadItem p {
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codexMessageList {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.codexMessageItem {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--lineSoft);
+  border-radius: var(--radiusControl);
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.codexMessageItem[data-role="user"] {
+  border-color: rgba(59, 130, 246, 0.28);
+}
+
+.codexMessageItem[data-role="assistant"] {
+  border-color: rgba(16, 185, 129, 0.24);
+}
+
+.codexMessageRole {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.codexMessageItem p {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #e4e4e7;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.codexComposer {
+  display: grid;
+  gap: 10px;
+}
+
+.codexComposer textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.codexCommandOutput {
+  min-height: 34px;
+  border: 1px solid var(--lineSoft);
+  border-radius: var(--radiusControl);
+  padding: 9px 10px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+}
+
+.codexCommandOutput[data-state="success"] {
+  border-color: rgba(16, 185, 129, 0.28);
+  color: #bbf7d0;
+}
+
+.codexCommandOutput[data-state="error"] {
+  border-color: rgba(239, 68, 68, 0.35);
+  color: #fecaca;
 }
 
 .logSummary {

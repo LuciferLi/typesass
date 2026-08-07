@@ -111,9 +111,79 @@ type DiagnosticLogCategory = "recording" | "transcribe" | "process" | "paste" | 
 type SubtitleAudioSource = "microphone" | "system" | "mixed";
 type MicrophoneProcessingMode = "enhanced" | "natural";
 type SubtitleOverlayState = "hidden" | "listening" | "text" | "error";
+type CodexConnectionState = "idle" | "success" | "warning" | "error";
 type IconName = keyof typeof ICON_RENDERERS;
 type ReadinessAction = "apiKey" | "microphone" | "accessibility" | "shortcut" | "modes" | "start" | "refresh";
 type PermissionKind = "apiKey" | "microphone" | "accessibility" | "shortcut" | "systemAudio";
+
+interface CodexStatusResponse {
+  /** 当前本机是否具备可调用 Codex 的最低条件。 */
+  connected: boolean;
+  /** 面向界面展示的连接状态说明。 */
+  message: string;
+  /** 当前检测到的 Codex CLI 版本。 */
+  cliVersion: string;
+  /** 本地会话索引文件是否存在且可读。 */
+  hasSessionIndex: boolean;
+}
+
+interface CodexThreadSummary {
+  /** Codex 会话 ID，用于读取详情和向既有会话发送消息。 */
+  id: string;
+  /** Codex 会话标题或本地索引中的 thread_name。 */
+  title: string;
+  /** 最近更新时间的 ISO 字符串。 */
+  updatedAt: string;
+}
+
+interface CodexThreadMessage {
+  /** 消息角色，MVP 只展示用户和助手消息。 */
+  role: "user" | "assistant";
+  /** 消息正文，已在原生侧做长度保护。 */
+  content: string;
+  /** 消息创建时间的 ISO 字符串。 */
+  createdAt: string;
+}
+
+interface CodexThreadDetail {
+  /** Codex 会话 ID。 */
+  id: string;
+  /** Codex 会话标题。 */
+  title: string;
+  /** 最近更新时间的 ISO 字符串。 */
+  updatedAt: string;
+  /** 本地解析出的最近消息列表。 */
+  messages: CodexThreadMessage[];
+}
+
+interface CodexCommandResponse {
+  /** 命令是否成功完成。 */
+  success: boolean;
+  /** 命令完成后的界面提示。 */
+  message: string;
+  /** 创建或续接后的会话 ID。 */
+  threadId: string;
+  /** Codex 命令最后输出摘要。 */
+  output: string;
+}
+
+interface CodexCommandStartResponse {
+  /** 本次后台命令 ID，前端用它轮询结果。 */
+  commandId: string;
+  /** 后台命令启动提示。 */
+  message: string;
+}
+
+interface CodexCommandOutcome {
+  /** 本次后台命令 ID。 */
+  commandId: string;
+  /** 后台命令是否成功完成。 */
+  ok: boolean;
+  /** 成功时的命令响应。 */
+  response?: CodexCommandResponse | null;
+  /** 失败时的错误摘要。 */
+  error?: string | null;
+}
 
 interface PasteTranscriptionOptions {
   /** 是否在系统只确认发出粘贴指令但无法确认写入输入框时展示结果兜底窗口。 */
@@ -708,6 +778,7 @@ const VIEW_TITLES: Record<string, { eyebrow: string; title: string }> = {
   subtitleSettings: { eyebrow: "只影响实时字幕", title: "实时字幕设置" },
   history: { eyebrow: "只保存在本机", title: "历史记录" },
   dictionary: { eyebrow: "专有名词更准确", title: "词典" },
+  codexAssistant: { eyebrow: "本机 Codex 会话", title: "Codex助手" },
   diagnosticsLog: { eyebrow: "定位自动粘贴问题", title: "诊断日志" },
   settings: { eyebrow: "本机配置", title: "系统设置" },
 };
@@ -812,6 +883,20 @@ const diagnosticLogList = getElement<HTMLElement>("diagnosticLogList");
 const diagnosticLogCount = getElement<HTMLElement>("diagnosticLogCount");
 const copyDiagnosticLogButton = getElement<HTMLButtonElement>("copyDiagnosticLogButton");
 const clearDiagnosticLogButton = getElement<HTMLButtonElement>("clearDiagnosticLogButton");
+const codexStatusPill = getElement<HTMLElement>("codexStatusPill");
+const codexStatusText = getElement<HTMLElement>("codexStatusText");
+const refreshCodexStatusButton = getElement<HTMLButtonElement>("refreshCodexStatusButton");
+const refreshCodexThreadsButton = getElement<HTMLButtonElement>("refreshCodexThreadsButton");
+const codexThreadSummary = getElement<HTMLElement>("codexThreadSummary");
+const codexThreadList = getElement<HTMLElement>("codexThreadList");
+const codexDetailTitle = getElement<HTMLElement>("codexDetailTitle");
+const codexDetailMeta = getElement<HTMLElement>("codexDetailMeta");
+const codexMessageList = getElement<HTMLElement>("codexMessageList");
+const codexMessageForm = getElement<HTMLFormElement>("codexMessageForm");
+const codexMessageInput = getElement<HTMLTextAreaElement>("codexMessageInput");
+const createCodexThreadButton = getElement<HTMLButtonElement>("createCodexThreadButton");
+const sendCodexMessageButton = getElement<HTMLButtonElement>("sendCodexMessageButton");
+const codexCommandOutput = getElement<HTMLElement>("codexCommandOutput");
 const authorizeMicrophoneButton = getElement<HTMLButtonElement>("authorizeMicrophoneButton");
 const apiKeyStatus = getElement<HTMLElement>("apiKeyStatus");
 const microphoneStatus = getElement<HTMLElement>("microphoneStatus");
@@ -896,6 +981,9 @@ let activePermissionDialog: { mode: ShortcutMode; kind: PermissionKind } | null 
 let subtitleAudioAppsCache: ProcessTapAudioApp[] = [];
 let subtitleAppsDraftTargets: string[] = ["active"];
 let lastPermissionSnapshot: RuntimePermissionSnapshot = createDefaultPermissionSnapshot();
+let codexThreadsCache: CodexThreadSummary[] = [];
+let selectedCodexThreadId = "";
+let codexCommandInFlight = false;
 let subtitleMicStream: MediaStream | null = null;
 let subtitleSystemStream: MediaStream | null = null;
 let subtitleAudioContext: AudioContext | null = null;
@@ -1390,6 +1478,11 @@ function bindHubEvents(): void {
   clearHistoryButton.addEventListener("click", () => clearHistory(clearHistoryButton));
   copyDiagnosticLogButton.addEventListener("click", () => void copyDiagnosticLogs());
   clearDiagnosticLogButton.addEventListener("click", () => clearDiagnosticLogs(clearDiagnosticLogButton));
+  refreshCodexStatusButton.addEventListener("click", () => void refreshCodexAssistant());
+  refreshCodexThreadsButton.addEventListener("click", () => void loadCodexThreads());
+  codexThreadList.addEventListener("click", (event) => void handleCodexThreadListClick(event));
+  createCodexThreadButton.addEventListener("click", () => void createCodexThreadWithMessage());
+  codexMessageForm.addEventListener("submit", (event) => void sendCodexMessage(event));
   copyHubResultButton.addEventListener("click", () => void copyText(hubResultTextarea.value));
   retryHubResultButton.addEventListener("click", () => void retryLatestHistory());
   authorizeMicrophoneButton.addEventListener("click", () => void authorizeMicrophoneAccess());
@@ -6534,6 +6627,9 @@ function switchHubView(view: string): void {
     button.classList.toggle("isActive", button.dataset.viewTarget === navView);
   });
   renderHub();
+  if (view === "codexAssistant") {
+    void refreshCodexAssistant();
+  }
 }
 
 /** 子设置页仍归属语音模式导航，避免侧边栏出现不存在的当前模式状态。 */
@@ -6945,6 +7041,261 @@ function clearHistory(button: HTMLButtonElement): void {
   resetPendingConfirmation();
   renderHub();
   showHubNotice("历史记录已清空。", "success");
+}
+
+/** 刷新 Codex 助手状态和本地会话列表，作为进入页面后的 MVP 初始化入口。 */
+async function refreshCodexAssistant(): Promise<void> {
+  await refreshCodexStatus();
+  await loadCodexThreads();
+}
+
+/** 检测本机 Codex CLI、登录态和会话索引是否可用。 */
+async function refreshCodexStatus(): Promise<void> {
+  setCodexStatus("idle", "正在检测 Codex。");
+  if (!isTauriRuntime()) {
+    setCodexStatus("warning", "网页预览模式无法连接本机 Codex。");
+    return;
+  }
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const status = await invoke<CodexStatusResponse>("get_codex_status");
+    const detail = status.cliVersion ? ` · ${status.cliVersion}` : "";
+    setCodexStatus(status.connected ? "success" : "warning", `${status.message}${detail}`);
+  } catch (error) {
+    setCodexStatus("error", `Codex 检测失败：${formatError(error)}`);
+  }
+}
+
+/** 读取 Codex 本地会话索引，并在左侧列表渲染最近会话。 */
+async function loadCodexThreads(): Promise<void> {
+  if (!isTauriRuntime()) {
+    codexThreadList.innerHTML = '<div class="emptyState">网页预览模式无法读取 Codex 会话。</div>';
+    codexThreadSummary.textContent = "需要在桌面应用中使用。";
+    return;
+  }
+  setCodexBusy(true);
+  codexThreadSummary.textContent = "正在读取最近会话。";
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    codexThreadsCache = await invoke<CodexThreadSummary[]>("list_codex_threads");
+    renderCodexThreadList();
+    if (!selectedCodexThreadId && codexThreadsCache[0]) {
+      await loadCodexThreadDetail(codexThreadsCache[0].id);
+    } else if (selectedCodexThreadId) {
+      await loadCodexThreadDetail(selectedCodexThreadId);
+    }
+  } catch (error) {
+    codexThreadList.innerHTML = `<div class="emptyState">读取会话失败：${escapeHtml(formatError(error))}</div>`;
+    codexThreadSummary.textContent = "读取失败。";
+  } finally {
+    setCodexBusy(false);
+  }
+}
+
+/** 渲染 Codex 会话列表，点击后按会话 ID 读取详情。 */
+function renderCodexThreadList(): void {
+  codexThreadSummary.textContent = codexThreadsCache.length
+    ? `最近 ${codexThreadsCache.length} 个会话`
+    : "还没有读取到会话。";
+  if (!codexThreadsCache.length) {
+    codexThreadList.innerHTML = '<div class="emptyState">暂无 Codex 会话。</div>';
+    return;
+  }
+  codexThreadList.innerHTML = codexThreadsCache
+    .map(
+      (thread) => `
+        <button class="codexThreadItem${thread.id === selectedCodexThreadId ? " isActive" : ""}" type="button" data-codex-thread-id="${escapeHtml(thread.id)}">
+          <div class="historyMeta">
+            <span>Codex</span>
+            <time>${formatCodexDate(thread.updatedAt)}</time>
+          </div>
+          <h2>${escapeHtml(thread.title || "未命名会话")}</h2>
+          <p>${escapeHtml(thread.id)}</p>
+        </button>`,
+    )
+    .join("");
+}
+
+/** 处理左侧 Codex 会话点击，确保只有点到会话按钮时才触发详情加载。 */
+async function handleCodexThreadListClick(event: MouseEvent): Promise<void> {
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    return;
+  }
+  const button = target.closest<HTMLButtonElement>("[data-codex-thread-id]");
+  if (!button) {
+    return;
+  }
+  await loadCodexThreadDetail(button.dataset.codexThreadId || "");
+}
+
+/** 按会话 ID 读取本地 JSONL 中的用户和助手消息。 */
+async function loadCodexThreadDetail(threadId: string): Promise<void> {
+  if (!threadId || !isTauriRuntime()) {
+    return;
+  }
+  selectedCodexThreadId = threadId;
+  renderCodexThreadList();
+  codexDetailTitle.textContent = "正在读取会话";
+  codexDetailMeta.textContent = threadId;
+  codexMessageList.innerHTML = '<div class="emptyState">正在读取消息。</div>';
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const detail = await invoke<CodexThreadDetail>("read_codex_thread", { threadId });
+    selectedCodexThreadId = detail.id;
+    codexDetailTitle.textContent = detail.title || "未命名会话";
+    codexDetailMeta.textContent = `${formatCodexDate(detail.updatedAt)} · ${detail.id}`;
+    renderCodexMessages(detail.messages);
+    renderCodexThreadList();
+  } catch (error) {
+    codexDetailTitle.textContent = "读取失败";
+    codexDetailMeta.textContent = threadId;
+    codexMessageList.innerHTML = `<div class="emptyState">读取详情失败：${escapeHtml(formatError(error))}</div>`;
+  }
+}
+
+/** 渲染 Codex 会话详情消息，MVP 只展示用户和助手发言。 */
+function renderCodexMessages(messages: CodexThreadMessage[]): void {
+  if (!messages.length) {
+    codexMessageList.innerHTML = '<div class="emptyState">这个会话暂时没有可展示消息。</div>';
+    return;
+  }
+  codexMessageList.innerHTML = messages
+    .map(
+      (message) => `
+        <article class="codexMessageItem" data-role="${message.role}">
+          <div class="codexMessageRole">
+            <span>${message.role === "user" ? "我" : "Codex"}</span>
+            <time>${formatCodexDate(message.createdAt)}</time>
+          </div>
+          <p>${escapeHtml(message.content)}</p>
+        </article>`,
+    )
+    .join("");
+  codexMessageList.scrollTop = codexMessageList.scrollHeight;
+}
+
+/** 使用输入框中的首条消息创建一个新的 Codex 非交互式会话。 */
+async function createCodexThreadWithMessage(): Promise<void> {
+  const message = readCodexComposerMessage();
+  if (!message) {
+    setCodexCommandOutput("请输入要发送给 Codex 的消息。", "error");
+    return;
+  }
+  await runCodexMessageCommand("create_codex_thread", { message }, "正在创建 Codex 会话。");
+}
+
+/** 向当前选中的 Codex 会话发送消息，提交后刷新详情。 */
+async function sendCodexMessage(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  const message = readCodexComposerMessage();
+  if (!message) {
+    setCodexCommandOutput("请输入要发送给 Codex 的消息。", "error");
+    return;
+  }
+  if (!selectedCodexThreadId) {
+    setCodexCommandOutput("请先选择一个 Codex 会话，或使用新建会话。", "error");
+    return;
+  }
+  await runCodexMessageCommand(
+    "send_codex_thread_message",
+    { threadId: selectedCodexThreadId, message },
+    "正在发送到当前 Codex 会话。",
+  );
+}
+
+/** 调用原生 Codex 命令并统一处理按钮状态、输出和刷新动作。 */
+async function runCodexMessageCommand(command: string, payload: Record<string, string>, pendingText: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    setCodexCommandOutput("网页预览模式无法调用本机 Codex。", "error");
+    return;
+  }
+  if (codexCommandInFlight) {
+    setCodexCommandOutput("已有 Codex 命令正在后台执行，请稍等结果返回。", "error");
+    return;
+  }
+  codexCommandInFlight = true;
+  setCodexBusy(true);
+  setCodexCommandOutput(`${pendingText}你可以继续查看页面，完成后会自动刷新。`, "idle");
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const started = await invoke<CodexCommandStartResponse>(command, { request: payload });
+    const outcome = await pollCodexCommandOutcome(started.commandId);
+    if (!outcome.ok || !outcome.response) {
+      throw new Error(outcome.error || "Codex 后台命令执行失败。");
+    }
+    const response = outcome.response;
+    if (response.threadId) {
+      selectedCodexThreadId = response.threadId;
+    }
+    codexMessageInput.value = "";
+    setCodexCommandOutput(response.output || response.message, response.success ? "success" : "error");
+    await loadCodexThreads();
+  } catch (error) {
+    setCodexCommandOutput(`Codex 命令失败：${formatError(error)}`, "error");
+  } finally {
+    codexCommandInFlight = false;
+    setCodexBusy(false);
+  }
+}
+
+/** 轮询 Codex 后台命令结果，避免长耗时 invoke 卡住 WebView。 */
+async function pollCodexCommandOutcome(commandId: string): Promise<CodexCommandOutcome> {
+  const startedAt = Date.now();
+  const timeoutMs = 180000;
+  const { invoke } = await import("@tauri-apps/api/core");
+  while (Date.now() - startedAt < timeoutMs) {
+    const outcome = await invoke<CodexCommandOutcome | null>("take_codex_command_outcome", { commandId });
+    if (outcome) {
+      return outcome;
+    }
+    await delay(700);
+  }
+  throw new Error("Codex 后台命令超过 180 秒仍未完成。");
+}
+
+/** 读取输入框消息，并统一裁剪空白。 */
+function readCodexComposerMessage(): string {
+  return codexMessageInput.value.trim();
+}
+
+/** 更新 Codex 助手连接状态胶囊。 */
+function setCodexStatus(state: CodexConnectionState, message: string): void {
+  codexStatusPill.dataset.state = state;
+  codexStatusText.textContent = message;
+}
+
+/** 更新 Codex 命令输出区域，避免长输出撑开主界面。 */
+function setCodexCommandOutput(message: string, state: "idle" | "success" | "error"): void {
+  codexCommandOutput.dataset.state = state;
+  codexCommandOutput.textContent = limitCodexText(message || "命令已完成。", 420);
+}
+
+/** 切换 Codex 助手按钮状态，防止重复触发耗时命令。 */
+function setCodexBusy(isBusy: boolean): void {
+  refreshCodexStatusButton.disabled = false;
+  refreshCodexThreadsButton.disabled = false;
+  createCodexThreadButton.disabled = isBusy;
+  sendCodexMessageButton.disabled = isBusy || !selectedCodexThreadId;
+}
+
+/** 格式化 Codex ISO 时间；异常值直接展示原始文本，便于排查索引问题。 */
+function formatCodexDate(value: string): string {
+  const timestamp = /^\d+$/.test(value) ? Number(value) : Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return value || "--";
+  }
+  return formatDateTime(timestamp);
+}
+
+/** 限制 Codex 输出预览长度，保留详情文件作为完整记录来源。 */
+function limitCodexText(value: string, maxLength: number): string {
+  const normalizedText = value.trim();
+  const chars = Array.from(normalizedText);
+  if (chars.length <= maxLength) {
+    return normalizedText;
+  }
+  return `${chars.slice(0, maxLength).join("")}...`;
 }
 
 /** 渲染本机诊断日志，帮助定位快捷键、转写和自动粘贴链路问题。 */

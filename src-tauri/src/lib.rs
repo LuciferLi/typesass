@@ -1,14 +1,12 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-#[cfg(not(target_os = "macos"))]
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-#[cfg(not(target_os = "macos"))]
-use std::process::Stdio;
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -61,6 +59,12 @@ const PASTE_FOCUS_RETRY_COUNT: usize = 4;
 const PASTE_FOCUS_RETRY_DELAY_MS: u64 = 75;
 const HISTORY_AUDIO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PROCESS_TEXT_RETRY_COUNT: usize = 3;
+const CODEX_THREAD_LIST_LIMIT: usize = 60;
+const CODEX_THREAD_MESSAGE_LIMIT: usize = 80;
+const CODEX_MESSAGE_CONTENT_MAX_CHARS: usize = 6000;
+const CODEX_COMMAND_OUTPUT_MAX_CHARS: usize = 1200;
+const CODEX_SESSION_SCAN_LIMIT: usize = 180;
+const CODEX_SESSION_SUMMARY_MAX_LINES: usize = 120;
 
 /// 运行期间保存的敏感配置，只放内存，不写入本地文件。
 #[derive(Default)]
@@ -165,6 +169,13 @@ struct RuntimeResult {
 struct RuntimeSubtitleTranscribe {
     /// 最近一次原生字幕转写任务的完成结果；前端按片段序号轮询并消费。
     payload: Mutex<Option<ProcessTapTranscribeOutcome>>,
+}
+
+/// 运行期间保存 Codex CLI 后台命令结果，避免长耗时 exec 阻塞 WebView。
+#[derive(Default)]
+struct RuntimeCodexCommands {
+    /// 已完成的 Codex 后台命令结果；前端按命令 ID 轮询并消费。
+    payloads: Mutex<HashMap<String, CodexCommandOutcome>>,
 }
 
 /// 运行期间同步给托盘菜单的口述历史记录。
@@ -517,6 +528,114 @@ struct SelectedTextResponse {
     copy_method: String,
 }
 
+/// Codex 助手页展示的本机连接状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexStatusResponse {
+    /// 当前是否具备调用 Codex CLI 和读取本地会话的最低条件。
+    connected: bool,
+    /// 面向前端展示的状态说明。
+    message: String,
+    /// 当前检测到的 Codex CLI 版本。
+    cli_version: String,
+    /// 本地 Codex 会话索引是否存在。
+    has_session_index: bool,
+}
+
+/// Codex 会话索引中的单条会话摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadSummary {
+    /// Codex 会话 ID。
+    id: String,
+    /// Codex 会话标题。
+    title: String,
+    /// 最近更新时间，保持 ISO 字符串供前端本地化展示。
+    updated_at: String,
+}
+
+/// Codex 会话详情中的可展示消息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadMessage {
+    /// 消息角色，MVP 只返回 user 和 assistant。
+    role: String,
+    /// 消息正文，已经做最大长度保护。
+    content: String,
+    /// 消息创建时间，保持 ISO 字符串供前端本地化展示。
+    created_at: String,
+}
+
+/// Codex 本地会话详情。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadDetail {
+    /// Codex 会话 ID。
+    id: String,
+    /// Codex 会话标题。
+    title: String,
+    /// 最近更新时间，保持 ISO 字符串供前端本地化展示。
+    updated_at: String,
+    /// 从 JSONL 中抽取出的最近用户和助手消息。
+    messages: Vec<CodexThreadMessage>,
+}
+
+/// 前端创建或续接 Codex 会话时提交的消息。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexMessageRequest {
+    /// 要发送给 Codex 的用户消息。
+    message: String,
+}
+
+/// 前端向已有 Codex 会话发送消息时提交的参数。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadMessageRequest {
+    /// 需要续接的 Codex 会话 ID。
+    thread_id: String,
+    /// 要发送给 Codex 的用户消息。
+    message: String,
+}
+
+/// Codex CLI 命令执行后的摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCommandResponse {
+    /// 命令是否成功完成。
+    success: bool,
+    /// 面向前端展示的结果说明。
+    message: String,
+    /// 命令创建或续接的会话 ID。
+    thread_id: String,
+    /// Codex CLI 输出摘要。
+    output: String,
+}
+
+/// Codex CLI 后台命令启动后的前端轮询凭据。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCommandStartResponse {
+    /// 本次后台命令 ID，前端用它轮询命令结果。
+    command_id: String,
+    /// 面向前端展示的启动说明。
+    message: String,
+}
+
+/// Codex CLI 后台命令的完成结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCommandOutcome {
+    /// 前端启动后台任务时拿到的命令 ID。
+    command_id: String,
+    /// 命令是否成功完成。
+    ok: bool,
+    /// 成功时的命令响应。
+    response: Option<CodexCommandResponse>,
+    /// 失败时的错误摘要。
+    error: Option<String>,
+}
+
 /// 系统级粘贴触发结果，记录具体路径以便前端诊断。
 #[derive(Debug)]
 struct PasteTriggerResult {
@@ -608,6 +727,7 @@ pub fn run() {
         .manage(RuntimeShortcuts::default())
         .manage(RuntimeResult::default())
         .manage(RuntimeSubtitleTranscribe::default())
+        .manage(RuntimeCodexCommands::default())
         .manage(RuntimeDictationHistory::default())
         .manage(RuntimePasteFocusSnapshot::default())
         .setup(|app| {
@@ -675,6 +795,12 @@ pub fn run() {
             register_shortcuts,
             suspend_shortcuts_for_recording,
             get_runtime_diagnostics,
+            get_codex_status,
+            list_codex_threads,
+            read_codex_thread,
+            create_codex_thread,
+            send_codex_thread_message,
+            take_codex_command_outcome,
             open_accessibility_settings,
             open_microphone_settings,
             set_login_launch,
@@ -1292,6 +1418,879 @@ fn get_runtime_diagnostics(
         shortcut_registration_ready: shortcut_registration_status.ready,
         shortcut_registration_message: shortcut_registration_status.message,
     })
+}
+
+/// 检测 Codex CLI、认证文件和会话索引是否可用于 MVP 助手页。
+#[tauri::command]
+fn get_codex_status() -> Result<CodexStatusResponse, String> {
+    let cli_version = run_shell_command_output("codex --version", "")?;
+    let _ = run_codex_app_server_list(1)?;
+    let codex_home = codex_home_dir()?;
+    let has_auth = codex_home.join("auth.json").exists();
+    let has_session_index = codex_home.join("session_index.jsonl").exists();
+    let has_sessions_dir = codex_home.join("sessions").exists();
+    let connected = has_auth && (has_session_index || has_sessions_dir);
+    let message = if connected {
+        "已连接 Codex 桌面任务".to_string()
+    } else if has_auth {
+        "Codex 已登录，但未发现本机会话记录".to_string()
+    } else {
+        "未发现 Codex 登录凭据".to_string()
+    };
+
+    Ok(CodexStatusResponse {
+        connected,
+        message,
+        cli_version: cli_version.lines().next().unwrap_or("").trim().to_string(),
+        has_session_index,
+    })
+}
+
+/// 读取最近 Codex 会话列表，用于左侧会话选择。
+#[tauri::command]
+fn list_codex_threads() -> Result<Vec<CodexThreadSummary>, String> {
+    run_codex_app_server_list(CODEX_THREAD_LIST_LIMIT)
+}
+
+/// 读取指定 Codex 会话详情，从本地 JSONL 中抽取用户和助手消息。
+#[tauri::command]
+fn read_codex_thread(thread_id: String) -> Result<CodexThreadDetail, String> {
+    let normalized_id = thread_id.trim();
+    if normalized_id.is_empty() {
+        return Err("会话 ID 不能为空".to_string());
+    }
+    validate_codex_thread_id(normalized_id)?;
+    let summary = read_codex_thread_index()?
+        .into_iter()
+        .find(|thread| thread.id == normalized_id)
+        .unwrap_or_else(|| CodexThreadSummary {
+            id: normalized_id.to_string(),
+            title: "未命名会话".to_string(),
+            updated_at: String::new(),
+        });
+    let session_path = find_codex_session_file(normalized_id)?;
+    let messages = read_codex_session_messages(&session_path)?;
+
+    Ok(CodexThreadDetail {
+        id: summary.id,
+        title: summary.title,
+        updated_at: summary.updated_at,
+        messages,
+    })
+}
+
+/// 用一条消息创建 Codex 非交互式会话，并立即返回后台命令 ID。
+#[tauri::command]
+fn create_codex_thread(
+    app: AppHandle,
+    request: CodexMessageRequest,
+) -> Result<CodexCommandStartResponse, String> {
+    let message = request.message.trim().to_string();
+    if message.is_empty() {
+        return Err("消息不能为空".to_string());
+    }
+    let command_id = next_codex_command_id("create");
+    start_codex_background_command(app, command_id.clone(), move || {
+        create_codex_thread_blocking(message)
+    });
+    Ok(CodexCommandStartResponse {
+        command_id,
+        message: "Codex 创建命令已在后台执行".to_string(),
+    })
+}
+
+/// 向已有 Codex 会话发送一条消息，并立即返回后台命令 ID。
+#[tauri::command]
+fn send_codex_thread_message(
+    app: AppHandle,
+    request: CodexThreadMessageRequest,
+) -> Result<CodexCommandStartResponse, String> {
+    let thread_id = request.thread_id.trim();
+    let message = request.message.trim();
+    if thread_id.is_empty() {
+        return Err("会话 ID 不能为空".to_string());
+    }
+    validate_codex_thread_id(thread_id)?;
+    if message.is_empty() {
+        return Err("消息不能为空".to_string());
+    }
+    let command_id = next_codex_command_id("send");
+    let thread_id_for_task = thread_id.to_string();
+    let message_for_task = message.to_string();
+    start_codex_background_command(app, command_id.clone(), move || {
+        send_codex_thread_message_blocking(thread_id_for_task, message_for_task)
+    });
+    Ok(CodexCommandStartResponse {
+        command_id,
+        message: "Codex 发送命令已在后台执行".to_string(),
+    })
+}
+
+/// 消费指定 Codex 后台命令的完成结果。
+#[tauri::command]
+fn take_codex_command_outcome(
+    state: State<'_, RuntimeCodexCommands>,
+    command_id: String,
+) -> Result<Option<CodexCommandOutcome>, String> {
+    let mut payloads = state
+        .payloads
+        .lock()
+        .map_err(|_| "读取 Codex 后台命令状态失败：状态锁已损坏".to_string())?;
+    Ok(payloads.remove(command_id.trim()))
+}
+
+/// 在后台线程执行 Codex CLI 命令，并把完成结果写回运行期状态。
+fn start_codex_background_command<F>(app: AppHandle, command_id: String, task: F)
+where
+    F: FnOnce() -> Result<CodexCommandResponse, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = match task() {
+            Ok(response) => CodexCommandOutcome {
+                command_id: command_id.clone(),
+                ok: true,
+                response: Some(response),
+                error: None,
+            },
+            Err(error) => CodexCommandOutcome {
+                command_id: command_id.clone(),
+                ok: false,
+                response: None,
+                error: Some(error),
+            },
+        };
+        let state = app.state::<RuntimeCodexCommands>();
+        if let Ok(mut payloads) = state.payloads.lock() {
+            payloads.insert(command_id, outcome);
+        };
+    });
+}
+
+/// 生成 Codex 后台命令 ID，用当前时间纳秒保证单机运行期内足够唯一。
+fn next_codex_command_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", prefix, nanos)
+}
+
+/// 阻塞执行创建 Codex 非交互会话，供后台任务调用。
+fn create_codex_thread_blocking(message: String) -> Result<CodexCommandResponse, String> {
+    let thread_id = run_codex_app_server_create_and_send(&message)?;
+    Ok(CodexCommandResponse {
+        success: true,
+        message: "Codex 桌面任务已创建".to_string(),
+        thread_id,
+        output: "已创建 Codex 桌面任务，并发送首条消息。".to_string(),
+    })
+}
+
+/// 阻塞执行向已有 Codex 会话发送消息，供后台任务调用。
+fn send_codex_thread_message_blocking(
+    thread_id: String,
+    message: String,
+) -> Result<CodexCommandResponse, String> {
+    run_codex_app_server_send(&thread_id, &message)?;
+    Ok(CodexCommandResponse {
+        success: true,
+        message: "消息已发送到 Codex 桌面任务".to_string(),
+        thread_id,
+        output: "Codex 桌面任务已接收消息。".to_string(),
+    })
+}
+
+/// 通过 Codex app-server stdio 读取桌面任务列表，确保 Typesass 与 Codex 侧边栏使用同一套任务数据。
+fn run_codex_app_server_list(limit: usize) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut session = CodexAppServerSession::start()?;
+    session.initialize()?;
+    let response = session.request(
+        2,
+        "thread/list",
+        json!({
+            "limit": limit,
+            "archived": false,
+            "cwd": codex_thread_cwd(),
+            "sortKey": "updated_at",
+            "sortDirection": "desc"
+        }),
+    )?;
+    let threads = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex 桌面任务列表响应缺少 data".to_string())?;
+    Ok(threads
+        .iter()
+        .filter_map(parse_codex_app_thread_summary)
+        .collect())
+}
+
+/// 通过 Codex app-server 创建桌面任务并发送第一条用户消息。
+fn run_codex_app_server_create_and_send(message: &str) -> Result<String, String> {
+    let mut session = CodexAppServerSession::start()?;
+    session.initialize()?;
+    let response = session.request(
+        2,
+        "thread/start",
+        json!({
+            "cwd": codex_thread_cwd(),
+            "approvalPolicy": "never",
+            "sandbox": "workspace-write",
+            "threadSource": "typesass"
+        }),
+    )?;
+    let thread_id = response
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Codex 桌面任务创建响应缺少 thread.id".to_string())?
+        .to_string();
+    run_codex_app_server_turn_start(&mut session, &thread_id, message)?;
+    Ok(thread_id)
+}
+
+/// 通过 Codex app-server 向已有桌面任务发送一条用户消息。
+fn run_codex_app_server_send(thread_id: &str, message: &str) -> Result<(), String> {
+    let mut session = CodexAppServerSession::start()?;
+    session.initialize()?;
+    run_codex_app_server_turn_start(&mut session, thread_id, message)
+}
+
+/// 通过 turn/start 把用户输入追加到指定 Codex 桌面任务。
+fn run_codex_app_server_turn_start(
+    session: &mut CodexAppServerSession,
+    thread_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let _ = session.request(
+        3,
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": message,
+                "text_elements": []
+            }]
+        }),
+    )?;
+    session.wait_for_turn_completed(thread_id)
+}
+
+/// 将 app-server 返回的 Thread 对象转成前端列表需要的摘要。
+fn parse_codex_app_thread_summary(value: &Value) -> Option<CodexThreadSummary> {
+    let id = value.get("id").and_then(Value::as_str)?.to_string();
+    let title = value
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("preview").and_then(Value::as_str))
+        .unwrap_or("未命名任务")
+        .trim();
+    let updated_at = value
+        .get("updatedAt")
+        .and_then(Value::as_i64)
+        .map(|timestamp| (timestamp * 1000).to_string())
+        .unwrap_or_default();
+    Some(CodexThreadSummary {
+        id,
+        title: if title.is_empty() {
+            "未命名任务".to_string()
+        } else {
+            limit_chars(title, 60)
+        },
+        updated_at,
+    })
+}
+
+/// Typesass 只管理当前 monorepo 下的 aitool/Codex 任务，保持与用户 Codex 项目侧边栏一致。
+fn codex_thread_cwd() -> String {
+    env::var("TYPESASS_CODEX_CWD")
+        .ok()
+        .filter(|value| value.trim().is_empty() == false)
+        .unwrap_or_else(|| "/Users/lucifer/Documents/source/t/monorepo".to_string())
+}
+
+/// Codex app-server stdio 短连接，封装初始化、请求发送和响应读取。
+struct CodexAppServerSession {
+    /// 当前 app-server 子进程。
+    child: std::process::Child,
+    /// app-server stdin，用于写入 JSON-RPC 请求。
+    stdin: std::process::ChildStdin,
+    /// app-server stdout 行读取器，用于读取 JSON-RPC 响应和通知。
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl CodexAppServerSession {
+    /// 启动一个 app-server stdio 子进程，短连接结束时由 Drop 清理。
+    fn start() -> Result<Self, String> {
+        let mut child = Command::new("zsh")
+            .args([
+                "-lc",
+                "source ~/.zshrc >/dev/null 2>&1 || true; codex app-server --stdio",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "启动 Codex app-server 失败：{}",
+                    trim_error_message(&error.to_string())
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Codex app-server stdin 不可用".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Codex app-server stdout 不可用".to_string())?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// 完成 app-server 初始化握手，开启 experimental v2 API。
+    fn initialize(&mut self) -> Result<(), String> {
+        let _ = self.request(
+            1,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "typesass",
+                    "title": "typesass",
+                    "version": "0.0.2"
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "requestAttestation": false,
+                    "optOutNotificationMethods": [
+                        "item/agentMessage/delta",
+                        "command/exec/outputDelta",
+                        "rawResponseItem/completed"
+                    ]
+                }
+            }),
+        )?;
+        self.write_value(&json!({ "method": "initialized" }))
+    }
+
+    /// 写入一个 JSON-RPC 请求并等待对应 id 的成功响应。
+    fn request(&mut self, id: i64, method: &str, params: Value) -> Result<Value, String> {
+        self.write_value(&json!({
+            "id": id,
+            "method": method,
+            "params": params
+        }))?;
+        self.read_response(id)
+    }
+
+    /// 向 app-server 写入一行 JSON。
+    fn write_value(&mut self, value: &Value) -> Result<(), String> {
+        let line = serde_json::to_string(value)
+            .map_err(|error| format!("序列化 Codex app-server 请求失败：{}", error))?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| {
+                format!(
+                    "写入 Codex app-server 请求失败：{}",
+                    trim_error_message(&error.to_string())
+                )
+            })
+    }
+
+    /// 读取 app-server 输出，跳过通知，只返回指定 id 的 JSON-RPC 响应。
+    fn read_response(&mut self, id: i64) -> Result<Value, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read_count = self.stdout.read_line(&mut line).map_err(|error| {
+                format!(
+                    "读取 Codex app-server 响应失败：{}",
+                    trim_error_message(&error.to_string())
+                )
+            })?;
+            if read_count == 0 {
+                return Err("Codex app-server 已退出，未返回预期响应".to_string());
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_i64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex app-server 返回错误");
+                return Err(message.to_string());
+            }
+            return Ok(value);
+        }
+    }
+
+    /// 等待指定任务的当前 turn 完成，确保关闭短连接前 Codex 已经把本轮执行落盘。
+    fn wait_for_turn_completed(&mut self, thread_id: &str) -> Result<(), String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read_count = self.stdout.read_line(&mut line).map_err(|error| {
+                format!(
+                    "读取 Codex turn 状态失败：{}",
+                    trim_error_message(&error.to_string())
+                )
+            })?;
+            if read_count == 0 {
+                return Err("Codex app-server 已退出，未收到 turn 完成通知".to_string());
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if value.get("method").and_then(Value::as_str) != Some("turn/completed") {
+                continue;
+            }
+            let params = value.get("params").unwrap_or(&Value::Null);
+            if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+                continue;
+            }
+            let has_error = params
+                .get("turn")
+                .and_then(|turn| turn.get("error"))
+                .map(|error| error.is_null() == false)
+                .unwrap_or(false);
+            if has_error {
+                return Err("Codex turn 执行失败，请在 Codex 桌面任务中查看详情".to_string());
+            }
+            return Ok(());
+        }
+    }
+}
+
+impl Drop for CodexAppServerSession {
+    /// 结束短连接时终止 app-server 子进程，避免后台残留。
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 读取 Codex 会话索引并合并最近会话文件，避免 exec 新建会话尚未写入索引时列表缺项。
+fn read_codex_thread_index() -> Result<Vec<CodexThreadSummary>, String> {
+    let mut threads = read_codex_session_index_file()?;
+    let mut seen_ids = threads
+        .iter()
+        .map(|thread| (thread.id.clone(), true))
+        .collect::<HashMap<_, _>>();
+    for thread in read_recent_codex_session_summaries()? {
+        if seen_ids.contains_key(&thread.id) {
+            continue;
+        }
+        seen_ids.insert(thread.id.clone(), true);
+        threads.push(thread);
+    }
+    threads.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    threads.dedup_by(|left, right| left.id == right.id);
+    Ok(threads.into_iter().take(CODEX_THREAD_LIST_LIMIT).collect())
+}
+
+/// 读取 Codex 官方会话索引文件，作为列表标题和排序的主要来源。
+fn read_codex_session_index_file() -> Result<Vec<CodexThreadSummary>, String> {
+    let path = codex_home_dir()?.join("session_index.jsonl");
+    let content = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "读取 Codex 会话索引失败（{}）：{}",
+                path.display(),
+                trim_error_message(&error.to_string())
+            ));
+        }
+    };
+    let mut threads = Vec::new();
+    for line in content
+        .lines()
+        .filter(|line| line.trim().is_empty() == false)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = value
+            .get("thread_name")
+            .and_then(Value::as_str)
+            .unwrap_or("未命名会话")
+            .trim();
+        let updated_at = value
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        threads.push(CodexThreadSummary {
+            id: id.to_string(),
+            title: if title.is_empty() {
+                "未命名会话".to_string()
+            } else {
+                title.to_string()
+            },
+            updated_at: updated_at.to_string(),
+        });
+    }
+    Ok(threads)
+}
+
+/// 扫描最近修改的 Codex session 文件，补齐 CLI exec 新建但暂未进入 session_index 的会话。
+fn read_recent_codex_session_summaries() -> Result<Vec<CodexThreadSummary>, String> {
+    let sessions_dir = codex_home_dir()?.join("sessions");
+    if sessions_dir.exists() == false {
+        return Ok(Vec::new());
+    }
+    let mut files = collect_codex_session_files(&sessions_dir)?;
+    files.sort_by(|left, right| right.1.cmp(&left.1));
+    let mut summaries = Vec::new();
+    for (path, _) in files.into_iter().take(CODEX_SESSION_SCAN_LIMIT) {
+        if let Some(summary) = read_codex_session_summary(&path)? {
+            summaries.push(summary);
+        }
+    }
+    Ok(summaries)
+}
+
+/// 递归收集 Codex session JSONL 文件及修改时间，用于按最近活跃度补漏。
+fn collect_codex_session_files(dir: &PathBuf) -> Result<Vec<(PathBuf, u128)>, String> {
+    let mut stack = vec![dir.clone()];
+    let mut files = Vec::new();
+    while let Some(current_dir) = stack.pop() {
+        let entries = fs::read_dir(&current_dir).map_err(|error| {
+            format!(
+                "读取 Codex 会话目录失败（{}）：{}",
+                current_dir.display(),
+                trim_error_message(&error.to_string())
+            )
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let modified_ms = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0);
+            files.push((path, modified_ms));
+        }
+    }
+    Ok(files)
+}
+
+/// 从单个 session JSONL 文件中读取会话 ID、标题和最近更新时间。
+fn read_codex_session_summary(path: &PathBuf) -> Result<Option<CodexThreadSummary>, String> {
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "读取 Codex 会话摘要失败（{}）：{}",
+            path.display(),
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let mut id = String::new();
+    let mut title = String::new();
+    let mut updated_at = file_modified_timestamp(path);
+    for line_result in BufReader::new(file)
+        .lines()
+        .take(CODEX_SESSION_SUMMARY_MAX_LINES)
+    {
+        let Ok(line) = line_result else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        if timestamp.is_empty() == false {
+            updated_at = timestamp.to_string();
+        }
+        if id.is_empty() {
+            id = value
+                .get("payload")
+                .and_then(|payload| payload.get("id").or_else(|| payload.get("session_id")))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+        }
+        if title.is_empty() {
+            title = extract_codex_summary_title(&value);
+        }
+        if id.is_empty() == false && title.is_empty() == false && updated_at.is_empty() == false {
+            break;
+        }
+    }
+    if id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CodexThreadSummary {
+        id,
+        title: if title.is_empty() {
+            "未命名会话".to_string()
+        } else {
+            title
+        },
+        updated_at,
+    }))
+}
+
+/// 读取文件修改时间作为会话排序兜底值，避免为摘要扫描完整大文件。
+fn file_modified_timestamp(path: &PathBuf) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if let Some(timestamp) = extract_codex_timestamp_from_file_name(file_name) {
+        return timestamp;
+    }
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_default()
+}
+
+/// 从 Codex rollout 文件名里还原可被前端解析的时间字符串。
+fn extract_codex_timestamp_from_file_name(file_name: &str) -> Option<String> {
+    let start = file_name.find("rollout-")? + "rollout-".len();
+    let value = file_name.get(start..start + 19)?;
+    let date = value.get(0..10)?;
+    let time = value.get(11..19)?.replace('-', ":");
+    Some(format!("{}T{}", date, time))
+}
+
+/// 用首条用户消息生成 exec 会话标题，避免新会话在列表里只能显示未命名。
+fn extract_codex_summary_title(value: &Value) -> String {
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("user_message")
+    {
+        return limit_chars(
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            36,
+        );
+    }
+    if value.get("type").and_then(Value::as_str) == Some("response_item")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("role"))
+            .and_then(Value::as_str)
+            == Some("user")
+    {
+        let content = value
+            .get("payload")
+            .and_then(|payload| payload.get("content"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return limit_chars(&content, 36);
+    }
+    String::new()
+}
+
+/// 在 Codex sessions 目录下按会话 ID 定位 JSONL 文件。
+fn find_codex_session_file(thread_id: &str) -> Result<PathBuf, String> {
+    let sessions_dir = codex_home_dir()?.join("sessions");
+    let mut stack = vec![sessions_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|error| {
+            format!(
+                "读取 Codex 会话目录失败（{}）：{}",
+                dir.display(),
+                trim_error_message(&error.to_string())
+            )
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if file_name.contains(thread_id) && file_name.ends_with(".jsonl") {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!(
+        "未找到 Codex 会话文件：{}（目录：{}）",
+        thread_id,
+        sessions_dir.display()
+    ))
+}
+
+/// 从 Codex 会话 JSONL 中抽取最近用户消息和助手消息。
+fn read_codex_session_messages(path: &PathBuf) -> Result<Vec<CodexThreadMessage>, String> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "读取 Codex 会话详情失败（{}）：{}",
+            path.display(),
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let mut messages = Vec::new();
+    for line in content
+        .lines()
+        .filter(|line| line.trim().is_empty() == false)
+    {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(message) = extract_codex_event_message(&value, &timestamp) {
+            messages.push(message);
+        }
+    }
+    let skip_count = messages.len().saturating_sub(CODEX_THREAD_MESSAGE_LIMIT);
+    Ok(messages.into_iter().skip(skip_count).collect())
+}
+
+/// 从单行 Codex JSONL 事件中抽取一条可展示消息。
+fn extract_codex_event_message(value: &Value, timestamp: &str) -> Option<CodexThreadMessage> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    match payload.get("type").and_then(Value::as_str)? {
+        "user_message" => Some(CodexThreadMessage {
+            role: "user".to_string(),
+            content: limit_chars(
+                payload.get("message").and_then(Value::as_str).unwrap_or(""),
+                CODEX_MESSAGE_CONTENT_MAX_CHARS,
+            ),
+            created_at: timestamp.to_string(),
+        }),
+        "agent_message" => Some(CodexThreadMessage {
+            role: "assistant".to_string(),
+            content: limit_chars(
+                payload.get("message").and_then(Value::as_str).unwrap_or(""),
+                CODEX_MESSAGE_CONTENT_MAX_CHARS,
+            ),
+            created_at: timestamp.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// 运行需要 stdin 的 Codex CLI 命令，并返回 stdout/stderr 摘要。
+fn run_shell_command_output(command: &str, stdin_text: &str) -> Result<String, String> {
+    let script = format!("source ~/.zshrc >/dev/null 2>&1 || true; {}", command);
+    let mut child = Command::new("zsh")
+        .args(["-lc", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动命令失败：{}", trim_error_message(&error.to_string())))?;
+    if stdin_text.is_empty() == false {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "命令 stdin 不可用".to_string())?;
+        stdin.write_all(stdin_text.as_bytes()).map_err(|error| {
+            format!(
+                "写入 Codex 消息失败：{}",
+                trim_error_message(&error.to_string())
+            )
+        })?;
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().map_err(|error| {
+        format!(
+            "等待命令完成失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        return Ok(if stdout.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        });
+    }
+    Err(limit_chars(
+        &format!("{}{}", stdout, stderr),
+        CODEX_COMMAND_OUTPUT_MAX_CHARS,
+    ))
+}
+
+/// 校验 Codex 会话 ID 只能包含本地索引中的安全字符，避免 shell 命令注入。
+fn validate_codex_thread_id(thread_id: &str) -> Result<(), String> {
+    let is_safe = thread_id
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '_');
+    if is_safe {
+        Ok(())
+    } else {
+        Err("会话 ID 包含不支持的字符".to_string())
+    }
+}
+
+/// 读取当前 Codex home 目录，优先使用 CODEX_HOME，默认回落到用户目录。
+fn codex_home_dir() -> Result<PathBuf, String> {
+    if let Ok(value) = env::var("CODEX_HOME") {
+        let trimmed = value.trim();
+        if trimmed.is_empty() == false {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    let home = env::var("HOME").map_err(|_| "无法读取 HOME 环境变量".to_string())?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
+/// 按字符数裁剪文本，避免前端展示和命令反馈被长上下文撑爆。
+fn limit_chars(value: &str, max_chars: usize) -> String {
+    let chars = value.trim().chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return chars.into_iter().collect();
+    }
+    let mut text = chars.into_iter().take(max_chars).collect::<String>();
+    text.push_str("...");
+    text
 }
 
 /// 打开 macOS 辅助功能设置，用于授予自动粘贴权限。

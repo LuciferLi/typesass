@@ -65,6 +65,10 @@
             <span class="navIcon" data-icon="book" aria-hidden="true"></span>
             <span>词典</span>
           </button>
+          <button class="hubNavButton" type="button" data-view-target="codexAssistant">
+            <span class="navIcon" data-icon="message" aria-hidden="true"></span>
+            <span>Codex助手</span>
+          </button>
           <button class="hubNavButton" type="button" data-view-target="diagnosticsLog">
             <span class="navIcon" data-icon="terminal" aria-hidden="true"></span>
             <span>诊断日志</span>
@@ -354,6 +358,61 @@
           </form>
           <input id="dictionarySearchInput" class="searchInput" type="search" placeholder="搜索词典" />
           <div id="dictionaryList" class="tagList"></div>
+        </section>
+
+        <section id="codexAssistantView" class="hubView" data-view="codexAssistant">
+          <div class="toolbarLine">
+            <div id="codexStatusPill" class="codexStatusPill" data-state="idle">
+              <span></span>
+              <strong id="codexStatusText">正在检测 Codex</strong>
+            </div>
+            <div class="rowActions rowActionsInline">
+              <button id="refreshCodexStatusButton" type="button">
+                <span class="buttonIcon" data-icon="refresh" aria-hidden="true"></span>
+                <span>刷新连接</span>
+              </button>
+              <button id="refreshCodexThreadsButton" type="button">
+                <span class="buttonIcon" data-icon="history" aria-hidden="true"></span>
+                <span>刷新会话</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="codexAssistantLayout">
+            <section class="codexThreadPanel" aria-label="Codex 会话列表">
+              <div class="codexPanelHeader">
+                <div>
+                  <div class="sectionTitle">会话</div>
+                  <p id="codexThreadSummary" class="sectionHint">等待读取本地会话索引。</p>
+                </div>
+              </div>
+              <div id="codexThreadList" class="listSurface"></div>
+            </section>
+
+            <section class="codexDetailPanel" aria-label="Codex 会话详情">
+              <div class="codexPanelHeader">
+                <div>
+                  <div id="codexDetailTitle" class="sectionTitle">未选择会话</div>
+                  <p id="codexDetailMeta" class="sectionHint">选择左侧会话后查看最近消息。</p>
+                </div>
+              </div>
+              <div id="codexMessageList" class="codexMessageList"></div>
+              <form id="codexMessageForm" class="codexComposer">
+                <textarea id="codexMessageInput" placeholder="输入要发送给 Codex 的消息"></textarea>
+                <div class="rowActions rowActionsInline">
+                  <button id="createCodexThreadButton" class="plainButton" type="button">
+                    <span class="buttonIcon" data-icon="plus" aria-hidden="true"></span>
+                    <span>新建会话</span>
+                  </button>
+                  <button id="sendCodexMessageButton" class="primaryAction" type="submit">
+                    <span class="buttonIcon" data-icon="message" aria-hidden="true"></span>
+                    <span>发送到当前会话</span>
+                  </button>
+                </div>
+              </form>
+              <div id="codexCommandOutput" class="codexCommandOutput" data-state="idle">等待操作。</div>
+            </section>
+          </div>
         </section>
 
         <section id="diagnosticsLogView" class="hubView" data-view="diagnosticsLog">
