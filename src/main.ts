@@ -3545,7 +3545,7 @@ async function startRecording(mode: VoiceMode, targetApp = "", keepHubVisible = 
     recordedSamples = [];
     recordedSampleLength = 0;
     recordedAudioFrameCount = 0;
-    recordingStream = await navigator.mediaDevices.getUserMedia({ audio: buildAudioConstraints(config) });
+    recordingStream = await getMicrophoneStreamWithConstraintFallback(config, "recording", activeMode);
     if (cancelStartingRecordingRequested) {
       stopStream();
       setStatus("已取消录音。", "ready");
@@ -3864,6 +3864,48 @@ function buildAudioConstraints(config: VoiceConfig): MediaTrackConstraints {
   return constraints;
 }
 
+/** 创建最小麦克风授权约束，只用于触发系统权限弹窗，避免 WebView 不支持增强约束时报 Invalid constraint。 */
+function buildMicrophoneAuthorizationConstraints(): MediaStreamConstraints {
+  return { audio: true };
+}
+
+/**
+ * 按当前设置申请麦克风流，并在浏览器不支持增强约束时自动降级。
+ * 流程：先使用用户选择的设备和处理模式；如果 WebView 返回约束错误，则改用最小麦克风约束重新申请。
+ * 参数：config 为当前语音设置；category 用于诊断日志归类；mode 用于标记触发的语音模式。
+ * 返回：成功打开的麦克风 MediaStream。
+ * 异常：权限拒绝、设备不可用或降级后仍失败时继续抛给调用方处理。
+ */
+async function getMicrophoneStreamWithConstraintFallback(
+  config: VoiceConfig,
+  category: DiagnosticLogItem["category"],
+  mode: ShortcutMode,
+): Promise<MediaStream> {
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio: buildAudioConstraints(config) });
+  } catch (error) {
+    if (!isUnsupportedAudioConstraintError(error)) {
+      throw error;
+    }
+    addDiagnosticLog({
+      level: "warning",
+      category,
+      title: "麦克风增强约束不可用",
+      message: "当前 WebView 不支持部分麦克风增强约束，已降级为系统默认麦克风授权方式重试。",
+      mode,
+      details: [`原始错误：${formatError(error)}`],
+    });
+    return navigator.mediaDevices.getUserMedia(buildMicrophoneAuthorizationConstraints());
+  }
+}
+
+/** 判断 getUserMedia 失败是否由浏览器不支持当前音频约束导致。 */
+function isUnsupportedAudioConstraintError(error: unknown): boolean {
+  const name = error instanceof DOMException ? error.name : "";
+  const message = formatError(error).toLowerCase();
+  return name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError" || message.includes("invalid constraint");
+}
+
 /** 格式化麦克风采集处理模式，用于诊断日志展示。 */
 function formatMicrophoneProcessingMode(mode: MicrophoneProcessingMode): string {
   return mode === "natural" ? "原声" : "增强";
@@ -4062,7 +4104,7 @@ async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
     });
     if (config.subtitleIncludeMicrophone) {
       try {
-        subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风");
+        subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风", config);
       } catch (error) {
         addDiagnosticLog({
           level: "warning",
@@ -4107,7 +4149,7 @@ async function setupSubtitleAudioGraph(config: VoiceConfig): Promise<void> {
       `麦克风处理：${formatMicrophoneProcessingMode(config.microphoneProcessingMode)}`,
     ],
   });
-  subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风");
+  subtitleMicStream = await requestSubtitleAudioStream({ audio: buildAudioConstraints(config) }, "麦克风", config);
   addDiagnosticLog({
     level: "info",
     category: "subtitle",
@@ -4534,7 +4576,11 @@ async function handleSubtitleRecorderChunk(chunk: SubtitleRecorderChunk): Promis
  * 返回：成功获取到的 MediaStream。
  * 异常：浏览器权限拒绝、设备不可用或超时都会抛出 Error。
  */
-function requestSubtitleAudioStream(constraints: MediaStreamConstraints, label: string): Promise<MediaStream> {
+function requestSubtitleAudioStream(
+  constraints: MediaStreamConstraints,
+  label: string,
+  fallbackConfig?: VoiceConfig,
+): Promise<MediaStream> {
   return new Promise<MediaStream>((resolve, reject) => {
     let settled = false;
     addDiagnosticLog({
@@ -4559,8 +4605,12 @@ function requestSubtitleAudioStream(constraints: MediaStreamConstraints, label: 
       reject(new Error(`${label}音频输入长时间无响应，请检查设备权限或输入源。`));
     }, SUBTITLE_AUDIO_SETUP_TIMEOUT_MS);
 
-    navigator.mediaDevices
-      .getUserMedia(constraints)
+    const requestStream =
+      fallbackConfig && label === "麦克风"
+        ? getMicrophoneStreamWithConstraintFallback(fallbackConfig, "subtitle", "subtitle")
+        : navigator.mediaDevices.getUserMedia(constraints);
+
+    requestStream
       .then((stream) => {
         if (settled) {
           stream.getTracks().forEach((track) => track.stop());
@@ -5290,6 +5340,25 @@ function playInteractionSound(kind: "start" | "stop", config: VoiceConfig): void
   if (!config.interactionSounds) {
     return;
   }
+  if (isTauriRuntime()) {
+    void playNativeInteractionSound(kind).catch(() => playWebInteractionSound(kind));
+    return;
+  }
+  playWebInteractionSound(kind);
+}
+
+/**
+ * 调用桌面端原生提示音，避免全局快捷键触发时 WebView 拦截 AudioContext 播放。
+ * 参数：kind 区分开始录音和停止录音。
+ * 返回：原生提示音命令完成发起后的 Promise。
+ */
+async function playNativeInteractionSound(kind: "start" | "stop"): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("play_native_interaction_sound", { kind });
+}
+
+/** 使用 WebAudio 播放提示音，供浏览器预览和原生播放失败时兜底。 */
+function playWebInteractionSound(kind: "start" | "stop"): void {
   try {
     const context = new AudioContext();
     const oscillator = context.createOscillator();

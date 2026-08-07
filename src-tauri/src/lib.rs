@@ -60,6 +60,7 @@ const PASTE_TARGET_REFOCUS_DELAY_MS: u64 = 160;
 const PASTE_FOCUS_RETRY_COUNT: usize = 4;
 const PASTE_FOCUS_RETRY_DELAY_MS: u64 = 75;
 const HISTORY_AUDIO_MAX_BYTES: usize = 32 * 1024 * 1024;
+const PROCESS_TEXT_RETRY_COUNT: usize = 3;
 
 /// 运行期间保存的敏感配置，只放内存，不写入本地文件。
 #[derive(Default)]
@@ -681,6 +682,7 @@ pub fn run() {
             set_dock_visible,
             get_frontmost_app,
             set_system_output_muted,
+            play_native_interaction_sound,
             save_history_audio,
             read_history_audio,
             delete_history_audio_files,
@@ -2100,6 +2102,29 @@ fn set_system_output_muted(muted: bool) -> Result<bool, String> {
     }
 }
 
+/// 播放录音开始或停止提示音，避免 WebView 全局快捷键触发时受自动播放策略影响。
+#[tauri::command]
+fn play_native_interaction_sound(kind: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let sound_path = match kind.as_str() {
+            "start" => "/System/Library/Sounds/Tink.aiff",
+            "stop" => "/System/Library/Sounds/Pop.aiff",
+            _ => "/System/Library/Sounds/Tink.aiff",
+        };
+        Command::new("afplay")
+            .arg(sound_path)
+            .spawn()
+            .map_err(|error| format!("播放交互提示音失败：{}", error))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = kind;
+        Ok(())
+    }
+}
+
 /// 安装当前 App 的用户级 LaunchAgent。
 fn install_login_agent() -> Result<(), String> {
     let path = login_agent_path()?;
@@ -3090,22 +3115,13 @@ async fn process_text(
         "thinking": { "type": "disabled" }
     });
 
-    let response_json = send_chat_completion(
+    let (response_json, processed_text) = send_process_text_completion_with_retry(
         &base_url,
         &api_key,
         &body,
         Some(calculate_process_timeout(&request, normalized_text)),
     )
     .await?;
-    let processed_text = response_json
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if contains_internal_prompt_leak(&processed_text) {
-        return Err("AI 处理失败：模型输出包含内部提示结构，已阻止进入粘贴流程".to_string());
-    }
     Ok(ProcessTextResponse {
         processed_text,
         elapsed_ms: started_at.elapsed().as_millis(),
@@ -3115,6 +3131,46 @@ async fn process_text(
             .unwrap_or(text_model)
             .to_string(),
     })
+}
+
+/// 调用 AI 文本处理接口并在失败或模型输出不可用时自动重试。
+async fn send_process_text_completion_with_retry(
+    base_url: &str,
+    api_key: &str,
+    body: &Value,
+    request_timeout: Option<Duration>,
+) -> Result<(Value, String), String> {
+    let mut last_error = String::new();
+    for attempt in 0..=PROCESS_TEXT_RETRY_COUNT {
+        match send_chat_completion(base_url, api_key, body, request_timeout).await {
+            Ok(response_json) => {
+                let processed_text = response_json
+                    .pointer("/choices/0/message/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if processed_text.is_empty() {
+                    last_error = "AI 处理失败：模型返回为空".to_string();
+                } else if contains_internal_prompt_leak(&processed_text) {
+                    last_error =
+                        "AI 处理失败：模型输出包含内部提示结构，已阻止进入粘贴流程".to_string();
+                } else {
+                    return Ok((response_json, processed_text));
+                }
+            }
+            Err(error) => {
+                last_error = error;
+            }
+        }
+        if attempt == PROCESS_TEXT_RETRY_COUNT {
+            break;
+        }
+    }
+    Err(format!(
+        "{}；AI 文本处理已自动重试 {} 次",
+        last_error, PROCESS_TEXT_RETRY_COUNT
+    ))
 }
 
 /// 判断模型输出是否复述了内部提示词结构，命中时不能进入最终粘贴链路。
