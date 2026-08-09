@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "默认窗口权限",
   "windows": ["main", "hub", "toast", "result", "subtitle", "subtitleHistory"],
-  "permissions": ["core:default", "opener:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "opener:default"
+  ]
 }

@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
@@ -9,9 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size, State};
+
+mod task_store;
 
 #[cfg(target_os = "macos")]
 use objc2::rc::{autoreleasepool, Retained};
@@ -25,6 +31,7 @@ use objc2_foundation::{NSArray, NSData, NSString};
 const DEFAULT_BASE_URL: &str = "https://token-plan-cn.xiaomimimo.com/v1";
 const DEFAULT_ASR_MODEL: &str = "mimo-v2.5-asr";
 const DEFAULT_TEXT_MODEL: &str = "mimo-v2.5";
+const DEFAULT_ASR_TEXT_SHORTCUT: &str = "ctrl+shift+d";
 const DEFAULT_DICTATE_SHORTCUT: &str = "ctrl+p";
 const DEFAULT_TRANSLATE_SHORTCUT: &str = "ctrl+t";
 const DEFAULT_ASK_SHORTCUT: &str = "ctrl+space";
@@ -59,12 +66,18 @@ const PASTE_FOCUS_RETRY_COUNT: usize = 4;
 const PASTE_FOCUS_RETRY_DELAY_MS: u64 = 75;
 const HISTORY_AUDIO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const PROCESS_TEXT_RETRY_COUNT: usize = 3;
+const LOCAL_CONFIG_FILE_NAME: &str = "typesass-config.json";
+const LOCAL_CONFIG_WATCH_INTERVAL_MS: u64 = 500;
 const CODEX_THREAD_LIST_LIMIT: usize = 60;
 const CODEX_THREAD_MESSAGE_LIMIT: usize = 80;
 const CODEX_MESSAGE_CONTENT_MAX_CHARS: usize = 6000;
 const CODEX_COMMAND_OUTPUT_MAX_CHARS: usize = 1200;
 const CODEX_SESSION_SCAN_LIMIT: usize = 180;
 const CODEX_SESSION_SUMMARY_MAX_LINES: usize = 120;
+const CODEX_THREAD_VISIBLE_RETRY_COUNT: usize = 10;
+const CODEX_THREAD_VISIBLE_RETRY_DELAY_MS: u64 = 350;
+const CODEX_DESKTOP_BIN: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+const CLIENT_HTTP_BRIDGE_ADDR: &str = "127.0.0.1:25818";
 
 /// 运行期间保存的敏感配置，只放内存，不写入本地文件。
 #[derive(Default)]
@@ -185,6 +198,189 @@ struct RuntimeDictationHistory {
     items: Mutex<Vec<TrayHistoryItem>>,
 }
 
+/// 运行期间保存客户端 JSON 配置文件监听状态，避免重复启动轮询线程。
+#[derive(Default)]
+struct RuntimeLocalConfigWatcher {
+    /// 是否已经启动本机配置文件监听。
+    started: Mutex<bool>,
+}
+
+/// 客户端 JSON 配置文件结构，按前端 StorageKey 分区保存可持久化配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalConfigDocument {
+    /// 配置文件版本号，后续字段升级时用于兼容迁移。
+    version: u32,
+    /// 最近一次客户端写入时间；外部手动编辑文件时保留原值。
+    updated_at: String,
+    /// 各模块配置分区，key 来自前端 StorageKey。
+    items: HashMap<String, Value>,
+}
+
+impl Default for LocalConfigDocument {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            updated_at: String::new(),
+            items: HashMap::new(),
+        }
+    }
+}
+
+/// 读取客户端 JSON 配置文件中的单个分区。
+#[tauri::command]
+fn read_local_config_value(app: AppHandle, key: String) -> Result<Option<Value>, String> {
+    validate_local_config_key(&key)?;
+    let document = read_local_config_document(&app)?;
+    Ok(document.items.get(&key).cloned())
+}
+
+/// 写入客户端 JSON 配置文件中的单个分区，并通知所有 WebView 刷新。
+#[tauri::command]
+fn write_local_config_value(app: AppHandle, key: String, value: Value) -> Result<(), String> {
+    validate_local_config_key(&key)?;
+    let mut document = read_local_config_document(&app)?;
+    document.version = 1;
+    document.updated_at = local_config_updated_at();
+    document.items.insert(key, value);
+    write_local_config_document(&app, &document)?;
+    emit_local_config_changed(&app, &document);
+    Ok(())
+}
+
+/// 删除客户端 JSON 配置文件中的单个分区，并通知所有 WebView 刷新。
+#[tauri::command]
+fn remove_local_config_value(app: AppHandle, key: String) -> Result<(), String> {
+    validate_local_config_key(&key)?;
+    let mut document = read_local_config_document(&app)?;
+    document.updated_at = local_config_updated_at();
+    document.items.remove(&key);
+    write_local_config_document(&app, &document)?;
+    emit_local_config_changed(&app, &document);
+    Ok(())
+}
+
+/// 读取客户端 JSON 配置文件的完整快照，供前端启动时诊断或主动刷新。
+#[tauri::command]
+fn read_local_config_snapshot(app: AppHandle) -> Result<LocalConfigDocument, String> {
+    read_local_config_document(&app)
+}
+
+/// 启动客户端 JSON 配置文件变化监听；内部通过轻量轮询捕捉外部改文件场景。
+#[tauri::command]
+fn start_local_config_watch(
+    app: AppHandle,
+    watcher: State<'_, RuntimeLocalConfigWatcher>,
+) -> Result<(), String> {
+    {
+        let mut started = watcher
+            .started
+            .lock()
+            .map_err(|_| "启动配置监听失败：状态锁已损坏".to_string())?;
+        if *started {
+            return Ok(());
+        }
+        *started = true;
+    }
+    let watch_app = app.clone();
+    thread::spawn(move || {
+        let mut last_modified = local_config_modified_millis(&watch_app).unwrap_or(0);
+        loop {
+            thread::sleep(Duration::from_millis(LOCAL_CONFIG_WATCH_INTERVAL_MS));
+            let current_modified = local_config_modified_millis(&watch_app).unwrap_or(0);
+            if current_modified == last_modified {
+                continue;
+            }
+            last_modified = current_modified;
+            if let Ok(document) = read_local_config_document(&watch_app) {
+                emit_local_config_changed(&watch_app, &document);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// 校验客户端配置 key，避免 Web 端传入空 key 或路径类字符串污染 JSON 结构。
+fn validate_local_config_key(key: &str) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err("配置 key 不能为空".to_string());
+    }
+    if !trimmed.starts_with("typesass.") {
+        return Err("配置 key 不在允许的 typesass 命名空间内".to_string());
+    }
+    Ok(())
+}
+
+/// 读取客户端 JSON 配置文件；文件不存在时返回空默认结构。
+fn read_local_config_document(app: &AppHandle) -> Result<LocalConfigDocument, String> {
+    let path = local_config_file_path(app)?;
+    if !path.exists() {
+        return Ok(LocalConfigDocument::default());
+    }
+    let content =
+        fs::read_to_string(&path).map_err(|error| format!("读取本地配置文件失败：{}", error))?;
+    if content.trim().is_empty() {
+        return Ok(LocalConfigDocument::default());
+    }
+    serde_json::from_str::<LocalConfigDocument>(&content)
+        .map_err(|error| format!("解析本地配置文件失败：{}", error))
+}
+
+/// 写入客户端 JSON 配置文件；目录不存在时自动创建。
+fn write_local_config_document(
+    app: &AppHandle,
+    document: &LocalConfigDocument,
+) -> Result<(), String> {
+    let path = local_config_file_path(app)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建本地配置目录失败：{}", error))?;
+    }
+    let content = serde_json::to_string_pretty(document)
+        .map_err(|error| format!("序列化本地配置失败：{}", error))?;
+    fs::write(&path, content).map_err(|error| format!("写入本地配置文件失败：{}", error))
+}
+
+/// 读取客户端 JSON 配置文件路径，集中约束配置只能落在应用数据目录下。
+fn local_config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join(LOCAL_CONFIG_FILE_NAME))
+        .map_err(|error| format!("读取应用数据目录失败：{}", error))
+}
+
+/// 读取客户端 JSON 配置文件修改时间，用于轮询监听外部编辑。
+fn local_config_modified_millis(app: &AppHandle) -> Result<u128, String> {
+    let path = local_config_file_path(app)?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| format!("读取本地配置修改时间失败：{}", error))?;
+    system_time_to_millis(modified)
+}
+
+/// 生成客户端配置更新时间戳字符串，前端只用于判断快照新旧和排查。
+fn local_config_updated_at() -> String {
+    system_time_to_millis(SystemTime::now())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// 将系统时间转换为 Unix 毫秒时间戳。
+fn system_time_to_millis(value: SystemTime) -> Result<u128, String> {
+    value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .map_err(|error| format!("转换系统时间失败：{}", error))
+}
+
+/// 向所有 WebView 广播客户端 JSON 配置文件快照。
+fn emit_local_config_changed(app: &AppHandle, document: &LocalConfigDocument) {
+    let _ = app.emit("local-config-changed", document.clone());
+}
+
 /// 前端同步给原生托盘菜单的历史记录摘要。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,8 +395,10 @@ struct TrayHistoryItem {
 
 /// 前端提交的全局模式快捷键。
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 struct ShortcutProfile {
+    /// ASR 仅转文本模式快捷键。
+    asr: String,
     /// 听写模式快捷键。
     dictate: String,
     /// 翻译模式快捷键。
@@ -216,6 +414,7 @@ struct ShortcutProfile {
 impl Default for ShortcutProfile {
     fn default() -> Self {
         Self {
+            asr: DEFAULT_ASR_TEXT_SHORTCUT.to_string(),
             dictate: DEFAULT_DICTATE_SHORTCUT.to_string(),
             translate: DEFAULT_TRANSLATE_SHORTCUT.to_string(),
             ask: DEFAULT_ASK_SHORTCUT.to_string(),
@@ -554,6 +753,20 @@ struct CodexThreadSummary {
     updated_at: String,
 }
 
+/// Codex 已有任务归属的工作空间摘要。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexWorkspaceSummary {
+    /// 工作空间绝对路径，对应 Codex Thread.cwd。
+    cwd: String,
+    /// 下拉框展示名称，优先使用目录名。
+    title: String,
+    /// 最近任务数量，用于辅助判断工作空间活跃度。
+    thread_count: usize,
+    /// 最近更新时间，保持字符串交给前端格式化。
+    updated_at: String,
+}
+
 /// Codex 会话详情中的可展示消息。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -586,6 +799,8 @@ struct CodexThreadDetail {
 struct CodexMessageRequest {
     /// 要发送给 Codex 的用户消息。
     message: String,
+    /// 新建 Codex 桌面任务时使用的工作空间路径。
+    workspace_cwd: Option<String>,
 }
 
 /// 前端向已有 Codex 会话发送消息时提交的参数。
@@ -596,6 +811,8 @@ struct CodexThreadMessageRequest {
     thread_id: String,
     /// 要发送给 Codex 的用户消息。
     message: String,
+    /// 当前前端选择的工作空间路径，用于保持界面上下文一致。
+    workspace_cwd: Option<String>,
 }
 
 /// Codex CLI 命令执行后的摘要。
@@ -730,6 +947,7 @@ pub fn run() {
         .manage(RuntimeCodexCommands::default())
         .manage(RuntimeDictationHistory::default())
         .manage(RuntimePasteFocusSnapshot::default())
+        .manage(RuntimeLocalConfigWatcher::default())
         .setup(|app| {
             #[cfg(desktop)]
             {
@@ -750,6 +968,7 @@ pub fn run() {
                 let _ =
                     set_shortcut_runtime(&shortcut_state, default_profile, shortcut_result.err());
                 configure_tray(app)?;
+                start_client_http_bridge(app.handle().clone());
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -796,11 +1015,19 @@ pub fn run() {
             suspend_shortcuts_for_recording,
             get_runtime_diagnostics,
             get_codex_status,
+            list_codex_workspaces,
             list_codex_threads,
             read_codex_thread,
             create_codex_thread,
             send_codex_thread_message,
             take_codex_command_outcome,
+            load_session_workspace_data,
+            create_session_project,
+            create_session_task,
+            queue_session_task,
+            complete_session_task,
+            reset_session_task_schema,
+            open_session_external_thread,
             open_accessibility_settings,
             open_microphone_settings,
             set_login_launch,
@@ -813,7 +1040,12 @@ pub fn run() {
             read_history_audio,
             delete_history_audio_files,
             clear_history_audio_files,
-            sync_tray_dictation_history
+            sync_tray_dictation_history,
+            read_local_config_value,
+            write_local_config_value,
+            remove_local_config_value,
+            read_local_config_snapshot,
+            start_local_config_watch
         ])
         .build(tauri::generate_context!())
         .expect("启动 typesass 失败")
@@ -840,13 +1072,12 @@ fn configure_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "open_home" => present_hub_view(app, "home"),
-            "open_history" => present_hub_view(app, "history"),
-            "add_dictionary_word" => add_clipboard_words_to_dictionary(app),
+            "open_voice_polish" => present_hub_view(app, "voicePolish"),
+            "open_text_polish" => present_hub_view(app, "textPolish"),
             "open_settings" => present_hub_view(app, "settings"),
-            "microphone_default" | "microphone_settings" => present_hub_view(app, "settings"),
+            "microphone_default" | "microphone_settings" => present_hub_view(app, "permission"),
             "microphone_refresh" => {
-                present_hub_view(app, "settings");
+                present_hub_view(app, "permission");
                 emit_hub_event(app.clone(), "hub-refresh-microphones", String::new());
             }
             "check_updates" => show_update_status(app),
@@ -869,15 +1100,20 @@ fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 
     let menu = Menu::new(manager)?;
-    let open_home = MenuItem::with_id(
+    let open_voice_polish = MenuItem::with_id(
         manager,
-        "open_home",
-        "打开 typesass 主页",
+        "open_voice_polish",
+        "语音转文字润色",
         true,
         None::<&str>,
     )?;
-    let open_history =
-        MenuItem::with_id(manager, "open_history", "显示历史记录", true, None::<&str>)?;
+    let open_text_polish = MenuItem::with_id(
+        manager,
+        "open_text_polish",
+        "润色",
+        true,
+        None::<&str>,
+    )?;
     let dictation_history_menu =
         Submenu::with_id(manager, "dictation_history_menu", "口述历史记录", true)?;
     if history_items.is_empty() {
@@ -902,13 +1138,6 @@ fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
             dictation_history_menu.append(&menu_item)?;
         }
     }
-    let add_dictionary_word = MenuItem::with_id(
-        manager,
-        "add_dictionary_word",
-        "将词汇添加到词典",
-        true,
-        None::<&str>,
-    )?;
     let open_settings =
         MenuItem::with_id(manager, "open_settings", "设置...", true, Some("Cmd+,"))?;
     let microphone_default = MenuItem::with_id(
@@ -957,10 +1186,9 @@ fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     let quit = MenuItem::with_id(manager, "quit", "退出 typesass", true, Some("Cmd+Q"))?;
     let first_separator = PredefinedMenuItem::separator(manager)?;
     let second_separator = PredefinedMenuItem::separator(manager)?;
-    menu.append(&open_home)?;
-    menu.append(&open_history)?;
+    menu.append(&open_voice_polish)?;
+    menu.append(&open_text_polish)?;
     menu.append(&dictation_history_menu)?;
-    menu.append(&add_dictionary_word)?;
     menu.append(&first_separator)?;
     menu.append(&open_settings)?;
     menu.append(&microphone_menu)?;
@@ -1046,23 +1274,6 @@ fn should_trust_explicit_paste_target(
     resolved_target_app: &str,
 ) -> bool {
     should_refocus_requested_paste_target(requested_target_app, resolved_target_app)
-}
-
-/// 从剪贴板读取词汇并交给 Hub 写入本地词典。
-#[cfg(desktop)]
-fn add_clipboard_words_to_dictionary(app: &AppHandle) {
-    present_hub_view(app, "dictionary");
-    match read_clipboard_text().map(|text| split_dictionary_words(&text)) {
-        Ok(words) if !words.is_empty() => {
-            let app_handle = app.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(160));
-                let _ = app_handle.emit_to("hub", "hub-add-dictionary-words", words);
-            });
-        }
-        Ok(_) => emit_hub_notice(app, "剪贴板里没有可加入词典的词汇。", "error"),
-        Err(error) => emit_hub_notice(app, &format!("读取剪贴板失败：{}", error), "error"),
-    }
 }
 
 /// 展示当前版本的更新状态；在线更新通道接入前不给用户虚假的升级入口。
@@ -1216,10 +1427,6 @@ fn is_window_visible(app: &tauri::AppHandle, label: &str) -> bool {
 /// 根据全局快捷键字符串判断目标模式，并通知悬浮窗开始或停止。
 fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
     let mode = shortcut_to_mode(&app, &shortcut);
-    if mode == "subtitle" {
-        trigger_subtitle_mode(app);
-        return;
-    }
     trigger_voice_mode(app, &mode);
 }
 
@@ -1301,14 +1508,10 @@ fn shortcut_to_mode(app: &tauri::AppHandle, shortcut: &str) -> String {
         .lock()
         .map(|profile| profile.clone())
         .unwrap_or_default();
-    if normalized == normalize_shortcut(&profile.translate) {
-        "translate".to_string()
-    } else if normalized == normalize_shortcut(&profile.ask) {
-        "ask".to_string()
+    if normalized == normalize_shortcut(&profile.asr) {
+        "asr".to_string()
     } else if normalized == normalize_shortcut(&profile.polish) {
         "polish".to_string()
-    } else if normalized == normalize_shortcut(&profile.subtitle) {
-        "subtitle".to_string()
     } else if normalized == normalize_shortcut(&profile.dictate) {
         "dictate".to_string()
     } else {
@@ -1424,7 +1627,7 @@ fn get_runtime_diagnostics(
 #[tauri::command]
 fn get_codex_status() -> Result<CodexStatusResponse, String> {
     let cli_version = run_shell_command_output("codex --version", "")?;
-    let _ = run_codex_app_server_list(1)?;
+    let _ = run_codex_app_server_list(1, Some(&default_codex_workspace_cwd()))?;
     let codex_home = codex_home_dir()?;
     let has_auth = codex_home.join("auth.json").exists();
     let has_session_index = codex_home.join("session_index.jsonl").exists();
@@ -1448,8 +1651,26 @@ fn get_codex_status() -> Result<CodexStatusResponse, String> {
 
 /// 读取最近 Codex 会话列表，用于左侧会话选择。
 #[tauri::command]
-fn list_codex_threads() -> Result<Vec<CodexThreadSummary>, String> {
-    run_codex_app_server_list(CODEX_THREAD_LIST_LIMIT)
+fn list_codex_workspaces() -> Result<Vec<CodexWorkspaceSummary>, String> {
+    read_codex_state_workspaces().or_else(|_| run_codex_app_server_workspaces())
+}
+
+/// 读取最近 Codex 会话列表，用于左侧会话选择。
+#[tauri::command]
+fn list_codex_threads(request: CodexThreadListRequest) -> Result<Vec<CodexThreadSummary>, String> {
+    let cwd = normalize_codex_workspace_cwd(Some(&request.workspace_cwd));
+    let limit = normalize_codex_thread_page_limit(request.limit);
+    let offset = request.offset.max(0) as usize;
+    let keyword = request.keyword.trim().to_string();
+    read_codex_state_threads(&cwd, limit, offset, &keyword).or_else(|_| {
+        run_codex_app_server_list(limit + offset, Some(&cwd)).map(|threads| {
+            filter_codex_threads_by_keyword(threads, &keyword)
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect()
+        })
+    })
 }
 
 /// 读取指定 Codex 会话详情，从本地 JSONL 中抽取用户和助手消息。
@@ -1460,6 +1681,9 @@ fn read_codex_thread(thread_id: String) -> Result<CodexThreadDetail, String> {
         return Err("会话 ID 不能为空".to_string());
     }
     validate_codex_thread_id(normalized_id)?;
+    if let Ok(detail) = run_codex_app_server_thread_detail(normalized_id) {
+        return Ok(detail);
+    }
     let summary = read_codex_thread_index()?
         .into_iter()
         .find(|thread| thread.id == normalized_id)
@@ -1489,9 +1713,10 @@ fn create_codex_thread(
     if message.is_empty() {
         return Err("消息不能为空".to_string());
     }
+    let workspace_cwd = normalize_codex_workspace_cwd(request.workspace_cwd.as_deref());
     let command_id = next_codex_command_id("create");
     start_codex_background_command(app, command_id.clone(), move || {
-        create_codex_thread_blocking(message)
+        create_codex_thread_blocking(message, workspace_cwd)
     });
     Ok(CodexCommandStartResponse {
         command_id,
@@ -1514,11 +1739,12 @@ fn send_codex_thread_message(
     if message.is_empty() {
         return Err("消息不能为空".to_string());
     }
+    let workspace_cwd = normalize_codex_workspace_cwd(request.workspace_cwd.as_deref());
     let command_id = next_codex_command_id("send");
     let thread_id_for_task = thread_id.to_string();
     let message_for_task = message.to_string();
     start_codex_background_command(app, command_id.clone(), move || {
-        send_codex_thread_message_blocking(thread_id_for_task, message_for_task)
+        send_codex_thread_message_blocking(thread_id_for_task, message_for_task, workspace_cwd)
     });
     Ok(CodexCommandStartResponse {
         command_id,
@@ -1537,6 +1763,261 @@ fn take_codex_command_outcome(
         .lock()
         .map_err(|_| "读取 Codex 后台命令状态失败：状态锁已损坏".to_string())?;
     Ok(payloads.remove(command_id.trim()))
+}
+
+/// 按 MVP 的方式从 CodeX 本地 state_5.sqlite 读取工作空间列表。
+/// 流程：打开 ~/.codex/state_5.sqlite，只统计未归档且有标题或预览的 threads.cwd。
+/// 参数：无。
+/// 返回：按最近活跃时间倒序排列的工作空间摘要。
+/// 边界：状态库不存在或结构变化时返回错误，由调用方回退 app-server。
+fn read_codex_state_workspaces() -> Result<Vec<CodexWorkspaceSummary>, String> {
+    let connection = open_codex_state_database()?;
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT cwd,
+                   COUNT(*) AS thread_count,
+                   MAX(COALESCE(NULLIF(recency_at_ms, 0), updated_at * 1000)) AS latest_at
+              FROM threads
+             WHERE archived = 0
+               AND cwd <> ''
+               AND (title <> '' OR preview <> '')
+          GROUP BY cwd
+          ORDER BY latest_at DESC, cwd COLLATE NOCASE ASC
+            ",
+        )
+        .map_err(|error| format!("读取 CodeX 工作空间 SQL 准备失败：{}", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            let cwd: String = row.get(0)?;
+            let latest_at: i64 = row.get(2)?;
+            Ok(CodexWorkspaceSummary {
+                title: codex_workspace_title(&cwd),
+                cwd,
+                thread_count: row.get::<_, i64>(1)?.max(0) as usize,
+                updated_at: latest_at.to_string(),
+            })
+        })
+        .map_err(|error| format!("读取 CodeX 工作空间失败：{}", error))?;
+    collect_sqlite_rows(rows, "读取 CodeX 工作空间失败")
+}
+
+/// 按 MVP 的方式从 CodeX 本地 state_5.sqlite 读取指定工作空间会话。
+/// 流程：按 cwd 过滤未归档 threads，并按置顶和最近活跃时间排序。
+/// 参数：workspace_cwd 为工作空间绝对路径，limit 为最大返回数量，offset 为分页起点，keyword 为搜索关键词。
+/// 返回：CodeX 会话摘要列表。
+/// 边界：状态库不存在或结构变化时返回错误，由调用方回退 app-server。
+fn read_codex_state_threads(
+    workspace_cwd: &str,
+    limit: usize,
+    offset: usize,
+    keyword: &str,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let connection = open_codex_state_database()?;
+    let keyword_pattern = codex_thread_keyword_pattern(keyword);
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT id,
+                   SUBSTR(COALESCE(NULLIF(name, ''), NULLIF(title, ''), '未命名任务'), 1, 240) AS title,
+                   COALESCE(NULLIF(recency_at_ms, 0), updated_at * 1000) AS updated_at_ms
+              FROM threads
+             WHERE archived = 0
+               AND cwd = ?1
+               AND (title <> '' OR preview <> '')
+               AND (?4 = '' OR id LIKE ?4 OR title LIKE ?4 OR name LIKE ?4 OR preview LIKE ?4)
+          ORDER BY is_pinned DESC, updated_at_ms DESC, id DESC
+             LIMIT ?2
+            OFFSET ?3
+            ",
+        )
+        .map_err(|error| format!("读取 CodeX 会话 SQL 准备失败：{}", error))?;
+    let rows = statement
+        .query_map(params![workspace_cwd, limit as i64, offset as i64, keyword_pattern], |row| {
+            Ok(CodexThreadSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                updated_at: row.get::<_, i64>(2)?.to_string(),
+            })
+        })
+        .map_err(|error| format!("读取 CodeX 会话失败：{}", error))?;
+    collect_sqlite_rows(rows, "读取 CodeX 会话失败")
+}
+
+/// 归一化 CodeX 会话分页数量，避免前端异常参数一次读取过多本地状态库记录。
+fn normalize_codex_thread_page_limit(limit: i64) -> usize {
+    if limit <= 0 {
+        return 30;
+    }
+    (limit as usize).min(CODEX_THREAD_LIST_LIMIT)
+}
+
+/// 构造 CodeX 会话搜索 LIKE 参数。
+fn codex_thread_keyword_pattern(keyword: &str) -> String {
+    let trimmed = keyword.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("%{}%", trimmed)
+}
+
+/// 在 app-server 兜底数据中按关键词过滤会话。
+fn filter_codex_threads_by_keyword(
+    threads: Vec<CodexThreadSummary>,
+    keyword: &str,
+) -> Vec<CodexThreadSummary> {
+    let normalized_keyword = keyword.trim().to_lowercase();
+    if normalized_keyword.is_empty() {
+        return threads;
+    }
+    threads
+        .into_iter()
+        .filter(|thread| {
+            thread.id.to_lowercase().contains(&normalized_keyword)
+                || thread.title.to_lowercase().contains(&normalized_keyword)
+        })
+        .collect()
+}
+
+/// 打开 CodeX 本地状态库，只读访问避免影响 CodeX Desktop 自身写入。
+fn open_codex_state_database() -> Result<Connection, String> {
+    let path = codex_home_dir()?.join("state_5.sqlite");
+    if !path.exists() {
+        return Err(format!("未找到 CodeX 状态库：{}", path.display()));
+    }
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("打开 CodeX 状态库失败：{}", error))
+}
+
+/// 收集 rusqlite 查询行并统一转换错误文案。
+fn collect_sqlite_rows<T, F>(
+    rows: rusqlite::MappedRows<'_, F>,
+    context: &str,
+) -> Result<Vec<T>, String>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| format!("{}：{}", context, error))?);
+    }
+    Ok(items)
+}
+
+/// 读取会话管理和任务管理的本地业务数据。
+/// 流程：初始化 SQLite 表结构，再按项目查询任务和会话列表。
+/// 参数：project_id 为前端当前选中项目，空值时默认返回第一个项目的数据。
+/// 返回：项目、任务、会话聚合数据。
+/// 边界：没有项目时返回空任务和空会话，前端展示空态。
+#[tauri::command]
+fn load_session_workspace_data(
+    app: AppHandle,
+    project_id: Option<String>,
+) -> Result<task_store::WorkspaceDataResponse, String> {
+    task_store::load_workspace_data(&app, project_id)
+}
+
+/// 创建本地任务项目并绑定工作空间。
+/// 流程：写入 project 表后返回新项目的聚合数据。
+/// 参数：request 包含项目名称和工作空间路径。
+/// 返回：刷新后的项目、任务、会话聚合数据。
+/// 边界：项目名称或工作空间为空时返回错误。
+#[tauri::command]
+fn create_session_project(
+    app: AppHandle,
+    request: task_store::CreateProjectRequest,
+) -> Result<task_store::WorkspaceDataResponse, String> {
+    task_store::create_project(&app, request)
+}
+
+/// 创建本地任务卡片。
+/// 流程：写入已创建状态，不进入调度队列，等待用户点击播放或拖入排队中。
+/// 参数：request 包含项目 ID、任务标题和执行提示词。
+/// 返回：刷新后的项目、任务、会话聚合数据。
+/// 边界：项目不存在、标题为空或提示词为空时返回错误。
+#[tauri::command]
+fn create_session_task(
+    app: AppHandle,
+    request: task_store::CreateTaskRequest,
+) -> Result<task_store::WorkspaceDataResponse, String> {
+    task_store::create_task(&app, request)
+}
+
+/// 将任务推入排队并自动创建 CodeX 会话。
+/// 流程：先把任务置为 queued，再后台创建 CodeX thread，创建成功后进入待验收。
+/// 参数：task_id 为目标任务。
+/// 返回：刷新后的项目、任务、会话聚合数据。
+/// 边界：后台失败时会把任务置为 failed，前端下次刷新可见错误。
+#[tauri::command]
+fn queue_session_task(
+    app: AppHandle,
+    task_id: String,
+) -> Result<task_store::WorkspaceDataResponse, String> {
+    let task = task_store::queue_task(&app, task_id.trim())?;
+    let project_id = task.project_id.clone();
+    let event_project_id = project_id.clone();
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let session_id = match task_store::mark_task_running(&app_for_task, &task) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        match create_codex_thread_blocking(task.prompt.clone(), task.workspace_path.clone()) {
+            Ok(response) => {
+                let _ = task_store::mark_task_waiting_acceptance(
+                    &app_for_task,
+                    &task.id,
+                    &session_id,
+                    &response.thread_id,
+                );
+            }
+            Err(error) => {
+                let _ = task_store::mark_task_failed(&app_for_task, &task.id, &session_id, &error);
+            }
+        }
+        let _ = app_for_task.emit("session-task-updated", event_project_id);
+    });
+    task_store::load_workspace_data(&app, Some(project_id))
+}
+
+/// 将待验收任务标记为已完成。
+/// 流程：校验任务当前必须为待验收，再同步任务和会话完成状态。
+/// 参数：task_id 为目标任务。
+/// 返回：刷新后的项目、任务、会话聚合数据。
+/// 边界：非待验收任务不能直接完成。
+#[tauri::command]
+fn complete_session_task(
+    app: AppHandle,
+    task_id: String,
+) -> Result<task_store::WorkspaceDataResponse, String> {
+    task_store::complete_task(&app, task_id.trim())
+}
+
+/// 恢复任务管理最新表结构并清空业务数据。
+/// 流程：删除当前业务表、重新应用最新 schema，保留客户端 JSON 设置。
+/// 参数：无。
+/// 返回：空业务数据聚合结果。
+/// 边界：仅用于本地调试，不会删除 API Key、主题、快捷键等 JSON 设置。
+#[tauri::command]
+fn reset_session_task_schema(
+    app: AppHandle,
+) -> Result<task_store::WorkspaceDataResponse, String> {
+    task_store::reset_schema(&app)
+}
+
+/// 打开本地会话绑定的 CodeX thread。
+/// 流程：校验 thread ID 后使用 codex deeplink 打开桌面端任务。
+/// 参数：thread_id 为 CodeX 会话 ID。
+/// 返回：打开后的 deeplink URL。
+/// 边界：未绑定 thread ID 的任务不能定位到 CodeX。
+#[tauri::command]
+fn open_session_external_thread(thread_id: String) -> Result<String, String> {
+    let normalized_id = thread_id.trim();
+    if normalized_id.is_empty() {
+        return Err("当前任务还没有绑定 CodeX 会话".to_string());
+    }
+    validate_codex_thread_id(normalized_id)?;
+    open_codex_desktop_thread(normalized_id)
 }
 
 /// 在后台线程执行 Codex CLI 命令，并把完成结果写回运行期状态。
@@ -1576,13 +2057,17 @@ fn next_codex_command_id(prefix: &str) -> String {
 }
 
 /// 阻塞执行创建 Codex 非交互会话，供后台任务调用。
-fn create_codex_thread_blocking(message: String) -> Result<CodexCommandResponse, String> {
-    let thread_id = run_codex_app_server_create_and_send(&message)?;
+fn create_codex_thread_blocking(
+    message: String,
+    workspace_cwd: String,
+) -> Result<CodexCommandResponse, String> {
+    let thread_id = run_codex_app_server_create_and_send(&message, &workspace_cwd)?;
     Ok(CodexCommandResponse {
         success: true,
-        message: "Codex 桌面任务已创建".to_string(),
+        message: "Codex 桌面任务已创建并在 Desktop 打开".to_string(),
         thread_id,
-        output: "已创建 Codex 桌面任务，并发送首条消息。".to_string(),
+        output: "已创建 Codex 桌面任务，已发送首条消息，并打开 Codex Desktop 对应任务。"
+            .to_string(),
     })
 }
 
@@ -1590,31 +2075,58 @@ fn create_codex_thread_blocking(message: String) -> Result<CodexCommandResponse,
 fn send_codex_thread_message_blocking(
     thread_id: String,
     message: String,
+    workspace_cwd: String,
 ) -> Result<CodexCommandResponse, String> {
-    run_codex_app_server_send(&thread_id, &message)?;
+    run_codex_app_server_send(&thread_id, &message, &workspace_cwd)?;
     Ok(CodexCommandResponse {
         success: true,
-        message: "消息已发送到 Codex 桌面任务".to_string(),
+        message: "消息已发送到 Codex 桌面任务并在 Desktop 打开".to_string(),
         thread_id,
-        output: "Codex 桌面任务已接收消息。".to_string(),
+        output: "Codex 桌面任务已接收消息，并打开 Codex Desktop 对应任务。".to_string(),
     })
 }
 
-/// 通过 Codex app-server stdio 读取桌面任务列表，确保 Typesass 与 Codex 侧边栏使用同一套任务数据。
-fn run_codex_app_server_list(limit: usize) -> Result<Vec<CodexThreadSummary>, String> {
+/// 通过 Codex app-server stdio 读取已有任务中的工作空间列表。
+fn run_codex_app_server_workspaces() -> Result<Vec<CodexWorkspaceSummary>, String> {
     let mut session = CodexAppServerSession::start()?;
     session.initialize()?;
     let response = session.request(
         2,
         "thread/list",
         json!({
-            "limit": limit,
+            "limit": 120,
             "archived": false,
-            "cwd": codex_thread_cwd(),
             "sortKey": "updated_at",
             "sortDirection": "desc"
         }),
     )?;
+    let threads = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex 工作空间响应缺少 data".to_string())?;
+    Ok(parse_codex_workspaces(threads))
+}
+
+/// 通过 Codex app-server stdio 读取桌面任务列表，确保 Typesass 与 Codex 侧边栏使用同一套任务数据。
+fn run_codex_app_server_list(
+    limit: usize,
+    workspace_cwd: Option<&str>,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let mut session = CodexAppServerSession::start()?;
+    session.initialize()?;
+    let mut params = json!({
+        "limit": limit,
+        "archived": false,
+        "sortKey": "updated_at",
+        "sortDirection": "desc"
+    });
+    if let Some(cwd) = workspace_cwd {
+        if let Value::Object(map) = &mut params {
+            map.insert("cwd".to_string(), json!(cwd));
+        }
+    }
+    let response = session.request(2, "thread/list", params)?;
     let threads = response
         .get("result")
         .and_then(|result| result.get("data"))
@@ -1626,15 +2138,37 @@ fn run_codex_app_server_list(limit: usize) -> Result<Vec<CodexThreadSummary>, St
         .collect())
 }
 
+/// 通过 Codex app-server 读取任务详情，确保 Typesass 和 Codex Desktop 数据层保持一致。
+fn run_codex_app_server_thread_detail(thread_id: &str) -> Result<CodexThreadDetail, String> {
+    let mut session = CodexAppServerSession::start()?;
+    session.initialize()?;
+    let response = session.request(
+        2,
+        "thread/read",
+        json!({
+            "threadId": thread_id,
+            "includeTurns": true
+        }),
+    )?;
+    let thread = response
+        .get("result")
+        .and_then(|result| result.get("thread"))
+        .ok_or_else(|| "Codex 任务详情响应缺少 thread".to_string())?;
+    parse_codex_app_thread_detail(thread)
+}
+
 /// 通过 Codex app-server 创建桌面任务并发送第一条用户消息。
-fn run_codex_app_server_create_and_send(message: &str) -> Result<String, String> {
+fn run_codex_app_server_create_and_send(
+    message: &str,
+    workspace_cwd: &str,
+) -> Result<String, String> {
     let mut session = CodexAppServerSession::start()?;
     session.initialize()?;
     let response = session.request(
         2,
         "thread/start",
         json!({
-            "cwd": codex_thread_cwd(),
+            "cwd": workspace_cwd,
             "approvalPolicy": "never",
             "sandbox": "workspace-write",
             "threadSource": "typesass"
@@ -1647,44 +2181,76 @@ fn run_codex_app_server_create_and_send(message: &str) -> Result<String, String>
         .and_then(Value::as_str)
         .ok_or_else(|| "Codex 桌面任务创建响应缺少 thread.id".to_string())?
         .to_string();
-    run_codex_app_server_turn_start(&mut session, &thread_id, message)?;
+    run_codex_app_server_turn_start(&mut session, &thread_id, message, workspace_cwd)?;
+    let _ = open_codex_desktop_thread(&thread_id);
+    let _ = session.wait_for_thread_visible(&thread_id, workspace_cwd)?;
     Ok(thread_id)
 }
 
 /// 通过 Codex app-server 向已有桌面任务发送一条用户消息。
-fn run_codex_app_server_send(thread_id: &str, message: &str) -> Result<(), String> {
+fn run_codex_app_server_send(
+    thread_id: &str,
+    message: &str,
+    workspace_cwd: &str,
+) -> Result<(), String> {
     let mut session = CodexAppServerSession::start()?;
     session.initialize()?;
-    run_codex_app_server_turn_start(&mut session, thread_id, message)
+    run_codex_app_server_turn_start(&mut session, thread_id, message, workspace_cwd)?;
+    let _ = open_codex_desktop_thread(thread_id);
+    Ok(())
 }
 
-/// 通过 turn/start 把用户输入追加到指定 Codex 桌面任务。
+/// 通过 turn/start 把用户输入追加到指定 Codex 桌面任务；请求受理后立即返回，让 Codex 桌面侧边栏实时出现新任务。
 fn run_codex_app_server_turn_start(
     session: &mut CodexAppServerSession,
     thread_id: &str,
     message: &str,
+    workspace_cwd: &str,
 ) -> Result<(), String> {
-    let _ = session.request(
+    let _response = session.request(
         3,
         "turn/start",
         json!({
             "threadId": thread_id,
+            "clientUserMessageId": next_codex_command_id("typesass-message"),
+            "cwd": workspace_cwd,
             "input": [{
                 "type": "text",
                 "text": message,
-                "text_elements": []
             }]
         }),
     )?;
-    session.wait_for_turn_completed(thread_id)
+    Ok(())
+}
+
+/// 使用 Codex Desktop deeplink 打开指定任务，让真实 Desktop 侧边栏立即选中该任务。
+fn open_codex_desktop_thread(thread_id: &str) -> Result<String, String> {
+    let url = format!("codex://threads/{}", thread_id);
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "打开 Codex Desktop 任务失败：{}",
+                    trim_error_message(&error.to_string())
+                )
+            })?;
+    }
+    Ok(url)
 }
 
 /// 将 app-server 返回的 Thread 对象转成前端列表需要的摘要。
 fn parse_codex_app_thread_summary(value: &Value) -> Option<CodexThreadSummary> {
     let id = value.get("id").and_then(Value::as_str)?.to_string();
     let title = value
-        .get("name")
+        .get("title")
         .and_then(Value::as_str)
+        .or_else(|| value.get("name").and_then(Value::as_str))
+        .or_else(|| value.get("threadName").and_then(Value::as_str))
         .or_else(|| value.get("preview").and_then(Value::as_str))
         .unwrap_or("未命名任务")
         .trim();
@@ -1704,8 +2270,148 @@ fn parse_codex_app_thread_summary(value: &Value) -> Option<CodexThreadSummary> {
     })
 }
 
-/// Typesass 只管理当前 monorepo 下的 aitool/Codex 任务，保持与用户 Codex 项目侧边栏一致。
-fn codex_thread_cwd() -> String {
+/// 将 app-server 的 Thread 详情转成前端可展示的消息列表。
+fn parse_codex_app_thread_detail(value: &Value) -> Result<CodexThreadDetail, String> {
+    let thread_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Codex 任务详情缺少 id".to_string())?;
+    let title = value
+        .get("name")
+        .or_else(|| value.get("title"))
+        .or_else(|| value.get("preview"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("未命名会话");
+    let updated_at = value
+        .get("updatedAt")
+        .and_then(Value::as_i64)
+        .map(|timestamp| (timestamp * 1000).to_string())
+        .unwrap_or_default();
+    let mut messages = Vec::new();
+    if let Some(turns) = value.get("turns").and_then(Value::as_array) {
+        for turn in turns {
+            let created_at = turn
+                .get("startedAt")
+                .and_then(Value::as_i64)
+                .map(|timestamp| (timestamp * 1000).to_string())
+                .unwrap_or_else(|| updated_at.clone());
+            if let Some(items) = turn.get("items").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(message) = parse_codex_app_thread_item(item, &created_at) {
+                        messages.push(message);
+                    }
+                }
+            }
+        }
+    }
+    let skip_count = messages.len().saturating_sub(CODEX_THREAD_MESSAGE_LIMIT);
+    Ok(CodexThreadDetail {
+        id: thread_id.to_string(),
+        title: title.to_string(),
+        updated_at,
+        messages: messages.into_iter().skip(skip_count).collect(),
+    })
+}
+
+/// 从 app-server 的单个 ThreadItem 中抽取用户或助手消息。
+fn parse_codex_app_thread_item(value: &Value, created_at: &str) -> Option<CodexThreadMessage> {
+    match value.get("type").and_then(Value::as_str)? {
+        "userMessage" => Some(CodexThreadMessage {
+            role: "user".to_string(),
+            content: limit_chars(
+                &extract_codex_app_user_message(value),
+                CODEX_MESSAGE_CONTENT_MAX_CHARS,
+            ),
+            created_at: created_at.to_string(),
+        }),
+        "agentMessage" => Some(CodexThreadMessage {
+            role: "assistant".to_string(),
+            content: limit_chars(
+                value.get("text").and_then(Value::as_str).unwrap_or(""),
+                CODEX_MESSAGE_CONTENT_MAX_CHARS,
+            ),
+            created_at: created_at.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// 从 app-server 用户消息内容数组中拼出纯文本，兼容未来多段文本结构。
+fn extract_codex_app_user_message(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_default()
+}
+
+/// 将 app-server 返回的近期任务按 cwd 合并成工作空间列表。
+fn parse_codex_workspaces(threads: &[Value]) -> Vec<CodexWorkspaceSummary> {
+    let mut workspaces = HashMap::<String, CodexWorkspaceSummary>::new();
+    for thread in threads {
+        let Some(cwd) = thread.get("cwd").and_then(Value::as_str) else {
+            continue;
+        };
+        let updated_at = thread
+            .get("updatedAt")
+            .and_then(Value::as_i64)
+            .map(|timestamp| (timestamp * 1000).to_string())
+            .unwrap_or_default();
+        let entry = workspaces
+            .entry(cwd.to_string())
+            .or_insert_with(|| CodexWorkspaceSummary {
+                cwd: cwd.to_string(),
+                title: codex_workspace_title(cwd),
+                thread_count: 0,
+                updated_at: updated_at.clone(),
+            });
+        entry.thread_count += 1;
+        if updated_at > entry.updated_at {
+            entry.updated_at = updated_at;
+        }
+    }
+    let mut values = workspaces.into_values().collect::<Vec<_>>();
+    if values.is_empty() {
+        values.push(CodexWorkspaceSummary {
+            cwd: default_codex_workspace_cwd(),
+            title: codex_workspace_title(&default_codex_workspace_cwd()),
+            thread_count: 0,
+            updated_at: String::new(),
+        });
+    }
+    values.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    values
+}
+
+/// 使用工作空间目录名作为下拉主标题，路径仍在辅助信息中完整展示。
+fn codex_workspace_title(cwd: &str) -> String {
+    PathBuf::from(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.trim().is_empty() == false)
+        .unwrap_or(cwd)
+        .to_string()
+}
+
+/// 归一化前端传入的工作空间路径，空值回落到默认 monorepo。
+fn normalize_codex_workspace_cwd(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|cwd| cwd.is_empty() == false)
+        .map(str::to_string)
+        .unwrap_or_else(default_codex_workspace_cwd)
+}
+
+/// Typesass 默认管理当前 monorepo 下的 aitool/Codex 任务，环境变量可覆盖。
+fn default_codex_workspace_cwd() -> String {
     env::var("TYPESASS_CODEX_CWD")
         .ok()
         .filter(|value| value.trim().is_empty() == false)
@@ -1725,11 +2431,19 @@ struct CodexAppServerSession {
 impl CodexAppServerSession {
     /// 启动一个 app-server stdio 子进程，短连接结束时由 Drop 清理。
     fn start() -> Result<Self, String> {
-        let mut child = Command::new("zsh")
-            .args([
+        let mut command = if fs::metadata(CODEX_DESKTOP_BIN).is_ok() {
+            let mut command = Command::new(CODEX_DESKTOP_BIN);
+            command.args(["app-server", "--stdio"]);
+            command
+        } else {
+            let mut command = Command::new("zsh");
+            command.args([
                 "-lc",
                 "source ~/.zshrc >/dev/null 2>&1 || true; codex app-server --stdio",
-            ])
+            ]);
+            command
+        };
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1837,40 +2551,42 @@ impl CodexAppServerSession {
         }
     }
 
-    /// 等待指定任务的当前 turn 完成，确保关闭短连接前 Codex 已经把本轮执行落盘。
-    fn wait_for_turn_completed(&mut self, thread_id: &str) -> Result<(), String> {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read_count = self.stdout.read_line(&mut line).map_err(|error| {
-                format!(
-                    "读取 Codex turn 状态失败：{}",
-                    trim_error_message(&error.to_string())
-                )
-            })?;
-            if read_count == 0 {
-                return Err("Codex app-server 已退出，未收到 turn 完成通知".to_string());
+    /// 等待新任务进入 Codex 任务列表；这里只等索引可见，不等待 AI 回复完成。
+    fn wait_for_thread_visible(
+        &mut self,
+        thread_id: &str,
+        workspace_cwd: &str,
+    ) -> Result<bool, String> {
+        for attempt in 0..CODEX_THREAD_VISIBLE_RETRY_COUNT {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(CODEX_THREAD_VISIBLE_RETRY_DELAY_MS));
             }
-            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-                continue;
-            };
-            if value.get("method").and_then(Value::as_str) != Some("turn/completed") {
-                continue;
-            }
-            let params = value.get("params").unwrap_or(&Value::Null);
-            if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
-                continue;
-            }
-            let has_error = params
-                .get("turn")
-                .and_then(|turn| turn.get("error"))
-                .map(|error| error.is_null() == false)
+            let response = self.request(
+                4 + attempt as i64,
+                "thread/list",
+                json!({
+                    "limit": CODEX_THREAD_LIST_LIMIT,
+                    "archived": false,
+                    "cwd": workspace_cwd,
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc"
+                }),
+            )?;
+            let is_visible = response
+                .get("result")
+                .and_then(|result| result.get("data"))
+                .and_then(Value::as_array)
+                .map(|threads| {
+                    threads
+                        .iter()
+                        .any(|thread| thread.get("id").and_then(Value::as_str) == Some(thread_id))
+                })
                 .unwrap_or(false);
-            if has_error {
-                return Err("Codex turn 执行失败，请在 Codex 桌面任务中查看详情".to_string());
+            if is_visible {
+                return Ok(true);
             }
-            return Ok(());
         }
+        Ok(false)
     }
 }
 
@@ -2366,11 +3082,9 @@ fn register_shortcut_profile(
     let mut seen = std::collections::HashSet::new();
     let mut shortcuts = Vec::new();
     for shortcut in [
+        profile.asr.as_str(),
         profile.dictate.as_str(),
-        profile.translate.as_str(),
-        profile.ask.as_str(),
         profile.polish.as_str(),
-        profile.subtitle.as_str(),
     ] {
         let normalized = normalize_shortcut(shortcut);
         if seen.insert(normalized) {
@@ -2415,6 +3129,7 @@ fn suspend_shortcut_profile(_app: &tauri::AppHandle) -> Result<(), String> {
 /// 规范化前端快捷键配置，并检查是否存在冲突。
 fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfile, String> {
     let normalized = ShortcutProfile {
+        asr: normalize_shortcut_or_default(&profile.asr, DEFAULT_ASR_TEXT_SHORTCUT),
         dictate: normalize_shortcut_or_default(&profile.dictate, DEFAULT_DICTATE_SHORTCUT),
         translate: normalize_shortcut_or_default(&profile.translate, DEFAULT_TRANSLATE_SHORTCUT),
         ask: normalize_shortcut_or_default(&profile.ask, DEFAULT_ASK_SHORTCUT),
@@ -2423,15 +3138,13 @@ fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfil
     };
     let mut seen = std::collections::HashSet::new();
     for shortcut in [
+        &normalized.asr,
         &normalized.dictate,
-        &normalized.translate,
-        &normalized.ask,
         &normalized.polish,
-        &normalized.subtitle,
     ] {
         let key = normalize_shortcut(shortcut);
         if !seen.insert(key) {
-            return Err("五个模式不能使用同一个快捷键".to_string());
+            return Err("语音转文字、语音润色和文本润色不能使用同一个快捷键".to_string());
         }
     }
     Ok(normalized)
@@ -3961,7 +4674,7 @@ fn capture_process_tap_audio_bytes(
 ) -> Result<ProcessTapCapturedAudio, String> {
     let started_at = Instant::now();
     let helper = resolve_process_tap_helper_path()?;
-    let duration_ms = request.duration_ms.clamp(800, 8_000);
+    let duration_ms = request.duration_ms.clamp(800, 30_000);
     let duration_seconds = format!("{:.3}", duration_ms as f64 / 1000.0);
     let target_keyword = if request.target_keyword.trim().is_empty() {
         "active"
@@ -4129,6 +4842,865 @@ async fn process_text(
             .and_then(Value::as_str)
             .unwrap_or(text_model)
             .to_string(),
+    })
+}
+
+/// 启动本地 HTTP 桥接服务。
+/// 流程：只监听 127.0.0.1，让普通浏览器预览页把模型测试请求转交给已启动的 typesass 客户端执行。
+/// 参数：app 为 Tauri 应用句柄，用于在请求处理时读取运行期密钥状态。
+/// 返回：无返回值；端口被占用时仅记录错误并跳过，避免阻塞客户端启动。
+/// 边界：服务只处理模型测试相关端点，不暴露外网地址。
+fn start_client_http_bridge(app: AppHandle) {
+    thread::spawn(move || {
+        let listener = match TcpListener::bind(CLIENT_HTTP_BRIDGE_ADDR) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("启动 typesass 本地 HTTP 桥接失败：{}", error);
+                return;
+            }
+        };
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let app_handle = app.clone();
+                    thread::spawn(move || {
+                        handle_client_http_bridge_stream(app_handle, stream);
+                    });
+                }
+                Err(error) => {
+                    eprintln!("接收 typesass 本地 HTTP 桥接请求失败：{}", error);
+                }
+            }
+        }
+    });
+}
+
+/// 处理单次 HTTP 桥接请求。
+/// 流程：解析请求方法、路径和 JSON body；根据路径分发到现有 Tauri 模型命令；最后写回 JSON 响应和 CORS 头。
+/// 参数：app 为 Tauri 应用句柄；stream 为当前 TCP 连接。
+/// 返回：无返回值。
+/// 边界：解析失败、路径不支持或模型请求失败时均返回结构化错误，不让线程 panic。
+fn handle_client_http_bridge_stream(app: AppHandle, mut stream: TcpStream) {
+    let request = match read_http_bridge_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = write_http_bridge_response(&mut stream, 400, json!({ "error": error }));
+            return;
+        }
+    };
+    if !is_allowed_http_bridge_origin(request.origin.as_deref()) {
+        let _ = write_http_bridge_response(
+            &mut stream,
+            403,
+            json!({ "error": "本地桥接拒绝非本机页面请求。" }),
+        );
+        return;
+    }
+    if request.method == "OPTIONS" {
+        let _ = write_http_bridge_response(&mut stream, 204, Value::Null);
+        return;
+    }
+    let response = match request.path.as_str() {
+        "/health" if request.method == "GET" => {
+            Ok(json!({ "ok": true, "name": "typesass-client-bridge" }))
+        }
+        "/openapi.json" if request.method == "GET" => Ok(build_client_http_bridge_openapi_document()),
+        "/runtime-diagnostics" if request.method == "GET" || request.method == "POST" => {
+            let secrets = app.state::<RuntimeSecrets>();
+            let shortcuts = app.state::<RuntimeShortcuts>();
+            get_runtime_diagnostics(secrets, shortcuts).map(|response| json!(response))
+        }
+        "/register-shortcuts" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<ShortcutProfile>(&request.body)
+                .map_err(|error| format!("解析快捷键配置失败：{}", error));
+            parsed_request.and_then(|shortcuts| {
+                let state = app.state::<RuntimeShortcuts>();
+                register_shortcuts(app.clone(), shortcuts, state).map(|response| json!(response))
+            })
+        }
+        "/suspend-shortcuts-for-recording" if request.method == "POST" => {
+            suspend_shortcuts_for_recording(app.clone()).map(|_| Value::Null)
+        }
+        "/open-microphone-settings" if request.method == "POST" => {
+            open_microphone_settings().map(|_| Value::Null)
+        }
+        "/open-accessibility-settings" if request.method == "POST" => {
+            open_accessibility_settings().map(|_| Value::Null)
+        }
+        "/set-login-launch" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<LoginLaunchBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析开机启动配置失败：{}", error));
+            parsed_request.and_then(|login_request| {
+                set_login_launch(login_request.enabled).map(|_| Value::Null)
+            })
+        }
+        "/get-login-launch" if request.method == "GET" || request.method == "POST" => {
+            get_login_launch().map(|response| json!(response))
+        }
+        "/save-api-key" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<SaveApiKeyBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析 API Key 保存请求失败：{}", error));
+            parsed_request.and_then(|key_request| {
+                let secrets = app.state::<RuntimeSecrets>();
+                save_api_key(secrets, key_request.api_key).map(|_| Value::Null)
+            })
+        }
+        "/process-text" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<ProcessTextRequest>(&request.body)
+                .map_err(|error| format!("解析文本模型请求失败：{}", error));
+            parsed_request.and_then(|process_request| {
+                tauri::async_runtime::block_on(async {
+                    let secrets = app.state::<RuntimeSecrets>();
+                    process_text(secrets, process_request)
+                        .await
+                        .map(|response| json!(response))
+                })
+            })
+        }
+        "/transcribe-audio" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<TranscribeRequest>(&request.body)
+                .map_err(|error| format!("解析 ASR 模型请求失败：{}", error));
+            parsed_request.and_then(|transcribe_request| {
+                tauri::async_runtime::block_on(async {
+                    let secrets = app.state::<RuntimeSecrets>();
+                    transcribe_audio(secrets, transcribe_request)
+                        .await
+                        .map(|response| json!(response))
+                })
+            })
+        }
+        "/read-selected-text" if request.method == "POST" => {
+            read_selected_text().map(|response| json!(response))
+        }
+        "/paste-text" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<PasteTextBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析自动粘贴请求失败：{}", error));
+            parsed_request.and_then(|paste_request| {
+                tauri::async_runtime::block_on(async {
+                    let focus_snapshot_state = app.state::<RuntimePasteFocusSnapshot>();
+                    paste_text(
+                        app.clone(),
+                        focus_snapshot_state,
+                        paste_request.text,
+                        paste_request.target_app,
+                    )
+                    .await
+                    .map(|response| json!(response))
+                })
+            })
+        }
+        "/hide-result-window" if request.method == "POST" => {
+            hide_result_window(app.clone()).map(|_| Value::Null)
+        }
+        "/show-subtitle-windows" if request.method == "POST" => {
+            show_subtitle_windows(app.clone()).map(|_| Value::Null)
+        }
+        "/hide-subtitle-windows" if request.method == "POST" => {
+            hide_subtitle_windows(app.clone()).map(|_| Value::Null)
+        }
+        "/get-last-result-window-payload" if request.method == "GET" || request.method == "POST" => {
+            let result_state = app.state::<RuntimeResult>();
+            get_last_result_window_payload(result_state).map(|response| json!(response))
+        }
+        "/load-session-workspace-data" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<SessionWorkspaceBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析会话工作区读取请求失败：{}", error));
+            parsed_request.and_then(|session_request| {
+                load_session_workspace_data(app.clone(), session_request.project_id)
+                    .map(|response| json!(response))
+            })
+        }
+        "/create-session-project" if request.method == "POST" => {
+            let parsed_request =
+                serde_json::from_slice::<task_store::CreateProjectRequest>(&request.body)
+                    .map_err(|error| format!("解析本地项目创建请求失败：{}", error));
+            parsed_request.and_then(|session_request| {
+                create_session_project(app.clone(), session_request).map(|response| json!(response))
+            })
+        }
+        "/create-session-task" if request.method == "POST" => {
+            let parsed_request =
+                serde_json::from_slice::<task_store::CreateTaskRequest>(&request.body)
+                    .map_err(|error| format!("解析本地任务创建请求失败：{}", error));
+            parsed_request.and_then(|session_request| {
+                create_session_task(app.clone(), session_request).map(|response| json!(response))
+            })
+        }
+        "/queue-session-task" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<SessionTaskIdBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析本地任务排队请求失败：{}", error));
+            parsed_request.and_then(|session_request| {
+                queue_session_task(app.clone(), session_request.task_id).map(|response| json!(response))
+            })
+        }
+        "/complete-session-task" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<SessionTaskIdBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析本地任务完成请求失败：{}", error));
+            parsed_request.and_then(|session_request| {
+                complete_session_task(app.clone(), session_request.task_id).map(|response| json!(response))
+            })
+        }
+        "/reset-session-task-schema" if request.method == "POST" => {
+            reset_session_task_schema(app.clone()).map(|response| json!(response))
+        }
+        "/open-session-external-thread" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<CodexThreadIdBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析 CodeX 会话打开请求失败：{}", error));
+            parsed_request.and_then(|thread_request| {
+                open_session_external_thread(thread_request.thread_id).map(|response| json!(response))
+            })
+        }
+        "/list-codex-workspaces" if request.method == "GET" || request.method == "POST" => {
+            list_codex_workspaces().map(|response| json!(response))
+        }
+        "/list-codex-threads" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<CodexThreadListRequest>(&request.body)
+                .map_err(|error| format!("解析 CodeX 工作空间请求失败：{}", error));
+            parsed_request.and_then(|workspace_request| {
+                list_codex_threads(workspace_request).map(|response| json!(response))
+            })
+        }
+        "/read-local-config-value" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<LocalConfigKeyBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析配置读取请求失败：{}", error));
+            parsed_request.and_then(|config_request| {
+                read_local_config_value(app.clone(), config_request.key).map(|response| json!(response))
+            })
+        }
+        "/write-local-config-value" if request.method == "POST" => {
+            let parsed_request =
+                serde_json::from_slice::<LocalConfigWriteBridgeRequest>(&request.body)
+                    .map_err(|error| format!("解析配置写入请求失败：{}", error));
+            parsed_request.and_then(|config_request| {
+                write_local_config_value(app.clone(), config_request.key, config_request.value)
+                    .map(|_| Value::Null)
+            })
+        }
+        "/remove-local-config-value" if request.method == "POST" => {
+            let parsed_request = serde_json::from_slice::<LocalConfigKeyBridgeRequest>(&request.body)
+                .map_err(|error| format!("解析配置删除请求失败：{}", error));
+            parsed_request.and_then(|config_request| {
+                remove_local_config_value(app.clone(), config_request.key).map(|_| Value::Null)
+            })
+        }
+        "/read-local-config-snapshot" if request.method == "GET" || request.method == "POST" => {
+            read_local_config_snapshot(app.clone()).map(|response| json!(response))
+        }
+        "/start-local-config-watch" if request.method == "POST" => {
+            let watcher = app.state::<RuntimeLocalConfigWatcher>();
+            start_local_config_watch(app.clone(), watcher).map(|_| Value::Null)
+        }
+        _ => Err("不支持的本地桥接请求。".to_string()),
+    };
+    match response {
+        Ok(value) => {
+            let _ = write_http_bridge_response(&mut stream, 200, value);
+        }
+        Err(error) => {
+            let _ = write_http_bridge_response(&mut stream, 500, json!({ "error": error }));
+        }
+    }
+}
+
+/// 本地 HTTP 桥接请求模型。
+/// 业务含义：承载解析后的 HTTP 方法、路径和请求体，供本地桥接分发使用。
+struct HttpBridgeRequest {
+    /// HTTP 方法，例如 GET、POST、OPTIONS。
+    method: String,
+    /// HTTP 路径，不包含查询参数。
+    path: String,
+    /// 浏览器请求来源，用于阻止非本机页面跨域调用客户端能力。
+    origin: Option<String>,
+    /// 请求体原始字节，JSON 端点会在分发时解析。
+    body: Vec<u8>,
+}
+
+/// 保存 API Key 的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveApiKeyBridgeRequest {
+    /// 用户在模型管理中填写的 Mimo API Key。
+    api_key: String,
+}
+
+/// 开机启动状态的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginLaunchBridgeRequest {
+    /// 是否启用开机自动启动。
+    enabled: bool,
+}
+
+/// 自动粘贴的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PasteTextBridgeRequest {
+    /// 需要写回外部输入框的文本。
+    text: String,
+    /// 录音或润色开始时记录的目标应用名称。
+    target_app: String,
+}
+
+/// 本地 JSON 配置 key 的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalConfigKeyBridgeRequest {
+    /// 配置分区 key，必须位于 typesass 命名空间内。
+    key: String,
+}
+
+/// 本地 JSON 配置写入的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalConfigWriteBridgeRequest {
+    /// 配置分区 key，必须位于 typesass 命名空间内。
+    key: String,
+    /// 需要写入配置文件的 JSON 值。
+    value: Value,
+}
+
+/// 会话工作区读取的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionWorkspaceBridgeRequest {
+    /// 当前选中的项目 ID，空值时由客户端选择默认项目。
+    project_id: Option<String>,
+}
+
+/// 本地任务 ID 的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTaskIdBridgeRequest {
+    /// 需要操作的本地任务 ID。
+    task_id: String,
+}
+
+/// CodeX thread ID 的 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadIdBridgeRequest {
+    /// 需要打开的 CodeX 会话 ID。
+    thread_id: String,
+}
+
+/// CodeX 会话列表 HTTP 桥接请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadListRequest {
+    /// CodeX 工作空间绝对路径。
+    workspace_cwd: String,
+    /// 本次读取的最大会话数量。
+    limit: i64,
+    /// 跳过的会话数量，用于加载更多分页。
+    offset: i64,
+    /// 搜索关键词，可匹配标题、预览或 thread ID。
+    keyword: String,
+}
+
+/// 读取并解析本地 HTTP 桥接请求。
+/// 流程：读取头部，解析首行和 Content-Length，再读取完整 body。
+/// 参数：stream 为当前 TCP 连接。
+/// 返回：解析后的桥接请求。
+/// 边界：当前只支持普通 Content-Length 请求，不处理 chunked 编码。
+fn read_http_bridge_request(stream: &mut TcpStream) -> Result<HttpBridgeRequest, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("设置本地桥接读取超时失败：{}", error))?;
+    let mut buffer = Vec::new();
+    let mut temp = [0_u8; 1024];
+    let header_end = loop {
+        let count = stream
+            .read(&mut temp)
+            .map_err(|error| format!("读取本地桥接请求失败：{}", error))?;
+        if count == 0 {
+            return Err("本地桥接请求为空。".to_string());
+        }
+        buffer.extend_from_slice(&temp[..count]);
+        if let Some(index) = find_header_end(&buffer) {
+            break index;
+        }
+        if buffer.len() > 64 * 1024 {
+            return Err("本地桥接请求头过大。".to_string());
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+    let mut lines = header_text.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "本地桥接请求首行缺失。".to_string())?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| "本地桥接请求方法缺失。".to_string())?
+        .to_string();
+    let raw_path = request_parts
+        .next()
+        .ok_or_else(|| "本地桥接请求路径缺失。".to_string())?;
+    let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
+    let header_lines = lines.collect::<Vec<&str>>();
+    let origin = header_lines
+        .iter()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("origin")
+                .then(|| value.trim().to_string())
+        });
+    let content_length = header_lines
+        .iter()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    let mut body = buffer.get(body_start..).unwrap_or_default().to_vec();
+    while body.len() < content_length {
+        let count = stream
+            .read(&mut temp)
+            .map_err(|error| format!("读取本地桥接请求体失败：{}", error))?;
+        if count == 0 {
+            break;
+        }
+        body.extend_from_slice(&temp[..count]);
+    }
+    body.truncate(content_length);
+    Ok(HttpBridgeRequest {
+        method,
+        path,
+        origin,
+        body,
+    })
+}
+
+/// 校验本地 HTTP 桥接来源。
+/// 流程：非浏览器请求通常没有 Origin，直接允许；浏览器请求只允许本机开发地址和 Tauri 内置页面。
+/// 参数：origin 为 HTTP Origin 头。
+/// 返回：是否允许继续访问桥接端点。
+/// 边界：拒绝公网域名跨域调用，避免普通网页操作本机剪贴板、系统设置或本地配置。
+fn is_allowed_http_bridge_origin(origin: Option<&str>) -> bool {
+    let Some(value) = origin else {
+        return true;
+    };
+    value == "tauri://localhost"
+        || value.starts_with("http://127.0.0.1:")
+        || value.starts_with("http://localhost:")
+        || value.starts_with("https://127.0.0.1:")
+        || value.starts_with("https://localhost:")
+}
+
+/// 查找 HTTP 头部结束位置。
+/// 流程：扫描字节窗口，找到 CRLFCRLF 后返回头部结束索引。
+/// 参数：buffer 为当前已读取的请求字节。
+/// 返回：找到时返回头部结束位置，否则返回 None。
+/// 边界：只处理标准 HTTP CRLF 头部。
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+}
+
+/// 写回本地 HTTP 桥接响应。
+/// 流程：将响应 JSON 序列化，附加 CORS 和 JSON 响应头后写入 TCP 连接。
+/// 参数：stream 为当前 TCP 连接；status 为 HTTP 状态码；body 为响应 JSON。
+/// 返回：写入成功或失败结果。
+/// 边界：204 响应不写 body，避免浏览器把预检响应当成业务 JSON。
+fn write_http_bridge_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: Value,
+) -> Result<(), String> {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    let body_text = if status == 204 {
+        String::new()
+    } else {
+        serde_json::to_string(&body).map_err(|error| format!("序列化本地桥接响应失败：{}", error))?
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Max-Age: 600\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason,
+        body_text.as_bytes().len(),
+        body_text
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("写入本地桥接响应失败：{}", error))
+}
+
+/// 生成 typesass 本地 HTTP 桥接 OpenAPI 文档。
+/// 流程：按当前 HTTP handler 已实现的真实端点声明路径、分组、入参、出参和错误响应。
+/// 参数：无。
+/// 返回：OpenAPI 3.1 JSON 文档。
+/// 边界：只登记当前代码实际分发的端点，未实现的业务能力不写入文档。
+fn build_client_http_bridge_openapi_document() -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "typesass App HTTP Bridge API",
+            "version": "0.0.2",
+            "description": "typesass Web 通过 App 在 127.0.0.1:25818 启动的 HTTP 桥接服务访问本机能力。所有接口只面向本机页面，公网网页会被 Origin 校验拒绝。"
+        },
+        "servers": [
+            {
+                "url": "http://127.0.0.1:25818",
+                "description": "typesass App 本机 HTTP 桥接服务"
+            }
+        ],
+        "tags": [
+            { "name": "基础与文档", "description": "健康检查和 OpenAPI 文档。" },
+            { "name": "权限管理", "description": "读取系统权限、快捷键、开机启动和打开系统设置。" },
+            { "name": "模型管理", "description": "保存 Mimo API Key，并通过真实模型请求校验文本和语音模型。" },
+            { "name": "语音转文字", "description": "提交音频 base64 到 App，再由 App 调用真实 ASR 模型。" },
+            { "name": "润色", "description": "读取系统选中文本、调用文本模型处理，并粘贴回目标应用。" },
+            { "name": "本地配置", "description": "读写 App 数据目录中的 typesass JSON 配置文件。" },
+            { "name": "会话与任务", "description": "读写本地项目、任务和任务状态。" },
+            { "name": "Codex", "description": "读取本机 Codex 工作空间、会话列表并打开外部会话。" },
+            { "name": "窗口", "description": "控制 App 内部辅助窗口。实时字幕业务不属于当前开发范围，但这些窗口端点当前存在。" }
+        ],
+        "paths": {
+            "/health": {
+                "get": {
+                    "tags": ["基础与文档"],
+                    "summary": "读取 App HTTP 桥健康状态",
+                    "description": "Web 端轮询此接口判断 App 服务是否已连接。",
+                    "responses": {
+                        "200": { "description": "服务健康。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/HealthResponse" } } } },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "500": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/openapi.json": {
+                "get": {
+                    "tags": ["基础与文档"],
+                    "summary": "读取 HTTP 桥 OpenAPI 文档",
+                    "description": "返回当前 App HTTP 桥真实支持的接口、入参、出参和模块分组。",
+                    "responses": {
+                        "200": { "description": "OpenAPI 3.1 JSON 文档。", "content": { "application/json": { "schema": { "type": "object" } } } },
+                        "403": { "$ref": "#/components/responses/Forbidden" },
+                        "500": { "$ref": "#/components/responses/Error" }
+                    }
+                }
+            },
+            "/runtime-diagnostics": {
+                "get": {
+                    "tags": ["权限管理"],
+                    "summary": "读取系统权限和快捷键诊断",
+                    "description": "返回麦克风、辅助功能、会话 API Key、快捷键配置、快捷键注册状态等运行期诊断。",
+                    "responses": { "200": { "description": "权限和快捷键诊断。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RuntimeDiagnostics" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/register-shortcuts": {
+                "post": {
+                    "tags": ["权限管理"],
+                    "summary": "注册全局快捷键",
+                    "description": "保存并立即注册 ASR、听写、翻译、随便问、润色和字幕快捷键。当前页面只展示已开发模块，但协议保持完整快捷键 Profile。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ShortcutProfile" } } } },
+                    "responses": { "200": { "description": "已生效的快捷键配置。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ShortcutProfile" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/suspend-shortcuts-for-recording": {
+                "post": { "tags": ["权限管理"], "summary": "临时暂停快捷键注册", "description": "录制新快捷键前调用，避免系统全局快捷键拦截 Web 输入。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/open-microphone-settings": {
+                "post": { "tags": ["权限管理"], "summary": "打开麦克风系统设置", "description": "在 macOS 上打开麦克风权限设置入口。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/open-accessibility-settings": {
+                "post": { "tags": ["权限管理"], "summary": "打开辅助功能系统设置", "description": "在 macOS 上打开辅助功能权限设置入口。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/set-login-launch": {
+                "post": {
+                    "tags": ["权限管理"],
+                    "summary": "设置开机自动启动",
+                    "description": "写入或删除用户级 LaunchAgent。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginLaunchRequest" } } } },
+                    "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/get-login-launch": {
+                "get": { "tags": ["权限管理"], "summary": "读取开机自动启动状态", "description": "返回 LaunchAgent 当前是否已启用。", "responses": { "200": { "description": "布尔值。", "content": { "application/json": { "schema": { "type": "boolean" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/save-api-key": {
+                "post": {
+                    "tags": ["模型管理"],
+                    "summary": "保存 Mimo API Key",
+                    "description": "把 API Key 保存到当前 App 会话和 macOS 钥匙串。空字符串会返回错误。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SaveApiKeyRequest" } } } },
+                    "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/transcribe-audio": {
+                "post": {
+                    "tags": ["语音转文字", "模型管理"],
+                    "summary": "执行语音转文字",
+                    "description": "提交音频 base64 和 ASR 模型配置。apiKey 为空时 App 会从会话内存或环境变量读取。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TranscribeRequest" } } } },
+                    "responses": { "200": { "description": "语音转写结果。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TranscribeResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/process-text": {
+                "post": {
+                    "tags": ["润色", "模型管理"],
+                    "summary": "执行文本处理",
+                    "description": "按模式处理文本，支持听写整理、翻译、问答、润色等现有协议值。当前已开发入口主要使用润色和语音转文字润色。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProcessTextRequest" } } } },
+                    "responses": { "200": { "description": "文本处理结果。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProcessTextResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/read-selected-text": {
+                "post": { "tags": ["润色"], "summary": "读取系统当前选中文本", "description": "通过辅助功能和系统复制快捷键读取外部 App 选中文本，并尽量恢复原剪贴板。", "responses": { "200": { "description": "选中文本读取结果。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SelectedTextResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/paste-text": {
+                "post": {
+                    "tags": ["润色", "语音转文字"],
+                    "summary": "把文本粘贴回目标应用",
+                    "description": "写入系统剪贴板并模拟系统粘贴；会检查目标应用和辅助功能权限。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PasteTextRequest" } } } },
+                    "responses": { "200": { "description": "粘贴执行诊断。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PasteResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/read-local-config-value": {
+                "post": {
+                    "tags": ["本地配置"],
+                    "summary": "读取本地 JSON 配置分区",
+                    "description": "key 必须以 typesass. 开头；分区不存在时返回 null。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LocalConfigKeyRequest" } } } },
+                    "responses": { "200": { "description": "JSON 值或 null。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JsonValue" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/write-local-config-value": {
+                "post": {
+                    "tags": ["本地配置"],
+                    "summary": "写入本地 JSON 配置分区",
+                    "description": "写入 App 数据目录的 typesass-config.json，并通知 App WebView 刷新。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LocalConfigWriteRequest" } } } },
+                    "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/remove-local-config-value": {
+                "post": {
+                    "tags": ["本地配置"],
+                    "summary": "删除本地 JSON 配置分区",
+                    "description": "删除指定 key，key 不存在时幂等成功。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LocalConfigKeyRequest" } } } },
+                    "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/read-local-config-snapshot": {
+                "get": { "tags": ["本地配置"], "summary": "读取本地 JSON 配置完整快照", "description": "返回配置文件版本、更新时间和全部分区。", "responses": { "200": { "description": "配置快照。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LocalConfigDocument" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/start-local-config-watch": {
+                "post": { "tags": ["本地配置"], "summary": "启动本地 JSON 配置监听", "description": "让 App 后台轮询配置文件修改时间，捕捉外部编辑配置文件的场景。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/load-session-workspace-data": {
+                "post": {
+                    "tags": ["会话与任务"],
+                    "summary": "读取项目、任务和会话聚合数据",
+                    "description": "初始化 SQLite 表结构，并按 projectId 返回项目列表、任务列表和会话列表。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionWorkspaceRequest" } } } },
+                    "responses": { "200": { "description": "工作区聚合数据。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceDataResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/create-session-project": {
+                "post": {
+                    "tags": ["会话与任务"],
+                    "summary": "创建本地项目",
+                    "description": "项目绑定一个工作空间路径；项目名称和工作空间路径不能为空。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateProjectRequest" } } } },
+                    "responses": { "200": { "description": "刷新后的聚合数据。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceDataResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/create-session-task": {
+                "post": {
+                    "tags": ["会话与任务"],
+                    "summary": "创建本地任务",
+                    "description": "任务创建后保持 created 状态，不会自动执行。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTaskRequest" } } } },
+                    "responses": { "200": { "description": "刷新后的聚合数据。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceDataResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/queue-session-task": {
+                "post": {
+                    "tags": ["会话与任务"],
+                    "summary": "任务进入排队并启动 CodeX 会话创建",
+                    "description": "任务会先进入 queued，然后 App 后台创建 CodeX thread；失败会记录到任务 lastError。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionTaskIdRequest" } } } },
+                    "responses": { "200": { "description": "刷新后的聚合数据。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceDataResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/complete-session-task": {
+                "post": {
+                    "tags": ["会话与任务"],
+                    "summary": "完成待验收任务",
+                    "description": "只有 waiting_acceptance 状态的任务可以完成。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionTaskIdRequest" } } } },
+                    "responses": { "200": { "description": "刷新后的聚合数据。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceDataResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/reset-session-task-schema": {
+                "post": { "tags": ["会话与任务"], "summary": "重置任务管理本地表结构", "description": "删除任务、会话、项目业务表并重新应用当前 schema；不会删除 API Key、主题、快捷键等 JSON 设置。", "responses": { "200": { "description": "空业务数据聚合结果。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceDataResponse" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/open-session-external-thread": {
+                "post": {
+                    "tags": ["Codex", "会话与任务"],
+                    "summary": "打开 CodeX 外部会话",
+                    "description": "校验 threadId 后生成并打开 CodeX Desktop deeplink。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CodexThreadIdRequest" } } } },
+                    "responses": { "200": { "description": "deeplink URL 字符串。", "content": { "application/json": { "schema": { "type": "string" } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/list-codex-workspaces": {
+                "get": { "tags": ["Codex"], "summary": "读取本机 Codex 工作空间列表", "description": "优先读取本地状态文件，失败时尝试调用 Codex app-server。", "responses": { "200": { "description": "工作空间摘要列表。", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/CodexWorkspace" } } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } }
+            },
+            "/list-codex-threads": {
+                "post": {
+                    "tags": ["Codex"],
+                    "summary": "读取指定工作空间下的 Codex 会话列表",
+                    "description": "按 workspaceCwd 读取最近 CodeX 会话摘要。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CodexThreadListRequest" } } } },
+                    "responses": { "200": { "description": "会话摘要列表。", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/CodexThreadSummary" } } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } }
+                }
+            },
+            "/hide-result-window": { "post": { "tags": ["窗口"], "summary": "隐藏结果窗口", "description": "隐藏语音链路兜底结果窗口。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } } },
+            "/get-last-result-window-payload": { "get": { "tags": ["窗口"], "summary": "读取最近一次结果窗口内容", "description": "供结果窗口初始化时恢复最近一次兜底内容。", "responses": { "200": { "description": "结果窗口内容或 null。", "content": { "application/json": { "schema": { "oneOf": [ { "$ref": "#/components/schemas/ResultWindowPayload" }, { "type": "null" } ] } } } }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } } },
+            "/show-subtitle-windows": { "post": { "tags": ["窗口"], "summary": "显示字幕窗口", "description": "显示 App 内部字幕窗口；实时字幕业务不在当前用户开发范围内。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } } },
+            "/hide-subtitle-windows": { "post": { "tags": ["窗口"], "summary": "隐藏字幕窗口", "description": "隐藏 App 内部字幕窗口；实时字幕业务不在当前用户开发范围内。", "responses": { "200": { "$ref": "#/components/responses/Empty" }, "403": { "$ref": "#/components/responses/Forbidden" }, "500": { "$ref": "#/components/responses/Error" } } } }
+        },
+        "components": {
+            "responses": {
+                "Empty": { "description": "操作成功，无业务响应体；当前桥接实现可能返回 JSON null。" },
+                "Forbidden": { "description": "Origin 不允许。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } },
+                "Error": { "description": "业务错误、解析错误或系统错误。", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } } }
+            },
+            "schemas": {
+                "JsonValue": {
+                    "description": "可序列化 JSON 值。",
+                    "oneOf": [
+                        { "type": "null" },
+                        { "type": "string" },
+                        { "type": "number" },
+                        { "type": "boolean" },
+                        { "type": "array", "items": { "$ref": "#/components/schemas/JsonValue" } },
+                        { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/JsonValue" } }
+                    ]
+                },
+                "ErrorResponse": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": { "error": { "type": "string", "description": "可直接展示或记录的错误信息。" } }
+                },
+                "HealthResponse": {
+                    "type": "object",
+                    "required": ["ok", "name"],
+                    "properties": {
+                        "ok": { "type": "boolean", "description": "服务是否健康。" },
+                        "name": { "type": "string", "const": "typesass-client-bridge", "description": "桥接服务名称。" }
+                    }
+                },
+                "ShortcutProfile": {
+                    "type": "object",
+                    "properties": {
+                        "asr": { "type": "string", "description": "ASR 仅转文本快捷键，例如 ctrl+shift+d。" },
+                        "dictate": { "type": "string", "description": "听写整理快捷键，例如 ctrl+p。" },
+                        "translate": { "type": "string", "description": "翻译快捷键，协议保留。" },
+                        "ask": { "type": "string", "description": "随便问快捷键，协议保留。" },
+                        "polish": { "type": "string", "description": "文本润色快捷键，例如 ctrl+shift+p。" },
+                        "subtitle": { "type": "string", "description": "字幕快捷键，协议保留。" }
+                    },
+                    "additionalProperties": false
+                },
+                "RuntimeDiagnostics": {
+                    "type": "object",
+                    "description": "字段来自 App 运行期诊断，按 camelCase 序列化；具体字段会随权限诊断模型扩展。"
+                },
+                "LoginLaunchRequest": { "type": "object", "required": ["enabled"], "properties": { "enabled": { "type": "boolean", "description": "是否启用开机自动启动。" } }, "additionalProperties": false },
+                "SaveApiKeyRequest": { "type": "object", "required": ["apiKey"], "properties": { "apiKey": { "type": "string", "minLength": 1, "description": "Mimo API Key，服务端会 trim，空值报错。" } }, "additionalProperties": false },
+                "TranscribeRequest": {
+                    "type": "object",
+                    "required": ["apiKey", "baseUrl", "asrModel", "language", "contentType", "audioBase64"],
+                    "properties": {
+                        "apiKey": { "type": "string", "description": "Mimo API Key；为空时 App 从会话内存或环境变量读取。" },
+                        "baseUrl": { "type": "string", "description": "OpenAI 兼容接口地址，默认 https://token-plan-cn.xiaomimimo.com/v1。" },
+                        "asrModel": { "type": "string", "description": "语音识别模型名称，例如 mimo-v2.5-asr。" },
+                        "language": { "type": "string", "description": "识别语言，auto 表示自动识别。" },
+                        "contentType": { "type": "string", "description": "音频 MIME 类型，例如 audio/wav、audio/webm。" },
+                        "audioBase64": { "type": "string", "description": "音频 base64 内容，不包含 data URL 头。" }
+                    },
+                    "additionalProperties": false
+                },
+                "TranscribeResponse": {
+                    "type": "object",
+                    "required": ["text", "elapsedMs", "model"],
+                    "properties": {
+                        "text": { "type": "string", "description": "转写后的文字。" },
+                        "elapsedMs": { "type": "integer", "minimum": 0, "description": "App 统计的转写耗时毫秒。" },
+                        "model": { "type": "string", "description": "实际返回的模型名称。" }
+                    }
+                },
+                "ProcessTextRequest": {
+                    "type": "object",
+                    "required": ["apiKey", "baseUrl", "textModel", "mode", "text"],
+                    "properties": {
+                        "apiKey": { "type": "string", "description": "Mimo API Key；为空时 App 从会话内存或环境变量读取。" },
+                        "baseUrl": { "type": "string", "description": "OpenAI 兼容接口地址。" },
+                        "textModel": { "type": "string", "description": "文本模型名称，例如 mimo-v2.5。" },
+                        "mode": { "type": "string", "description": "处理模式，现有协议包含 dictate、translate、ask、polish、asr 等。" },
+                        "text": { "type": "string", "minLength": 1, "description": "待处理文本。" },
+                        "dictionary": { "type": "array", "items": { "type": "string" }, "description": "本地词典词条，用于约束输出。" },
+                        "styleInstruction": { "type": "string", "description": "用户个性化输出偏好。" },
+                        "targetApp": { "type": "string", "description": "目标 App 名称，用于提示词上下文。" }
+                    }
+                },
+                "ProcessTextResponse": {
+                    "type": "object",
+                    "required": ["processedText", "elapsedMs", "model"],
+                    "properties": {
+                        "processedText": { "type": "string", "description": "处理后的文本。" },
+                        "elapsedMs": { "type": "integer", "minimum": 0, "description": "App 统计的处理耗时毫秒。" },
+                        "model": { "type": "string", "description": "实际返回的模型名称。" }
+                    }
+                },
+                "SelectedTextResponse": {
+                    "type": "object",
+                    "required": ["text", "targetApp", "accessibilityTrusted", "clipboardRestored", "clipboardRestoreMessage", "copyMethod"],
+                    "properties": {
+                        "text": { "type": "string", "description": "读取到的选中文本。" },
+                        "targetApp": { "type": "string", "description": "读取前的前台 App 名称。" },
+                        "accessibilityTrusted": { "type": "boolean", "description": "是否检测到辅助功能授权。" },
+                        "clipboardRestored": { "type": "boolean", "description": "是否恢复原剪贴板。" },
+                        "clipboardRestoreMessage": { "type": "string", "description": "剪贴板恢复状态说明。" },
+                        "copyMethod": { "type": "string", "description": "读取选中文本使用的方法。" }
+                    }
+                },
+                "PasteTextRequest": { "type": "object", "required": ["text", "targetApp"], "properties": { "text": { "type": "string", "minLength": 1, "description": "需要粘贴的文本。" }, "targetApp": { "type": "string", "description": "期望粘贴回去的目标 App。" } }, "additionalProperties": false },
+                "PasteResponse": { "type": "object", "description": "自动粘贴诊断对象，包含 pasted、message、requiresAccessibility、targetApp、clipboardWritten、clipboardRestored、accessibilityTrusted、pasteMethod、frontmostBeforePaste 等字段。" },
+                "LocalConfigKeyRequest": { "type": "object", "required": ["key"], "properties": { "key": { "type": "string", "pattern": "^typesass\\.", "description": "配置分区 key，必须位于 typesass 命名空间。" } }, "additionalProperties": false },
+                "LocalConfigWriteRequest": { "type": "object", "required": ["key", "value"], "properties": { "key": { "type": "string", "pattern": "^typesass\\.", "description": "配置分区 key。" }, "value": { "$ref": "#/components/schemas/JsonValue" } }, "additionalProperties": false },
+                "LocalConfigDocument": { "type": "object", "required": ["version", "updatedAt", "items"], "properties": { "version": { "type": "integer", "description": "配置文件版本。" }, "updatedAt": { "type": "string", "description": "最近一次更新时间戳字符串。" }, "items": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/JsonValue" }, "description": "全部配置分区。" } } },
+                "SessionWorkspaceRequest": { "type": "object", "properties": { "projectId": { "type": "string", "description": "当前项目 ID；为空时 App 选择默认项目。" } }, "additionalProperties": false },
+                "CreateProjectRequest": { "type": "object", "required": ["name", "workspacePath"], "properties": { "name": { "type": "string", "minLength": 1, "description": "项目名称。" }, "workspacePath": { "type": "string", "minLength": 1, "description": "项目绑定的工作空间绝对路径。" } }, "additionalProperties": false },
+                "CreateTaskRequest": { "type": "object", "required": ["projectId", "title", "prompt"], "properties": { "projectId": { "type": "string", "minLength": 1, "description": "所属项目 ID。" }, "title": { "type": "string", "minLength": 1, "description": "任务标题。" }, "prompt": { "type": "string", "minLength": 1, "description": "发送给 CodeX 的任务内容。" } }, "additionalProperties": false },
+                "SessionTaskIdRequest": { "type": "object", "required": ["taskId"], "properties": { "taskId": { "type": "string", "minLength": 1, "description": "本地任务 ID。" } }, "additionalProperties": false },
+                "WorkspaceDataResponse": { "type": "object", "required": ["projects", "tasks", "sessions"], "properties": { "projects": { "type": "array", "items": { "$ref": "#/components/schemas/SessionProject" } }, "tasks": { "type": "array", "items": { "$ref": "#/components/schemas/SessionTask" } }, "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/SessionRecord" } } } },
+                "SessionProject": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" }, "workspacePath": { "type": "string" }, "taskCount": { "type": "integer" }, "sessionCount": { "type": "integer" }, "createdAt": { "type": "string" }, "updatedAt": { "type": "string" } } },
+                "SessionTask": { "type": "object", "properties": { "id": { "type": "string" }, "projectId": { "type": "string" }, "title": { "type": "string" }, "prompt": { "type": "string" }, "status": { "type": "string", "enum": ["created", "queued", "running", "waiting_acceptance", "completed", "failed", "cancelled"] }, "currentSessionId": { "type": "string" }, "externalThreadId": { "type": "string" }, "lastError": { "type": "string" }, "createdAt": { "type": "string" }, "updatedAt": { "type": "string" } } },
+                "SessionRecord": { "type": "object", "properties": { "id": { "type": "string" }, "projectId": { "type": "string" }, "taskId": { "type": "string" }, "provider": { "type": "string" }, "workspacePath": { "type": "string" }, "title": { "type": "string" }, "status": { "type": "string" }, "externalThreadId": { "type": "string" }, "createdAt": { "type": "string" }, "updatedAt": { "type": "string" } } },
+                "CodexThreadIdRequest": { "type": "object", "required": ["threadId"], "properties": { "threadId": { "type": "string", "minLength": 1, "description": "CodeX 会话 ID。" } }, "additionalProperties": false },
+                "CodexThreadListRequest": { "type": "object", "required": ["workspaceCwd", "limit", "offset", "keyword"], "properties": { "workspaceCwd": { "type": "string", "minLength": 1, "description": "CodeX 工作空间绝对路径。" }, "limit": { "type": "integer", "minimum": 1, "maximum": 60, "description": "本次读取的最大会话数量。" }, "offset": { "type": "integer", "minimum": 0, "description": "跳过的会话数量，用于加载更多分页。" }, "keyword": { "type": "string", "description": "搜索关键词，可匹配标题、预览或 thread ID。" } }, "additionalProperties": false },
+                "CodexWorkspace": { "type": "object", "properties": { "cwd": { "type": "string" }, "title": { "type": "string" }, "threadCount": { "type": "integer" }, "updatedAt": { "type": "string" } } },
+                "CodexThreadSummary": { "type": "object", "properties": { "id": { "type": "string" }, "title": { "type": "string" }, "updatedAt": { "type": "string" } } },
+                "ResultWindowPayload": { "type": "object", "properties": { "text": { "type": "string" }, "reason": { "type": "string" }, "requiresAccessibility": { "type": "boolean" } } }
+            }
+        }
     })
 }
 
@@ -5137,41 +6709,10 @@ fn read_clipboard_text_raw() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// 通过 macOS pbpaste 读取剪贴板文本，用于托盘菜单快速加入本地词典。
-#[cfg(target_os = "macos")]
-fn read_clipboard_text() -> Result<String, String> {
-    Ok(read_clipboard_text_raw()?.trim().to_string())
-}
-
 /// 非 macOS 桌面端暂不支持读取剪贴板原文。
 #[cfg(not(target_os = "macos"))]
 fn read_clipboard_text_raw() -> Result<String, String> {
     Err("当前系统暂不支持读取剪贴板".to_string())
-}
-
-/// 非 macOS 桌面端暂不支持通过托盘读取剪贴板。
-#[cfg(not(target_os = "macos"))]
-fn read_clipboard_text() -> Result<String, String> {
-    Err("当前系统暂不支持从托盘读取剪贴板".to_string())
-}
-
-/// 将剪贴板文本拆成词典词条，兼容逗号、顿号、分号和换行。
-fn split_dictionary_words(text: &str) -> Vec<String> {
-    text.split(|character: char| {
-        character == '\n'
-            || character == '\r'
-            || character == ','
-            || character == '，'
-            || character == '、'
-            || character == ';'
-            || character == '；'
-            || character == '\t'
-    })
-    .map(str::trim)
-    .filter(|word| !word.is_empty())
-    .take(20)
-    .map(ToString::to_string)
-    .collect()
 }
 
 /// 触发系统级 Cmd+V；优先使用更接近物理按键的 CoreGraphics，再回退到 AppleScript。

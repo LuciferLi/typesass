@@ -1,0 +1,181 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 235 11% 96%;
+    --foreground: 240 9% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 9% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 9% 10%;
+    --overlay: 240 10% 3.9%;
+    --primary: 259 82% 68%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 7% 91%;
+    --secondary-foreground: 240 8% 16%;
+    --muted: 240 7% 92%;
+    --muted-foreground: 240 4% 43%;
+    --accent: 258 64% 92%;
+    --accent-foreground: 258 48% 32%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 240 8% 86%;
+    --input: 240 8% 86%;
+    --ring: 258 82% 68%;
+    --radius: 0.875rem;
+    --sidebar-background: 240 9% 98%;
+    --sidebar-foreground: 240 7% 24%;
+    --sidebar-primary: 258 82% 68%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 258 64% 92%;
+    --sidebar-accent-foreground: 258 48% 32%;
+    --sidebar-border: 240 8% 88%;
+    --sidebar-ring: 258 82% 68%;
+    --scrollbar-track: 240 9% 90%;
+    --scrollbar-thumb: 240 6% 64%;
+    --scrollbar-thumb-hover: 258 62% 56%;
+  }
+
+  .dark {
+    --background: 235 15% 5%;
+    --foreground: 240 17% 95%;
+    --card: 240 8% 12%;
+    --card-foreground: 240 17% 95%;
+    --popover: 240 8% 12%;
+    --popover-foreground: 240 17% 95%;
+    --overlay: 235 15% 5%;
+    --primary: 258 82% 69%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 6% 18%;
+    --secondary-foreground: 240 13% 91%;
+    --muted: 240 5% 16%;
+    --muted-foreground: 240 5% 66%;
+    --accent: 258 42% 28%;
+    --accent-foreground: 258 92% 82%;
+    --destructive: 0 68% 48%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 240 5% 20%;
+    --input: 240 5% 20%;
+    --ring: 258 82% 69%;
+    --sidebar-background: 240 8% 8%;
+    --sidebar-foreground: 240 11% 88%;
+    --sidebar-primary: 258 82% 69%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 5% 16%;
+    --sidebar-accent-foreground: 258 92% 82%;
+    --sidebar-border: 240 5% 17%;
+    --sidebar-ring: 258 82% 69%;
+    --scrollbar-track: 240 7% 13%;
+    --scrollbar-thumb: 240 5% 34%;
+    --scrollbar-thumb-hover: 258 82% 69%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 22% 0%, hsl(224 44% 19% / 0.16), transparent 32rem),
+    radial-gradient(circle at 78% 6%, hsl(258 82% 69% / 0.12), transparent 30rem),
+    hsl(var(--background));
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+html.dark body {
+  background:
+    radial-gradient(circle at 22% 0%, hsl(224 50% 24% / 0.38), transparent 32rem),
+    radial-gradient(circle at 82% 8%, hsl(258 82% 69% / 0.18), transparent 30rem),
+    radial-gradient(circle at 58% 100%, hsl(31 86% 52% / 0.08), transparent 34rem),
+    hsl(var(--background));
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+* {
+  scrollbar-color: hsl(var(--scrollbar-thumb)) hsl(var(--scrollbar-track));
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--scrollbar-track));
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--scrollbar-thumb));
+  border: 2px solid hsl(var(--scrollbar-track));
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--scrollbar-thumb-hover));
+}
+
+::-webkit-scrollbar-corner {
+  background: hsl(var(--scrollbar-track));
+}
+
+.windowDragRegion,
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.windowNoDrag,
+button,
+a,
+input,
+textarea,
+select,
+[role="button"],
+[data-disable-window-drag] {
+  -webkit-app-region: no-drag;
+}
+
+::selection {
+  background: hsl(var(--primary) / 0.24);
+  color: hsl(var(--foreground));
+}
+
+.dark [role="alert"],
+.dark .themeSurface {
+  background:
+    linear-gradient(135deg, hsl(240 8% 15% / 0.96), hsl(240 7% 12% / 0.96)),
+    hsl(var(--card));
+  border-color: hsl(var(--border) / 0.78);
+  box-shadow:
+    inset 0 1px 0 hsl(0 0% 100% / 0.04),
+    0 18px 42px hsl(235 18% 3% / 0.32);
+}
+
+.dark [role="alert"]:hover,
+.dark .themeSurface:hover {
+  border-color: hsl(258 82% 69% / 0.32);
+}
