@@ -60,7 +60,6 @@
                 <ui-accordion
                     v-if="endpointGroups.length"
                     type="multiple"
-                    :default-value="defaultModuleAccordionValues"
                     class="grid gap-3">
                     <ui-accordion-item
                         v-for="group in endpointGroups"
@@ -95,7 +94,6 @@
                             <ui-accordion
                                 type="single"
                                 collapsible
-                                :default-value="defaultEndpointAccordionValue(group)"
                                 class="grid gap-2">
                                 <ui-accordion-item
                                     v-for="endpoint in group.endpoints"
@@ -287,8 +285,6 @@
         return groupEndpoints(apiDocument.value, endpoints);
     });
 
-    const defaultModuleAccordionValues = computed<string[]>(() => endpointGroups.value.map((group) => group.name));
-
     onMounted(() => {
         loadDocument().catch(() => undefined);
     });
@@ -385,18 +381,6 @@
      */
     function endpointItemValue(groupName: string, endpoint: HttpApiEndpointModel): string {
         return `${groupName}:${endpoint.method}:${endpoint.path}`;
-    }
-
-    /**
-     * 获取模块内默认展开的第一个接口。
-     * 流程：读取模块第一条接口并生成 Accordion value。
-     * 参数：group 为接口模块分组。
-     * 返回：默认展开 value，模块为空时返回空字符串。
-     * 边界：空模块不会生成可展开接口。
-     */
-    function defaultEndpointAccordionValue(group: HttpApiEndpointGroupModel): string {
-        const [firstEndpoint] = group.endpoints;
-        return firstEndpoint ? endpointItemValue(group.name, firstEndpoint) : '';
     }
 
     /**
