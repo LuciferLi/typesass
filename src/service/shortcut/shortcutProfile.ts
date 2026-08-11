@@ -4,10 +4,7 @@ import type { ShortcutProfileModel } from '@/model/permission';
 export const DefaultShortcutProfile: ShortcutProfileModel = {
     asr: 'ctrl+shift+d',
     dictate: 'ctrl+p',
-    translate: 'ctrl+t',
-    ask: 'ctrl+space',
-    polish: 'ctrl+shift+p',
-    subtitle: 'ctrl+shift+s'
+    polish: 'ctrl+shift+p'
 };
 
 /**
@@ -20,7 +17,7 @@ export const DefaultShortcutProfile: ShortcutProfileModel = {
 export function hasShortcutProfileValue(value: unknown): boolean {
     if (!value || typeof value !== 'object') return false;
     const profile = value as Partial<ShortcutProfileModel>;
-    return [profile.asr, profile.dictate, profile.translate, profile.ask, profile.polish, profile.subtitle].some(
+    return [profile.asr, profile.dictate, profile.polish].some(
         (shortcut) => typeof shortcut === 'string' && shortcut.trim().length > 0
     );
 }
@@ -41,9 +38,6 @@ export function normalizeShortcutProfileValue(
     return {
         asr: typeof profile.asr === 'string' ? profile.asr : fallback.asr,
         dictate: typeof profile.dictate === 'string' ? profile.dictate : fallback.dictate,
-        translate: typeof profile.translate === 'string' ? profile.translate : fallback.translate,
-        ask: typeof profile.ask === 'string' ? profile.ask : fallback.ask,
-        polish: typeof profile.polish === 'string' ? profile.polish : fallback.polish,
-        subtitle: typeof profile.subtitle === 'string' ? profile.subtitle : fallback.subtitle
+        polish: typeof profile.polish === 'string' ? profile.polish : fallback.polish
     };
 }

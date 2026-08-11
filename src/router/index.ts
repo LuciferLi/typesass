@@ -6,7 +6,6 @@ import { createRouter, createWebHistory } from 'vue-router';
  * 业务含义：左侧导航、Tauri 事件和页面路由共用同一套路由名称，避免再维护一套视图切换状态。
  */
 export const HubRouteName = {
-    Subtitle: 'Subtitle',
     VoicePolish: 'VoicePolish',
     VoicePolishDictionary: 'VoicePolishDictionary',
     TextPolish: 'TextPolish',
@@ -25,10 +24,6 @@ export const HubRouteName = {
 const hubRoutes: RouteRecordRaw[] = [
     {
         path: '/',
-        redirect: '/voice-polish'
-    },
-    {
-        path: '/subtitle',
         redirect: '/voice-polish'
     },
     {

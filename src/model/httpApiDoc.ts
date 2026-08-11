@@ -1,6 +1,6 @@
 /**
  * OpenAPI 根文档模型。
- * 业务含义：承载 App HTTP 桥 `/openapi.json` 返回的接口文档，前端只按该文档渲染，不另行虚构接口。
+ * 业务含义：承载独立公共服务 `/openapi.json` 返回的接口文档，前端只按该文档渲染，不另行虚构接口。
  */
 export interface HttpApiOpenApiDocumentModel {
     /** OpenAPI 版本号。 */
@@ -32,7 +32,7 @@ export interface HttpApiInfoModel {
 
 /**
  * OpenAPI 服务地址模型。
- * 业务含义：说明 Web 应请求哪个 App HTTP 桥地址。
+ * 业务含义：说明第三方 Web 应请求当前 App 托管的本机 HTTP 服务地址。
  */
 export interface HttpApiServerModel {
     /** 服务地址。 */
@@ -43,7 +43,7 @@ export interface HttpApiServerModel {
 
 /**
  * OpenAPI 模块标签模型。
- * 业务含义：按模块组织 HTTP 桥接口。
+ * 业务含义：按模块组织公共 HTTP 接口。
  */
 export interface HttpApiTagModel {
     /** 模块名称。 */
@@ -80,6 +80,36 @@ export interface HttpApiOperationModel {
     requestBody?: HttpApiRequestBodyModel;
     /** 响应定义映射，key 通常为 HTTP 状态码。 */
     responses?: Record<string, HttpApiResponseModel | HttpApiReferenceModel>;
+    /** 该接口采用的 OpenAPI security scheme。 */
+    security?: Array<Record<string, string[]>>;
+    /** Header、query 等请求参数。 */
+    parameters?: HttpApiParameterModel[];
+    /** 服务端按 HTTP 状态声明的稳定业务错误码和处理建议。 */
+    'x-error-codes'?: Record<string, HttpApiErrorCodeModel[]>;
+}
+
+/** OpenAPI 扩展错误码说明。 */
+export interface HttpApiErrorCodeModel {
+    /** 稳定业务错误码。 */
+    code: string;
+    /** 相同请求在退避后是否允许重试。 */
+    retryable: boolean;
+    /** 第三方建议处理动作。 */
+    action: string;
+}
+
+/** OpenAPI 请求参数模型。 */
+export interface HttpApiParameterModel {
+    /** 参数名称。 */
+    name: string;
+    /** 参数位置。 */
+    in: string;
+    /** 参数是否必填。 */
+    required?: boolean;
+    /** 参数说明。 */
+    description?: string;
+    /** 参数 schema。 */
+    schema?: HttpApiSchemaModel | HttpApiReferenceModel;
 }
 
 /**
@@ -102,6 +132,16 @@ export interface HttpApiResponseModel {
     description?: string;
     /** 按 MIME 类型组织的内容定义。 */
     content?: Record<string, HttpApiMediaTypeModel>;
+    /** 响应 Header 定义。 */
+    headers?: Record<string, HttpApiHeaderModel | HttpApiReferenceModel>;
+}
+
+/** OpenAPI 响应 Header 定义。 */
+export interface HttpApiHeaderModel {
+    /** Header 业务说明。 */
+    description?: string;
+    /** Header 值 schema。 */
+    schema?: HttpApiSchemaModel | HttpApiReferenceModel;
 }
 
 /**
@@ -111,6 +151,10 @@ export interface HttpApiResponseModel {
 export interface HttpApiMediaTypeModel {
     /** JSON schema 定义。 */
     schema?: HttpApiSchemaModel | HttpApiReferenceModel;
+    /** 单个媒体类型示例。 */
+    example?: unknown;
+    /** 命名示例集合。 */
+    examples?: Record<string, { summary?: string; value?: unknown }>;
 }
 
 /**
@@ -135,8 +179,16 @@ export interface HttpApiSchemaModel {
     const?: unknown;
     /** 最小字符串长度。 */
     minLength?: number;
+    /** 最大字符串或数组长度。 */
+    maxLength?: number;
     /** 数值下限。 */
     minimum?: number;
+    /** 数值上限。 */
+    maximum?: number;
+    /** 数组最少元素数。 */
+    minItems?: number;
+    /** 数组最多元素数。 */
+    maxItems?: number;
     /** 字符串正则规则。 */
     pattern?: string;
     /** 枚举值列表。 */
@@ -151,6 +203,10 @@ export interface HttpApiSchemaModel {
     additionalProperties?: boolean | HttpApiSchemaModel | HttpApiReferenceModel;
     /** 多类型其一。 */
     oneOf?: Array<HttpApiSchemaModel | HttpApiReferenceModel>;
+    /** 任一匹配类型，FastAPI 可空字段通常使用该结构。 */
+    anyOf?: Array<HttpApiSchemaModel | HttpApiReferenceModel>;
+    /** 字段默认值。 */
+    default?: unknown;
 }
 
 /**
@@ -162,6 +218,20 @@ export interface HttpApiComponentsModel {
     schemas?: Record<string, HttpApiSchemaModel>;
     /** 公共响应映射。 */
     responses?: Record<string, HttpApiResponseModel>;
+    /** Bearer 等鉴权方案。 */
+    securitySchemes?: Record<string, HttpApiSecuritySchemeModel>;
+}
+
+/** OpenAPI 鉴权方案模型。 */
+export interface HttpApiSecuritySchemeModel {
+    /** security scheme 类型。 */
+    type: string;
+    /** HTTP 鉴权 scheme。 */
+    scheme?: string;
+    /** Bearer token 格式说明。 */
+    bearerFormat?: string;
+    /** 鉴权说明。 */
+    description?: string;
 }
 
 /**

@@ -23,6 +23,8 @@
 </template>
 
 <script setup lang="ts">
+    import { toast } from 'vue-sonner';
+
     import SessionManageSessionList from '@/components/sessionManage/sessionList.vue';
     import SessionManageWorkspaceList from '@/components/sessionManage/workspaceList.vue';
     import { useSessionManageStore } from '@/stores/sessionManage';
@@ -32,7 +34,19 @@
     });
 
     const store = useSessionManageStore();
-    let stopTaskUpdates: (() => void) | null = null;
+
+    /**
+     * 弹出会话管理操作失败提示。
+     * 流程：优先展示 Error 中的安全错误说明；未知异常使用兜底文案。
+     * 参数：title 为短提示标题，error 为捕获异常，fallbackDescription 为兜底说明。
+     * 返回：无返回值。
+     * 边界：只处理用户主动操作失败，页面加载失败仍由组件状态展示。
+     */
+    function showSessionOperationError(title: string, error: unknown, fallbackDescription: string): void {
+        toast.error(title, {
+            description: error instanceof Error ? error.message : fallbackDescription
+        });
+    }
 
     /**
      * 切换当前 CodeX 工作空间并刷新会话。
@@ -42,7 +56,9 @@
      * 边界：切换失败时由 store 写入提示文案，页面保留原选中态。
      */
     function handleSelectWorkspace(workspaceCwd: string): void {
-        void store.selectCodexWorkspace(workspaceCwd);
+        void store.selectCodexWorkspace(workspaceCwd).catch((error: unknown) => {
+            showSessionOperationError('切换工作空间失败', error, '读取工作空间会话失败。');
+        });
     }
 
     /**
@@ -53,7 +69,9 @@
      * 边界：CodeX 不可用时显示空工作空间列表。
      */
     function handleRefreshWorkspaces(): void {
-        void store.initSessionManage();
+        void store.initSessionManage().catch((error: unknown) => {
+            showSessionOperationError('刷新工作空间失败', error, '读取工作空间失败。');
+        });
     }
 
     /**
@@ -64,7 +82,9 @@
      * 边界：没有选中工作空间时由 store 返回空会话列表。
      */
     function handleRefreshSessions(): void {
-        void store.refreshCodexThreads(undefined, true);
+        void store.refreshCodexThreads(undefined, true).catch((error: unknown) => {
+            showSessionOperationError('刷新会话失败', error, '读取 CodeX 会话失败。');
+        });
     }
 
     /**
@@ -75,7 +95,9 @@
      * 边界：空关键词恢复默认会话列表。
      */
     function handleSearchThreads(keyword: string): void {
-        void store.searchCodexThreads(keyword);
+        void store.searchCodexThreads(keyword).catch((error: unknown) => {
+            showSessionOperationError('搜索会话失败', error, '读取搜索结果失败。');
+        });
     }
 
     /**
@@ -86,28 +108,25 @@
      * 边界：没有更多数据时组件不会触发。
      */
     function handleLoadMoreThreads(): void {
-        void store.loadMoreCodexThreads();
+        void store.loadMoreCodexThreads().catch((error: unknown) => {
+            showSessionOperationError('加载更多会话失败', error, '读取更多会话失败。');
+        });
     }
 
     /**
      * 打开 CodeX 会话定位。
-     * 流程：委托 store 使用 Tauri deeplink 打开外部 thread。
+     * 流程：委托 store 调用 HTTP，再由 Rust 打开受校验的外部 thread。
      * 参数：threadId 为 CodeX 会话 ID。
      * 返回：无返回值。
      * 边界：未绑定 thread 时按钮已禁用。
      */
     function handleOpenThread(threadId: string): void {
-        void store.openExternalThread(threadId);
+        void store.openExternalThread(threadId).catch((error: unknown) => {
+            showSessionOperationError('打开 CodeX 会话失败', error, '打开 CodeX 会话失败。');
+        });
     }
 
     onMounted(() => {
         void store.initSessionManage();
-        void store.listenTaskUpdates().then((dispose) => {
-            stopTaskUpdates = dispose;
-        });
-    });
-
-    onUnmounted(() => {
-        if (stopTaskUpdates) stopTaskUpdates();
     });
 </script>

@@ -8,7 +8,7 @@
 
 ## 技术方案
 
-- 客户端文件：通过 Tauri `app_data_dir()` 下的 `typesass-config.json` 保存配置。
+- 客户端文件：通过 Tauri `app_data_dir()` 下的 `codexman-config.json` 保存配置。
 - 文件结构：`version`、`updatedAt`、`items` 三段；`items` 按前端 `StorageKey` 分区保存模型、设置、语音、文字润色和字幕配置。
 - Web 调客户端：前端统一使用 `src/service/storage/clientJsonStorage.ts`，通过 Tauri `invoke` 调用 `read_local_config_value`、`write_local_config_value`、`remove_local_config_value`。
 - 实时变化：客户端启动 `start_local_config_watch` 后，每 500ms 检查配置文件修改时间；文件变化后广播 `local-config-changed` 快照给所有 WebView。
@@ -16,11 +16,11 @@
 
 ## 覆盖范围
 
-- 模型管理：`typesass.modelManage.v1`
-- 系统设置：`typesass.settings.v1`
-- 语音润色：`typesass.voicePolish.v1`
-- 文字实时润色：`typesass.textPolish.v1`
-- 实时字幕：`typesass.subtitle.v1`
+- 模型管理：`codexman.modelManage.v1`
+- 系统设置：`codexman.settings.v1`
+- 语音润色：`codexman.voicePolish.v1`
+- 文字实时润色：`codexman.textPolish.v1`
+- 实时字幕：`codexman.subtitle.v1`
 
 ## 测试用例
 
@@ -38,8 +38,8 @@
 - `cargo fmt --check --manifest-path src-tauri/Cargo.toml`：通过。
 - `cargo check --manifest-path src-tauri/Cargo.toml`：通过，存在 3 个既有未使用函数 warning。
 - `npm run tauri:build`：通过，已生成：
-  - `src-tauri/target/release/bundle/macos/typesass.app`
-  - `src-tauri/target/release/bundle/dmg/typesass_0.0.2_aarch64.dmg`
+  - `src-tauri/target/release/bundle/macos/CodexMan.app`
+  - `src-tauri/target/release/bundle/dmg/codexman_0.0.2_aarch64.dmg`
 
 ## 剩余风险
 

@@ -110,7 +110,7 @@ final class ProcessTapRecorder {
   private let targets: [AudioProcessInfo]
   private let outputURL: URL
   private let durationSeconds: Double
-  private let queue = DispatchQueue(label: "typesass.process-tap.demo")
+  private let queue = DispatchQueue(label: "codexman.process-tap.demo")
   private var tapID = AudioObjectID.unknown
   private var aggregateDeviceID = AudioObjectID.unknown
   private var deviceProcID: AudioDeviceIOProcID?
@@ -151,7 +151,7 @@ final class ProcessTapRecorder {
     let aggregateUID = UUID().uuidString
     let aggregateName = targets.map(\.name).joined(separator: "+")
     let aggregateDescription: [String: Any] = [
-      kAudioAggregateDeviceNameKey: "typesass-process-tap-\(aggregateName)",
+      kAudioAggregateDeviceNameKey: "codexman-process-tap-\(aggregateName)",
       kAudioAggregateDeviceUIDKey: aggregateUID,
       kAudioAggregateDeviceMainSubDeviceKey: outputUID,
       kAudioAggregateDeviceIsPrivateKey: true,
@@ -336,7 +336,7 @@ func shouldSkipAutoTarget(_ process: AudioProcessInfo) -> Bool {
   if !process.audioActive {
     return true
   }
-  if name.contains("typesass") || bundleID == "asia.aijob.aitool" {
+  if name.contains("CodexMan") || bundleID == "asia.aijob.aitool" {
     return true
   }
   if name.contains("graphics and media") || bundleID == "com.apple.webkit.gpu" {
@@ -437,7 +437,7 @@ func findTargets(keyword: String) throws -> [AudioProcessInfo] {
 struct ProcessTapCaptureDemo {
   static func main() throws {
     let arguments = Array(CommandLine.arguments.dropFirst())
-    let outputPath = arguments.first ?? "/tmp/typesass-process-tap-demo.caf"
+    let outputPath = arguments.first ?? "/tmp/codexman-process-tap-demo.caf"
     let duration = Double(arguments.dropFirst().first ?? "8") ?? 8
     let keyword = arguments.dropFirst().dropFirst().first ?? "Music"
     let targets = try findTargets(keyword: keyword)

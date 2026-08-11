@@ -1,8 +1,11 @@
-import { StorageKey } from '@/config/storageKey';
 import type { LocalConfigChangedPayloadModel, LocalConfigJsonValueModel } from '@/model/localConfig';
-import { requestClientHttpBridge } from '@/service/tauri/command';
-
-const LOCAL_CONFIG_WATCH_INTERVAL_MS = 500;
+import {
+    listenEvent,
+    readLocalConfigValue,
+    removeLocalConfigValue,
+    startLocalConfigWatch,
+    writeLocalConfigValue
+} from '@/service/tauri/command';
 
 /**
  * 判断未知值是否为可序列化 JSON。
@@ -26,25 +29,19 @@ function isLocalConfigJsonValue(value: unknown): value is LocalConfigJsonValueMo
 
 /**
  * 读取客户端 JSON 配置中的单个分区。
- * 流程：通过客户端本地 HTTP 桥接读取用户电脑上的配置文件。
- * 参数：key 为 StorageKey 分区名，fallback 为配置缺失或读取失败时的兜底值。
+ * 流程：通过受 Tauri capability 保护的 IPC 读取用户电脑上的配置文件。
+ * 参数：key 为配置分区名，fallback 只用于分区尚未创建的首次启动场景。
  * 返回：对应分区的配置值。
- * 边界：客户端未启动、配置文件损坏或分区不存在时返回 fallback，不再读取 localStorage。
+ * 边界：分区不存在时返回 fallback；配置损坏或 IPC 失败会抛错，避免静默用默认值覆盖问题现场。
  */
 export async function readClientJson<T>(key: string, fallback: T): Promise<T> {
-    try {
-        const value = await requestClientHttpBridge<LocalConfigJsonValueModel | null>('/read-local-config-value', {
-            key
-        });
-        return value === null ? fallback : (value as T);
-    } catch {
-        return fallback;
-    }
+    const value = await readLocalConfigValue(key);
+    return value === null ? fallback : (value as T);
 }
 
 /**
  * 写入客户端 JSON 配置中的单个分区。
- * 流程：校验值可 JSON 序列化后，通过客户端本地 HTTP 桥接写入用户电脑上的配置文件。
+ * 流程：校验值可 JSON 序列化后，通过桌面 IPC 写入用户电脑上的配置文件。
  * 参数：key 为 StorageKey 分区名，value 为需要保存的配置值。
  * 返回：写入完成 Promise。
  * 边界：客户端未启动或不可序列化值会直接抛错，不再写浏览器本地存储。
@@ -53,72 +50,29 @@ export async function writeClientJson<T>(key: string, value: T): Promise<void> {
     if (!isLocalConfigJsonValue(value)) {
         throw new Error('配置内容不是有效 JSON，无法写入客户端文件。');
     }
-    await requestClientHttpBridge<void>('/write-local-config-value', { key, value });
+    await writeLocalConfigValue(key, value);
 }
 
 /**
  * 删除客户端 JSON 配置中的单个分区。
- * 流程：通过客户端本地 HTTP 桥接移除配置文件内指定 key，不再访问浏览器 storage。
+ * 流程：通过桌面 IPC 移除配置文件内指定 key，不访问浏览器 storage。
  * 参数：key 为 StorageKey 分区名。
  * 返回：删除完成 Promise。
  * 边界：分区不存在时客户端保持幂等成功。
  */
 export async function removeClientJson(key: string): Promise<void> {
-    await requestClientHttpBridge<void>('/remove-local-config-value', { key });
+    await removeLocalConfigValue(key);
 }
 
 /**
  * 启动客户端 JSON 配置文件监听。
- * 流程：先让 Rust 侧开启文件轮询监听，Web 侧再通过 HTTP 定时读取全量配置快照。
+ * 流程：先让 Rust 侧开启文件监听，再通过 Tauri event 接收配置快照。
  * 参数：handler 为配置文件变化后的前端刷新函数。
  * 返回：取消前端事件监听的函数。
- * 边界：客户端未启动时不会启动监听，直接返回空取消函数。
+ * 边界：仅桌面运行时可调用；IPC 或监听注册失败会抛错，交由应用初始化错误处理记录。
  */
 export async function watchClientJson(handler: (payload: LocalConfigChangedPayloadModel) => void): Promise<() => void> {
-    try {
-        await requestClientHttpBridge<void>('/start-local-config-watch', {});
-    } catch {
-        return () => {};
-    }
-    let previousSnapshot = '';
-    const refreshSnapshot = async () => {
-        try {
-            const snapshot =
-                await requestClientHttpBridge<LocalConfigChangedPayloadModel>('/read-local-config-snapshot');
-            const nextSnapshot = JSON.stringify(snapshot);
-            if (nextSnapshot === previousSnapshot) return;
-            previousSnapshot = nextSnapshot;
-            handler(snapshot);
-        } catch {
-            // 客户端关闭后停止刷新交给取消函数处理，单次失败不打断页面。
-        }
-    };
-    await refreshSnapshot();
-    const timer = window.setInterval(() => {
-        void refreshSnapshot();
-    }, LOCAL_CONFIG_WATCH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-}
-
-/**
- * 把历史浏览器 localStorage 配置迁移到客户端 JSON 文件。
- * 流程：遍历已知 StorageKey，读取浏览器旧值并写入客户端文件，写入成功后删除旧 localStorage。
- * 参数：无。
- * 返回：迁移完成 Promise。
- * 边界：只在真实 Tauri 环境执行；单个旧值损坏时跳过该 key，避免阻塞其他配置迁移。
- */
-export async function migrateBrowserStorageToClientJson(): Promise<void> {
-    const keys = Object.values(StorageKey);
-    for (const key of keys) {
-        const rawValue = window.localStorage.getItem(key);
-        if (!rawValue) continue;
-        try {
-            const value = JSON.parse(rawValue) as unknown;
-            if (!isLocalConfigJsonValue(value)) continue;
-            await writeClientJson(key, value);
-            window.localStorage.removeItem(key);
-        } catch {
-            window.localStorage.removeItem(key);
-        }
-    }
+    const unlisten = await listenEvent<LocalConfigChangedPayloadModel>('local-config-changed', handler);
+    await startLocalConfigWatch();
+    return unlisten;
 }

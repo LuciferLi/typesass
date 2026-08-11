@@ -14,8 +14,8 @@
     });
 
     const props = defineProps<{
-        // 厂商预设键；为空时表示用户自定义中转站。
-        vendorKey: ModelVendorKey | '';
+        // 原生端返回的供应商标识；未知值按自定义模型展示。
+        vendorKey: string;
         // 自定义模型名称，用于没有厂商预设时生成首字徽标。
         label: string;
     }>();
@@ -41,8 +41,19 @@
         volcengine: { text: 'ARK', className: 'border-rose-500/30 bg-rose-500/10 text-rose-300' }
     };
 
+    /**
+     * 判断供应商标识是否存在于前端预设徽标映射。
+     * 流程：检查对象自有属性并收窄字符串类型。
+     * 参数：vendorKey 为原生端返回的供应商标识。
+     * 返回：存在预设徽标时返回 true。
+     * 边界：自定义或未来新增供应商返回 false，页面使用名称首字兜底。
+     */
+    function isKnownVendorKey(vendorKey: string): vendorKey is ModelVendorKey {
+        return Object.prototype.hasOwnProperty.call(vendorMarkConfigMap, vendorKey);
+    }
+
     const markConfig = computed<VendorMarkConfig>(() => {
-        if (props.vendorKey) return vendorMarkConfigMap[props.vendorKey];
+        if (isKnownVendorKey(props.vendorKey)) return vendorMarkConfigMap[props.vendorKey];
         return {
             text: props.label.trim().slice(0, 1).toUpperCase() || '自',
             className: 'border-border bg-muted text-muted-foreground'

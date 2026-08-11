@@ -1,4 +1,4 @@
-// 录音结果模型，用于语音转写和实时字幕切片。
+// 录音结果模型，用于语音转写。
 export type AudioRecordResultModel = {
     // 音频 Blob 对象。
     blob: Blob;

@@ -1,119 +1,149 @@
-// 任务状态类型，用于任务看板分栏和状态流转控制。
-export type SessionTaskStatusType =
-    | 'created'
-    | 'queued'
-    | 'running'
-    | 'waiting_acceptance'
-    | 'completed'
-    | 'failed'
-    | 'cancelled';
+/** 任务状态类型；前端只展示 HTTP 服务从 Rust 任务库返回的真实值。 */
+export type SessionTaskStatusType = 'created' | 'queued' | 'running' | 'waiting_acceptance' | 'completed' | 'failed';
 
-// 会话状态类型，用于会话管理列表展示本地执行生命周期。
-export type SessionStatusType = 'created' | 'running' | 'waiting_acceptance' | 'completed' | 'failed';
+/** 会话状态类型；会话只在任务被调度器真实领取后创建，不预留未实现的预创建状态。 */
+export type SessionStatusType = 'running' | 'waiting_acceptance' | 'completed' | 'failed';
 
-// 会话来源类型，用于区分当前 CodeX 和未来 Cloud 等执行器。
-export type SessionProviderType = 'codex' | 'cloud';
+/** 会话来源类型；首发版只接受已接通的真实 CodeX 执行器。 */
+export type SessionProviderType = 'codex';
 
-// 项目记录模型，用于左侧项目列表和工作空间绑定展示。
-export type SessionProjectModel = {
-    // 项目 ID，本地 SQLite 生成的稳定主键。
+/** 任务标题字符上限；必须与 Rust `TASK_TITLE_MAX_CHARS` 协议保持一致。 */
+export const SESSION_TASK_TITLE_MAX_CHARS = 200;
+
+/** 任务提示词字符上限；必须与 Rust `TASK_PROMPT_MAX_CHARS` 协议保持一致。 */
+export const SESSION_TASK_PROMPT_MAX_CHARS = 50_000;
+
+/** HTTP 服务返回的任务项目元数据。 */
+export interface SessionProjectModel {
+    /** Rust 权威任务库返回的稳定主键。 */
     id: string;
-    // 项目名称。
+    /** 项目展示名称。 */
     name: string;
-    // 项目绑定的工作空间绝对路径。
+    /** 绑定的真实工作空间绝对路径。 */
     workspacePath: string;
-    // 项目下任务数量。
+    /** Rust 权威任务库统计的任务数量。 */
     taskCount: number;
-    // 项目下会话数量。
+    /** Rust 权威任务库统计的会话数量。 */
     sessionCount: number;
-    // 创建时间，来自 SQLite。
+    /** 创建时间。 */
     createdAt: string;
-    // 更新时间，来自 SQLite。
+    /** 更新时间。 */
     updatedAt: string;
-};
+}
 
-// 任务记录模型，用于任务管理看板卡片展示。
-export type SessionTaskModel = {
-    // 任务 ID，本地 SQLite 生成的稳定主键。
+/** 任务记录，所有状态字段均以 HTTP 服务委托 Rust 返回的结果为准。 */
+export interface SessionTaskModel {
+    /** 任务稳定主键。 */
     id: string;
-    // 所属项目 ID。
+    /** 所属项目 ID。 */
     projectId: string;
-    // 任务标题。
+    /** 任务标题。 */
     title: string;
-    // 任务执行提示词。
+    /** 交给 CodeX 的真实提示词。 */
     prompt: string;
-    // 当前任务状态。
+    /** Rust 权威任务状态机确认的当前状态。 */
     status: SessionTaskStatusType;
-    // 当前绑定的本地会话 ID，未执行前为空。
+    /** 当前本地会话 ID，尚未执行时为空。 */
     currentSessionId: string;
-    // 当前绑定的 CodeX thread ID，未创建成功前为空。
+    /** CodeX thread ID，尚未创建成功时为空。 */
     externalThreadId: string;
-    // 最近失败原因，正常状态为空。
+    /** 最近失败原因，正常状态为空。 */
     lastError: string;
-    // 创建时间，来自 SQLite。
+    /** 可靠终态结果 JSON；执行前或失败时为 `{}`，最大 32 KiB。 */
+    resultJson: string;
+    /** 创建时间。 */
     createdAt: string;
-    // 更新时间，来自 SQLite。
+    /** 更新时间。 */
     updatedAt: string;
-};
+}
 
-// 会话记录模型，用于会话管理页面展示 CodeX 会话和工作空间。
-export type SessionRecordModel = {
-    // 会话 ID，本地 SQLite 生成的稳定主键。
+/** HTTP 服务返回的任务关联真实会话记录。 */
+export interface SessionRecordModel {
+    /** 本地会话主键。 */
     id: string;
-    // 所属项目 ID。
+    /** 所属项目 ID。 */
     projectId: string;
-    // 关联任务 ID，手动导入会话时可能为空。
+    /** 关联任务 ID。 */
     taskId: string;
-    // 会话来源，当前主要为 codex。
+    /** 会话执行器。 */
     provider: SessionProviderType;
-    // 会话所属工作空间绝对路径。
+    /** 工作空间绝对路径。 */
     workspacePath: string;
-    // 会话标题。
+    /** 会话标题。 */
     title: string;
-    // 当前会话状态。
+    /** Rust 权威任务状态机确认的会话状态。 */
     status: SessionStatusType;
-    // CodeX thread ID。
+    /** 外部 CodeX thread ID。 */
     externalThreadId: string;
-    // 创建时间，来自 SQLite。
+    /** 创建时间。 */
     createdAt: string;
-    // 更新时间，来自 SQLite。
+    /** 更新时间。 */
     updatedAt: string;
-};
+}
 
-// 会话与任务工作区聚合模型，用于页面一次性刷新项目、任务和会话。
-export type SessionWorkspaceDataModel = {
-    // 本地项目列表。
+/** 任务 HTTP 聚合响应，用于原子刷新项目、任务和会话。 */
+export interface SessionWorkspaceDataModel {
+    /** HTTP 服务返回的真实任务项目列表。 */
     projects: SessionProjectModel[];
-    // 当前项目下的任务列表。
+    /** 当前项目的真实任务列表。 */
     tasks: SessionTaskModel[];
-    // 当前项目下的会话列表。
+    /** 当前项目的真实会话列表。 */
     sessions: SessionRecordModel[];
-};
+}
 
-// 会话与任务管理持久化配置，用于客户端 JSON 保存用户最后一次选择的工作空间。
-export type SessionManagePersistedStateModel = {
-    // 最近一次选中的本地项目 ID，用于下次打开任务管理页时恢复看板上下文。
-    selectedProjectId: string;
-    // 最近一次选中的工作空间绝对路径，用于项目被删除或重建时按目录兜底恢复。
-    selectedWorkspaceCwd: string;
-};
+/**
+ * 创建任务 HTTP 响应。
+ * 业务含义：在权威聚合数据之外，明确返回本次事务创建的任务 ID，避免并发同名任务时由标题猜测。
+ */
+export interface CreateSessionTaskResponseModel extends SessionWorkspaceDataModel {
+    /** 本次 Rust 事务创建的唯一任务 ID。 */
+    createdTaskId: string;
+}
 
-// 创建项目请求模型，用于把业务项目绑定到工作空间。
-export type CreateSessionProjectRequestModel = {
-    // 项目名称。
+/** 创建任务项目的 HTTP 请求。 */
+export interface CreateSessionProjectRequestModel {
+    /** 项目展示名称。 */
     name: string;
-    // 绑定的工作空间绝对路径。
+    /** 绑定的真实工作空间绝对路径。 */
     workspacePath: string;
-};
+}
 
-// 创建任务请求模型，用于登记一张任务看板卡片。
-export type CreateSessionTaskRequestModel = {
-    // 所属项目 ID。
+/** 编辑任务项目的 HTTP 请求。 */
+export interface UpdateSessionProjectRequestModel {
+    /** 项目稳定主键。 */
+    id: string;
+    /** 项目新展示名称。 */
+    name: string;
+    /** 后续任务使用的真实工作空间绝对路径。 */
+    workspacePath: string;
+}
+
+/** 创建真实任务卡片的 HTTP 请求。 */
+export interface CreateSessionTaskRequestModel {
+    /** 所属项目 ID。 */
     projectId: string;
-    // 任务标题。
+    /** 任务标题。 */
     title: string;
-    // 任务执行提示词。
+    /** 交给 CodeX 的完整提示词。 */
     prompt: string;
+}
+
+/** 更新真实任务卡片的 HTTP 请求。 */
+export interface UpdateSessionTaskRequestModel {
+    /** 任务稳定主键。 */
+    id: string;
+    /** 任务标题。 */
+    title: string;
+    /** 交给 CodeX 的完整提示词。 */
+    prompt: string;
+}
+
+// 会话管理持久化配置，用于客户端 JSON 保存用户最后一次选择的真实 CodeX 工作空间。
+export type SessionManagePersistedStateModel = {
+    // 最近一次选中的任务项目 ID；仅用于恢复页面上下文，不代表任务状态。
+    selectedProjectId?: string;
+    // 最近一次选中的工作空间绝对路径。
+    selectedWorkspaceCwd: string;
 };
 
 // CodeX 工作空间模型，用于会话管理展示外部已有工作空间。
@@ -134,6 +164,14 @@ export type CodexThreadSummaryModel = {
     id: string;
     // CodeX 会话标题。
     title: string;
+    // 父级 CodeX thread ID；普通用户会话为空字符串。
+    parentThreadId: string;
+    // 子任务深度；普通用户会话为 0，子 Agent 会话通常从 1 开始。
+    depth: number;
+    // 子 Agent 昵称；普通用户会话为空字符串。
+    agentNickname: string;
+    // 子 Agent 角色；普通用户会话为空字符串。
+    agentRole: string;
     // 最近更新时间。
     updatedAt: string;
 };

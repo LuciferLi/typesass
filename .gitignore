@@ -119,3 +119,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+tmp/*
+output/*
+.coverage
+src-tauri/binaries/codexman-ai-sidecar-*
+server/.venv-build/

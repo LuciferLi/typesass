@@ -1,19 +1,19 @@
 {
-  "name": "typesass",
+  "name": "codexman",
   "version": "0.0.2",
   "private": true,
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/LuciferLi/typesass.git"
+    "url": "git+https://github.com/LuciferLi/codexman.git"
   },
   "bugs": {
-    "url": "https://github.com/LuciferLi/typesass/issues"
+    "url": "https://github.com/LuciferLi/codexman/issues"
   },
-  "homepage": "https://typesass.tolern.com/",
+  "homepage": "https://codexman.tolern.com/",
   "scripts": {
-    "dev": "node scripts/freeDevPort.mjs 1420 25818 && tauri dev",
+    "dev": "node scripts/freeDevPort.mjs 1420 && tauri dev",
     "dev:frontend": "node scripts/freeDevPort.mjs 1420 && vite --host 127.0.0.1",
     "tslint": "pnpm run typecheck",
     "lint": "eslint --ext .ts,.js,.vue --ignore-path .gitignore src/ && pnpm run typecheck",
@@ -21,11 +21,13 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc && vite build",
     "preview:web": "node scripts/devServer.mjs",
+    "build:sidecar": "node scripts/buildSidecar.mjs",
     "tauri:build": "tauri build"
   },
   "dependencies": {
     "@icon-park/svg": "^1.4.2",
     "@icon-park/vue-next": "^1.4.2",
+    "@tauri-apps/api": "^2.11.1",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vueuse/core": "^14.4.0",
     "autoprefixer": "^10.5.4",

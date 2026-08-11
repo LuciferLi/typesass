@@ -1,0 +1,273 @@
+"""目录驱动的 OpenAI-compatible 上游调用服务。"""
+
+import base64
+import binascii
+import logging
+import time
+from typing import Dict, Literal, Tuple
+
+import httpx
+
+from .config import ModelCatalogItem, Settings
+from .errors import ApiError
+from .models import AudioTranscriptionRequest, TextProcessRequest
+
+
+logger = logging.getLogger("aitool.upstream")
+ALLOWED_AUDIO_CONTENT_TYPES = {
+    "audio/wav",
+    "audio/webm",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/ogg",
+}
+
+
+class ModelService:
+    """目录驱动的 ASR 与文本处理服务。
+
+    用途：隔离受信模型目录、上游密钥、超时和响应解析，路由层不接触外部协议细节。
+    流程：按 opaque modelId 解析目录并校验能力，构造 OpenAI 兼容请求，通过共享客户端调用并映射稳定响应。
+    边界：客户端不能覆盖 provider、URL、上游模型或 Key；无模型和选择错误使用稳定错误码，上游错误只返回脱敏摘要。
+    """
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+        """初始化目录驱动模型服务。
+
+        用途：注入不可变配置和应用生命周期内共享的 HTTP 客户端。
+        流程：保存引用，不建立额外连接池。
+        参数：``settings`` 为服务配置，``client`` 为共享异步客户端。
+        返回：无。
+        异常边界：配置有效性由启动阶段负责。
+        """
+
+        self.settings = settings
+        self.client = client
+
+    def list_models(self) -> Tuple[ModelCatalogItem, ...]:
+        """读取当前不可变模型目录。
+
+        用途：供公开目录路由显式映射安全字段，不让路由访问环境变量或重新解析私有配置。
+        流程：直接返回启动阶段完成校验的不可变元组，调用方不得序列化私有字段。
+        参数：无。
+        返回：受信模型目录元组，保留 sidecar 注入顺序。
+        异常边界：空目录合法并返回空元组，不触发上游访问或配置错误。
+        """
+
+        return self.settings.model_catalog
+
+    def _resolve_model(
+        self, model_id: str, capability: Literal["asr", "text"]
+    ) -> ModelCatalogItem:
+        """按 opaque ID 解析并校验模型。
+
+        用途：为所有 AI 调用统一执行目录存在性、启用状态和单一能力校验，禁止静默回退其它模型。
+        流程：先区分空目录，再精确匹配 ID，随后检查 enabled 和 capability，全部通过后返回私有运行配置。
+        参数：``model_id`` 为请求提交的目录 ID；``capability`` 为当前接口要求的 asr 或 text。
+        返回：可用于受控上游调用的模型配置。
+        异常边界：依次稳定返回 MODEL_NOT_CONFIGURED、MODEL_NOT_FOUND、MODEL_DISABLED、MODEL_CAPABILITY_MISMATCH；
+        错误消息和日志不包含 URL、上游模型名或密钥。
+        """
+
+        if not self.settings.model_catalog:
+            raise ApiError(503, "MODEL_NOT_CONFIGURED", "服务尚未配置模型。")
+        model = next(
+            (item for item in self.settings.model_catalog if item.id == model_id), None
+        )
+        if model is None:
+            raise ApiError(404, "MODEL_NOT_FOUND", "模型不存在。")
+        if not model.enabled:
+            raise ApiError(409, "MODEL_DISABLED", "模型已禁用。")
+        if model.capability != capability:
+            raise ApiError(
+                409, "MODEL_CAPABILITY_MISMATCH", "模型能力与当前接口不匹配。"
+            )
+        return model
+
+    async def transcribe(
+        self, request: AudioTranscriptionRequest, request_id: str
+    ) -> Tuple[str, int, str]:
+        """执行音频转写。
+
+        用途：把合法 base64 音频提交给请求指定且已登记的 ASR 模型。
+        流程：先解析并校验目录模型，再校验 MIME、严格解码和大小，构造 data URL 请求并解析首条文本。
+        参数：``request`` 为音频契约，``request_id`` 用于结构化上游日志。
+        返回：识别文本、耗时毫秒、实际模型三元组。
+        异常边界：格式、大小、上游超时或空结果均抛出 ``ApiError``。
+        """
+
+        model = self._resolve_model(request.model_id, "asr")
+        content_type = request.content_type.strip().lower()
+        if content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
+            raise ApiError(400, "UNSUPPORTED_AUDIO_TYPE", "不支持的音频类型。")
+        try:
+            audio_bytes = base64.b64decode(request.audio_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ApiError(
+                400, "INVALID_AUDIO_BASE64", "音频 base64 格式无效。"
+            ) from error
+        if not audio_bytes:
+            raise ApiError(400, "EMPTY_AUDIO", "音频内容为空。")
+        if len(audio_bytes) > self.settings.max_audio_bytes:
+            raise ApiError(413, "AUDIO_TOO_LARGE", "音频超过服务限制。")
+        body: Dict[str, object] = {
+            "model": model.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": "data:{0};base64,{1}".format(
+                                    content_type,
+                                    request.audio_base64,
+                                )
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        language = (request.language or "auto").strip()
+        if language and language != "auto":
+            body["asr_options"] = {"language": language}
+        started_at = time.perf_counter()
+        response = await self._chat_completion(model, body, request_id)
+        text = self._message_text(response)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        return text, elapsed_ms, model.id
+
+    async def process_text(
+        self, request: TextProcessRequest, request_id: str
+    ) -> Tuple[str, int, str]:
+        """执行听写整理或文字润色。
+
+        用途：按固定业务模式生成提示词并调用请求指定且已登记的文本模型。
+        流程：先解析并校验目录模型，再校验文本及词典长度，组合系统和用户上下文，解析有效 assistant 文本。
+        参数：``request`` 为文本契约，``request_id`` 用于上游日志追踪。
+        返回：处理文本、耗时毫秒、实际模型三元组。
+        异常边界：超长输入、非法词典、超时、上游失败或空输出均抛出 ``ApiError``。
+        """
+
+        model = self._resolve_model(request.model_id, "text")
+        text = request.text.strip()
+        if len(text) > self.settings.max_text_chars:
+            raise ApiError(413, "TEXT_TOO_LARGE", "文本超过服务限制。")
+        if any(len(item) > 100 for item in request.dictionary):
+            raise ApiError(400, "INVALID_DICTIONARY", "词典单项长度超过限制。")
+        if request.mode == "dictate":
+            mode_rule = "整理听写内容，删除无意义重复和语气词，保持原意。"
+        else:
+            mode_rule = "润色文字，使表达清晰自然，保持事实与原意。"
+        system_prompt = (
+            "你是中文文本处理助手。{0}只输出最终文本，不解释处理过程。".format(
+                mode_rule
+            )
+        )
+        context_lines = ["原文：{0}".format(text)]
+        if request.dictionary:
+            context_lines.append("词典：{0}".format("、".join(request.dictionary)))
+        if request.context_app.strip():
+            context_lines.append("上下文应用：{0}".format(request.context_app.strip()))
+        if request.style_instruction.strip():
+            context_lines.append(
+                "风格要求：{0}".format(request.style_instruction.strip())
+            )
+        body = {
+            "model": model.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "\n".join(context_lines)},
+            ],
+            "temperature": 0.2,
+            "max_completion_tokens": min(4096, max(256, len(text) * 2)),
+        }
+        started_at = time.perf_counter()
+        response = await self._chat_completion(model, body, request_id)
+        processed_text = self._message_text(response)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        return processed_text, elapsed_ms, model.id
+
+    async def _chat_completion(
+        self,
+        model: ModelCatalogItem,
+        body: Dict[str, object],
+        request_id: str,
+    ) -> Dict[str, object]:
+        """调用目录模型绑定的 chat/completions 上游。
+
+        用途：统一 Bearer 鉴权、超时、上游状态映射和脱敏日志。
+        流程：使用共享客户端 POST 受信目录地址，注入对应私有密钥，校验 JSON 对象后返回。
+        参数：``model`` 为已校验私有目录项，``body`` 为服务端构造请求，``request_id`` 为追踪标识。
+        返回：上游 JSON 对象。
+        异常边界：连接或读取超时映射 504；其余网络错误和非 2xx 映射 502；
+        不透传完整上游响应。
+        """
+
+        url = "{0}/chat/completions".format(model.base_url)
+        try:
+            response = await self.client.post(
+                url,
+                headers={"Authorization": "Bearer {0}".format(model.api_key)},
+                json=body,
+            )
+        except httpx.TimeoutException as error:
+            logger.warning(
+                "upstream_timeout", extra={"context": {"requestId": request_id}}
+            )
+            raise ApiError(504, "UPSTREAM_TIMEOUT", "模型服务响应超时。") from error
+        except httpx.HTTPError as error:
+            logger.warning(
+                "upstream_network_error",
+                extra={
+                    "context": {
+                        "requestId": request_id,
+                        "errorType": type(error).__name__,
+                    }
+                },
+            )
+            raise ApiError(502, "UPSTREAM_UNAVAILABLE", "模型服务暂不可用。") from error
+        if not response.is_success:
+            logger.warning(
+                "upstream_rejected",
+                extra={
+                    "context": {
+                        "requestId": request_id,
+                        "statusCode": response.status_code,
+                    }
+                },
+            )
+            raise ApiError(502, "UPSTREAM_REJECTED", "模型服务请求失败。")
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ApiError(
+                502, "UPSTREAM_INVALID_RESPONSE", "模型服务返回格式无效。"
+            ) from error
+        if not isinstance(payload, dict):
+            raise ApiError(502, "UPSTREAM_INVALID_RESPONSE", "模型服务返回格式无效。")
+        return payload
+
+    def _message_text(self, response: Dict[str, object]) -> str:
+        """提取上游首条 assistant 文本。
+
+        用途：将 OpenAI 兼容响应映射为稳定业务字符串。
+        流程：逐层校验 choices、message、content 类型并 trim。
+        参数：``response`` 为已解析的上游 JSON 对象。
+        返回：非空 assistant 文本。
+        异常边界：结构缺失或内容为空时抛出 502 业务异常。
+        """
+
+        choices = response.get("choices")
+        if (
+            not isinstance(choices, list)
+            or not choices
+            or not isinstance(choices[0], dict)
+        ):
+            raise ApiError(502, "UPSTREAM_INVALID_RESPONSE", "模型服务未返回有效结果。")
+        message = choices[0].get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise ApiError(502, "UPSTREAM_EMPTY_RESULT", "模型服务返回空结果。")
+        return content.strip()

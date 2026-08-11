@@ -7,7 +7,7 @@
                         class="font-medium text-foreground"
                         type="button"
                         @click="handleBackHome">
-                        typesass
+                        CodexMan
                     </button>
                     <span>/</span>
                     <span>语音转文字润色</span>
@@ -32,44 +32,6 @@
                         </ui-tooltip-trigger>
                         <ui-tooltip-content>{{ microphoneTooltip }}</ui-tooltip-content>
                     </ui-tooltip>
-                    <ui-tooltip>
-                        <ui-tooltip-trigger as-child>
-                            <button
-                                :class="voiceRequirementIconClass(Boolean(selectedAsrModel))"
-                                type="button"
-                                aria-label="选择 ASR 模型"
-                                @click="handleOpenModelSetting('asr')">
-                                <microphone
-                                    theme="outline"
-                                    size="15" />
-                                <span
-                                    v-if="!selectedAsrModel"
-                                    class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full border border-background bg-destructive px-0.5 text-[10px] font-bold leading-none text-destructive-foreground">
-                                    !
-                                </span>
-                            </button>
-                        </ui-tooltip-trigger>
-                        <ui-tooltip-content>{{ asrModelTooltip }}</ui-tooltip-content>
-                    </ui-tooltip>
-                    <ui-tooltip>
-                        <ui-tooltip-trigger as-child>
-                            <button
-                                :class="voiceRequirementIconClass(Boolean(selectedTextModel))"
-                                type="button"
-                                aria-label="选择润色文本模型"
-                                @click="handleOpenModelSetting('text')">
-                                <magic
-                                    theme="outline"
-                                    size="15" />
-                                <span
-                                    v-if="!selectedTextModel"
-                                    class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full border border-background bg-destructive px-0.5 text-[10px] font-bold leading-none text-destructive-foreground">
-                                    !
-                                </span>
-                            </button>
-                        </ui-tooltip-trigger>
-                        <ui-tooltip-content>{{ textModelTooltip }}</ui-tooltip-content>
-                    </ui-tooltip>
                 </div>
             </div>
             <div class="flex items-center gap-2">
@@ -86,18 +48,6 @@
                         </ui-button>
                     </ui-dropdown-menu-trigger>
                     <ui-dropdown-menu-content class="w-44">
-                        <ui-dropdown-menu-item @select="handleOpenModelSetting('asr')">
-                            <microphone
-                                theme="outline"
-                                size="16" />
-                            <span>ASR 模型设置</span>
-                        </ui-dropdown-menu-item>
-                        <ui-dropdown-menu-item @select="handleOpenModelSetting('text')">
-                            <magic
-                                theme="outline"
-                                size="16" />
-                            <span>润色模型设置</span>
-                        </ui-dropdown-menu-item>
                         <ui-dropdown-menu-item @select="shortcutDialogOpen = true">
                             <enter-the-keyboard
                                 theme="outline"
@@ -140,8 +90,42 @@
                     </div>
                 </div>
             </ui-alert>
+            <div class="grid gap-3 md:grid-cols-2">
+                <label class="grid gap-1.5">
+                    <span class="text-[12px] font-medium text-foreground">语音识别模型</span>
+                    <ui-select-root v-model="selectedAsrModelId">
+                        <ui-select-trigger>
+                            <ui-select-value placeholder="暂无可用 ASR 模型" />
+                        </ui-select-trigger>
+                        <ui-select-content>
+                            <ui-select-item
+                                v-for="model in asrModels"
+                                :key="model.id"
+                                :value="model.id">
+                                {{ model.displayName }}
+                            </ui-select-item>
+                        </ui-select-content>
+                    </ui-select-root>
+                </label>
+                <label class="grid gap-1.5">
+                    <span class="text-[12px] font-medium text-foreground">润色模型</span>
+                    <ui-select-root v-model="selectedTextModelId">
+                        <ui-select-trigger>
+                            <ui-select-value placeholder="暂无可用文本模型" />
+                        </ui-select-trigger>
+                        <ui-select-content>
+                            <ui-select-item
+                                v-for="model in textModels"
+                                :key="model.id"
+                                :value="model.id">
+                                {{ model.displayName }}
+                            </ui-select-item>
+                        </ui-select-content>
+                    </ui-select-root>
+                </label>
+            </div>
             <div
-                v-if="isVoiceAsrConfigured"
+                v-if="isVoiceAsrReady"
                 class="flex flex-wrap items-center gap-2">
                 <ui-button
                     variant="outline"
@@ -153,14 +137,30 @@
                         size="16" />
                     <span>{{ store.running ? '处理中' : '语音转文字' }}</span>
                 </ui-button>
+                <ui-tooltip>
+                    <ui-tooltip-trigger as-child>
+                        <span
+                            class="inline-flex"
+                            tabindex="0">
+                            <ui-button
+                                type="button"
+                                :disabled="store.running || !isVoicePolishReady"
+                                @click="handleStartVoice('polish')">
+                                <magic
+                                    theme="outline"
+                                    size="16" />
+                                <span>{{ store.running ? '处理中' : '转文字并润色' }}</span>
+                            </ui-button>
+                        </span>
+                    </ui-tooltip-trigger>
+                    <ui-tooltip-content>{{ polishAvailabilityTooltip }}</ui-tooltip-content>
+                </ui-tooltip>
                 <ui-button
+                    v-if="!isVoicePolishReady"
+                    variant="ghost"
                     type="button"
-                    :disabled="store.running"
-                    @click="handleStartVoice('polish')">
-                    <magic
-                        theme="outline"
-                        size="16" />
-                    <span>{{ store.running ? '处理中' : '转文字并润色' }}</span>
+                    @click="handleOpenModelManage">
+                    配置润色模型
                 </ui-button>
             </div>
         </section>
@@ -168,7 +168,7 @@
         <section>
             <div class="grid gap-3">
                 <ui-page-state
-                    v-if="!isVoiceAsrConfigured"
+                    v-if="!isVoiceAsrReady"
                     :icon="SettingTwo"
                     :title="voiceEmptyStateTitle"
                     :description="voiceEmptyStateDescription">
@@ -194,16 +194,13 @@
                     </div>
                 </ui-alert>
                 <ui-page-state
-                    v-if="isVoiceAsrConfigured && !visibleHistory.length"
+                    v-if="isVoiceAsrReady && !visibleHistory.length"
                     :icon="Empty"
                     title="还没有语音处理历史"
                     description="完成一次语音转文字或转文字并润色后，原文、结果和生成时间会在这里形成历史记录。" />
             </div>
         </section>
 
-        <voice-polish-model-setting-dialog
-            v-model:open="modelSettingDialogOpen"
-            :mode="modelSettingMode" />
         <ui-dialog v-model:open="permissionPromptOpen">
             <ui-dialog-content>
                 <ui-dialog-header>
@@ -227,35 +224,6 @@
                 </ui-dialog-footer>
             </ui-dialog-content>
         </ui-dialog>
-        <model-manage-model-form-dialog
-            v-model:open="modelGuideDialogOpen"
-            :group="modelGuideGroup"
-            :title="modelGuideDialogTitle"
-            :save-model="handleAddGuidedModel" />
-        <ui-dialog v-model:open="textPolishPromptOpen">
-            <ui-dialog-content>
-                <ui-dialog-header>
-                    <ui-dialog-title>是否开启文本 AI 润色？</ui-dialog-title>
-                    <ui-dialog-description>
-                        文本 AI 润色可以在 ASR
-                        识别后自动整理口语、修正明显误识别、补齐标点，让语音内容更适合直接发送或记录。
-                    </ui-dialog-description>
-                </ui-dialog-header>
-                <ui-dialog-footer class="mt-5">
-                    <ui-button
-                        variant="outline"
-                        type="button"
-                        @click="handleDeferTextModel">
-                        以后添加
-                    </ui-button>
-                    <ui-button
-                        type="button"
-                        @click="handleAddTextModelNow">
-                        立即添加
-                    </ui-button>
-                </ui-dialog-footer>
-            </ui-dialog-content>
-        </ui-dialog>
         <voice-polish-shortcut-dialog v-model:open="shortcutDialogOpen" />
     </div>
 </template>
@@ -264,7 +232,6 @@
     import { Empty, EnterTheKeyboard, List, Magic, Microphone, Permissions, SettingTwo } from '@icon-park/vue-next';
     import { toast } from 'vue-sonner';
 
-    import ModelManageModelFormDialog from '@/components/modelManage/modelFormDialog.vue';
     import { Alert as UiAlert } from '@/components/ui/alert';
     import { Button as UiButton } from '@/components/ui/button';
     import {
@@ -283,13 +250,18 @@
     } from '@/components/ui/dropdownMenu';
     import { PageState as UiPageState } from '@/components/ui/pageState';
     import {
+        Select as UiSelectRoot,
+        SelectContent as UiSelectContent,
+        SelectItem as UiSelectItem,
+        SelectTrigger as UiSelectTrigger,
+        SelectValue as UiSelectValue
+    } from '@/components/ui/select';
+    import {
         Tooltip as UiTooltip,
         TooltipContent as UiTooltipContent,
         TooltipTrigger as UiTooltipTrigger
     } from '@/components/ui/tooltip';
-    import VoicePolishModelSettingDialog from '@/components/voicePolish/modelSettingDialog.vue';
     import VoicePolishShortcutDialog from '@/components/voicePolish/shortcutDialog.vue';
-    import type { ModelFormModel, ModelGroupType, ModelItemModel } from '@/model/modelManage';
     import type { VoicePolishRunModeType } from '@/model/voicePolish';
     import { HubRouteName } from '@/router';
     import { isTauriRuntime } from '@/service/tauri/command';
@@ -303,92 +275,112 @@
 
     const router = useRouter();
     const store = useVoicePolishStore();
-    const modelStore = useModelManageStore();
     const permissionStore = usePermissionStore();
+    const modelManageStore = useModelManageStore();
     const settingMenuOpen = ref(false);
-    const modelSettingDialogOpen = ref(false);
-    const modelSettingMode = ref<VoicePolishModelSettingMode>('all');
-    const modelGuideDialogOpen = ref(false);
-    const modelGuideGroup = ref<ModelGroupType>('asr');
     const permissionPromptOpen = ref(false);
-    const textPolishPromptOpen = ref(false);
     const shortcutDialogOpen = ref(false);
     const isClientRuntime = isTauriRuntime();
-    const asrModels = computed(() => modelStore.groupModels('asr'));
-    const textModels = computed(() => modelStore.groupModels('text'));
-    const selectedAsrModel = computed(() => modelStore.modelById(store.selectedAsrModelId));
-    const selectedTextModel = computed(() => modelStore.modelById(store.selectedTextModelId));
+    const asrModels = computed(() => modelManageStore.enabledServiceModels('asr'));
+    const textModels = computed(() => modelManageStore.enabledServiceModels('text'));
+    const selectedAsrModelId = computed({
+        get: () => store.asrModelId,
+        set: (modelId: string) => {
+            store.asrModelId = modelId;
+            store.persistVoicePolish();
+        }
+    });
+    const selectedTextModelId = computed({
+        get: () => store.textModelId,
+        set: (modelId: string) => {
+            store.textModelId = modelId;
+            store.persistVoicePolish();
+        }
+    });
     const microphonePermission = computed(() => permissionStore.items.find((item) => item.key === 'microphone'));
     const isMicrophoneReady = computed(() => Boolean(microphonePermission.value?.ready));
-    const isVoiceAsrConfigured = computed(() => Boolean(selectedAsrModel.value));
-    const isDictationPolishConfigured = computed(() => Boolean(selectedAsrModel.value && selectedTextModel.value));
-    const visibleHistory = computed(() => (isVoiceAsrConfigured.value ? store.history : []));
+    const isVoiceAsrConfigured = computed(() =>
+        Boolean(permissionStore.items.find((item) => item.key === 'httpApi')?.ready)
+    );
+    const isVoiceAsrReady = computed(
+        () => isMicrophoneReady.value && isVoiceAsrConfigured.value && Boolean(store.asrModelId)
+    );
+    const isVoicePolishReady = computed(() => isVoiceAsrReady.value && Boolean(store.textModelId));
+    const visibleHistory = computed(() => store.history);
     const requirementAlertTitle = computed(() => {
         if (!isMicrophoneReady.value) return '还缺少麦克风权限';
-        if (!selectedAsrModel.value) return '还缺少 ASR 模型';
-        if (!selectedTextModel.value) return '可先语音转文字，润色模型还未配置';
+        if (!isVoiceAsrConfigured.value) return '还缺少 HTTP 服务授权';
+        if (!store.asrModelId) return '还缺少可用 ASR 模型';
+        if (!store.textModelId) return '语音转文字已就绪';
         return '语音处理已准备好';
     });
     const requirementAlertDescription = computed(() => {
         if (!isMicrophoneReady.value) {
-            return '麦克风权限用于录音收音；ASR 模型用于把语音识别成文字；润色模型用于在识别后整理口语、补齐标点和修正明显误识别。';
+            return '麦克风权限用于录音收音；公共 HTTP 服务负责语音识别，并可继续整理口语、补齐标点和修正明显误识别。';
         }
-        if (!selectedAsrModel.value) {
-            return 'ASR 模型是语音转文字的必需配置，没有它就无法把录音识别成文字；润色模型只在需要整理口语和标点时使用。';
+        if (!isVoiceAsrConfigured.value) {
+            return 'HTTP 服务需要先连接并完成设备码授权，授权成功后才能提交录音。';
         }
-        if (!selectedTextModel.value) {
-            return '当前已经可以做语音转文字；如果希望识别后自动整理口语、补齐标点和润色表达，再配置文本润色模型。';
+        if (!store.asrModelId) {
+            return '服务目录中需要已启用的 ASR 模型，才能使用语音转文字。';
         }
-        return '麦克风、ASR 模型和润色模型都已具备：可以只转文字，也可以转文字后继续自动整理和润色。';
+        if (!store.textModelId) {
+            return 'ASR 模型可用，可以正常语音转文字；配置文本模型后还可继续自动润色。';
+        }
+        return '服务端语音识别和文本处理能力已就绪：可以只转文字，也可以转文字后继续自动整理和润色。';
     });
     const voiceEmptyStateTitle = computed(() => {
         if (!isMicrophoneReady.value) return '请先开启麦克风权限';
-        return '请先设置 ASR 模型';
+        if (!store.asrModelId) return '请先配置可用 ASR 模型';
+        return '语音服务暂不可用';
     });
     const voiceEmptyStateDescription = computed(() => {
-        if (!isMicrophoneReady.value && !isClientRuntime) {
-            return '浏览器预览无法开启本机系统权限。请在 typesass App 里打开权限管理，先开启麦克风权限，再回来配置 ASR 模型。';
-        }
+        if (!isMicrophoneReady.value && !isClientRuntime) return '点击语音按钮后，按浏览器提示允许麦克风访问。';
         if (!isMicrophoneReady.value) {
-            return '语音转文字需要先获得麦克风权限用于录音收音。开启权限后，再配置 ASR 模型把语音识别成文字。';
+            return '语音转文字需要先获得麦克风权限用于录音收音。';
         }
-        return '语音转文字需要先配置可用的 ASR 模型。需要润色时，再补充文本大模型。完成一次处理后，历史记录会在这里展示。';
+        if (!store.asrModelId) return '模型目录缺少已启用的 ASR 模型，请前往模型管理配置。';
+        return '公共 HTTP 服务未提供语音识别能力，请联系服务管理员检查部署配置。';
     });
     const voiceEmptyStateActionLabel = computed(() => {
-        if (!isMicrophoneReady.value && !isClientRuntime) return '请用 App 打开';
+        if (!isMicrophoneReady.value && !isClientRuntime) return '授权麦克风';
         if (!isMicrophoneReady.value) return '去开启权限';
-        return modelGuideActionLabel.value;
+        if (!store.asrModelId) return '去模型管理';
+        return '检查 HTTP 服务';
     });
     const microphoneTooltip = computed(() => {
         if (isMicrophoneReady.value) return '麦克风权限已开启。';
         return '未开启麦克风权限，语音转文字润色无法收音。';
     });
-    const asrModelTooltip = computed(() => {
-        if (selectedAsrModel.value) return `ASR 模型已选择：${selectedAsrModel.value.name}`;
-        if (asrModels.value.length) return '已有 ASR 模型，请先选择语音润色要使用的模型。';
-        return '还没有 ASR 模型，请先添加语音识别模型。';
-    });
-    const textModelTooltip = computed(() => {
-        if (selectedTextModel.value) return `文本模型已选择：${selectedTextModel.value.name}`;
-        if (textModels.value.length) return '已有文本模型，请先选择语音润色要使用的模型。';
-        return '还没有文本模型，无法进行语音内容整理和润色。';
-    });
-    const modelGuideActionLabel = computed(() => {
-        if (!asrModels.value.length) return '请添加 ASR 模型';
-        if (!textModels.value.length) return '添加大模型（文本模型）';
-        if (!selectedAsrModel.value) return '选择 ASR 模型';
-        if (!selectedTextModel.value) return '选择大模型（文本模型）';
-        return '设置模型';
-    });
-    const modelGuideDialogTitle = computed(() => {
-        if (modelGuideGroup.value === 'asr') return '添加 ASR 模型';
-        return '添加文本模型';
+    const polishAvailabilityTooltip = computed(() => {
+        if (isVoicePolishReady.value) return '使用当前文本模型整理并润色语音识别结果。';
+        return '缺少已启用的文本模型；语音转文字仍可正常使用。';
     });
     let permissionRefreshTimer: number | null = null;
 
     onMounted(() => {
         void refreshVoicePermission();
+        void initializeModelSelections();
     });
+
+    /**
+     * 初始化语音页模型选择。
+     * 流程：读取服务安全目录，分别校正 ASR 与文本模型 ID，并保存回退后的不透明 ID。
+     * 参数：无。
+     * 返回：初始化完成 Promise。
+     * 边界：目录不可达或没有对应能力时保留空选择并展示明确错误，不使用前端预设猜测模型。
+     */
+    async function initializeModelSelections(): Promise<void> {
+        await modelManageStore.hydrateModelManage();
+        const asrSelection = modelManageStore.resolveSelection('asr', store.asrModelId, '语音转文字');
+        const textSelection = modelManageStore.resolveSelection('text', store.textModelId, '语音转文字润色');
+        store.asrModelId = asrSelection.modelId;
+        store.textModelId = textSelection.modelId;
+        store.persistVoicePolish();
+        store.message = [modelManageStore.message, asrSelection.message, textSelection.message]
+            .filter(Boolean)
+            .join(' ');
+    }
 
     onUnmounted(() => {
         stopPermissionRefreshTimer();
@@ -477,14 +469,22 @@
 
     /**
      * 打开麦克风前置条件提示。
-     * 流程：网页预览环境提示用户改用 APP 打开；客户端环境弹出授权引导，用户确认后再进入权限管理页。
+     * 流程：普通 Web 请求浏览器麦克风权限并立即停止临时音轨；客户端弹出系统授权引导。
      * 参数：无。
      * 返回：无返回值。
      * 边界：麦克风已授权时仍允许进入权限管理页查看状态，不直接触发系统授权能力。
      */
-    function handleOpenMicrophoneRequirement(): void {
+    async function handleOpenMicrophoneRequirement(): Promise<void> {
         if (!isClientRuntime) {
-            showClientRuntimeToast();
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                stream.getTracks().forEach((track) => track.stop());
+                await refreshVoicePermission();
+            } catch {
+                toast.warning('麦克风未授权', {
+                    description: '请在浏览器地址栏的网站权限中允许麦克风访问后重试。'
+                });
+            }
             return;
         }
         permissionPromptOpen.value = true;
@@ -503,40 +503,8 @@
     }
 
     /**
-     * 打开指定类型的语音润色模型设置弹窗。
-     * 流程：先记录弹窗模式，再打开弹窗，让下拉菜单的 ASR 与润色模型入口分别展示对应配置项。
-     * 参数：mode 为模型设置弹窗模式，asr 只展示语音识别模型，text 只展示润色文本模型，all 展示完整配置。
-     * 返回：无返回值。
-     * 边界：完整设置入口用于未配置状态，仍保留同时配置两类模型的能力。
-     */
-    function handleOpenModelSetting(mode: VoicePolishModelSettingMode): void {
-        settingMenuOpen.value = false;
-        modelSettingMode.value = mode;
-        modelSettingDialogOpen.value = true;
-    }
-
-    /**
-     * 打开语音润色模型引导入口。
-     * 流程：先判断本地模型仓库缺少 ASR 还是文本模型；缺模型时打开对应新增弹窗，已有模型但未选择时打开选择弹窗。
-     * 参数：无。
-     * 返回：无返回值。
-     * 边界：ASR 和文本模型都存在但当前选择失效时，不新增模型，只让用户选择已有模型。
-     */
-    function handleOpenModelGuide(): void {
-        if (!asrModels.value.length) {
-            openGuidedModelDialog('asr');
-            return;
-        }
-        if (!textModels.value.length) {
-            openGuidedModelDialog('text');
-            return;
-        }
-        handleOpenModelSetting('all');
-    }
-
-    /**
      * 处理空态主按钮点击。
-     * 流程：优先处理麦克风权限；浏览器预览只提示必须使用 App，客户端则跳到权限管理；权限满足后再进入模型配置。
+     * 流程：优先处理麦克风权限；能力异常时进入 HTTP API 文档页查看服务地址、鉴权与错误码。
      * 参数：无。
      * 返回：无返回值。
      * 边界：不会在浏览器预览中尝试申请系统权限，避免给用户造成可以网页授权的误解。
@@ -544,120 +512,38 @@
     function handlePrimarySetupAction(): void {
         if (!isMicrophoneReady.value) {
             if (!isClientRuntime) {
-                showClientRuntimeToast();
+                void handleOpenMicrophoneRequirement();
                 return;
             }
             handleGoPermissionPage();
             return;
         }
-        handleOpenModelGuide();
+        if (!store.asrModelId) {
+            handleOpenModelManage();
+            return;
+        }
+        void router.push({ name: HubRouteName.HttpApiDoc });
     }
 
     /**
-     * 提示用户切换到客户端完成本机权限操作。
-     * 流程：使用 Sonner 展示轻量反馈，避免为无需确认的信息弹出阻断式 Dialog。
+     * 前往模型管理页面。
+     * 流程：从语音页的 ASR 空态或润色缺失引导跳转到统一模型管理路由。
      * 参数：无。
      * 返回：无返回值。
-     * 边界：仅用于网页预览环境，不会尝试申请或读取系统权限。
+     * 边界：不会修改当前选择，用户返回后页面会按服务目录重新校正。
      */
-    function showClientRuntimeToast(): void {
-        toast.warning('请用 APP 打开', {
-            description:
-                '浏览器预览无法读取本机麦克风权限。请在 typesass App 里打开权限管理，完成麦克风授权后再使用语音转文字润色。'
-        });
+    function handleOpenModelManage(): void {
+        void router.push({ name: HubRouteName.ModelManage });
     }
 
     /**
      * 手动开始语音处理。
-     * 流程：按模式校验 ASR 或润色模型是否具备；缺配置时打开对应引导，配置完整时调用真实录音、ASR、润色和粘贴链路。
+     * 流程：使用服务端固定能力执行真实录音、ASR、可选润色和桌面粘贴链路。
      * 参数：mode 为本次语音处理模式，asr 只转文字，polish 会继续调用文本模型润色。
      * 返回：无返回值。
-     * 边界：非客户端环境由 Store 展示客户端不可用提示，不会写入假历史。
+     * 边界：普通 Web 完成录音和 HTTP 处理后在页面展示结果，不执行桌面自动粘贴。
      */
     function handleStartVoice(mode: VoicePolishRunModeType): void {
-        if (!selectedAsrModel.value) {
-            handleOpenModelGuide();
-            return;
-        }
-        if (mode === 'polish' && !isDictationPolishConfigured.value) {
-            if (!textModels.value.length) {
-                openGuidedModelDialog('text');
-                return;
-            }
-            handleOpenModelSetting('text');
-            return;
-        }
         void store.runVoicePolish('', mode);
     }
-
-    /**
-     * 打开指定类型的模型新增弹窗。
-     * 流程：记录当前引导新增的模型类型，再打开模型管理页复用的添加弹窗。
-     * 参数：group 为需要新增的模型分组，asr 表示语音识别模型，text 表示文本润色模型。
-     * 返回：无返回值。
-     * 边界：弹窗内部仍负责字段校验和真实连通性测试。
-     */
-    function openGuidedModelDialog(group: ModelGroupType): void {
-        modelGuideGroup.value = group;
-        modelGuideDialogOpen.value = true;
-    }
-
-    /**
-     * 处理引导流程新增模型成功。
-     * 流程：把新增模型写入模型仓库并立即选中；ASR 新增后如果还没有文本模型，则弹出文本 AI 润色引导。
-     * 参数：form 为模型添加弹窗提交的模型表单。
-     * 返回：无返回值。
-     * 边界：如果新增文本模型，则直接完成语音润色所需的第二类模型配置。
-     */
-    async function handleAddGuidedModel(form: ModelFormModel): Promise<void> {
-        const model = await modelStore.addModel(form);
-        if (model.group === 'asr') {
-            store.updateModelSelection(model.id, store.selectedTextModelId);
-            if (!textModels.value.length) {
-                textPolishPromptOpen.value = true;
-            }
-            return;
-        }
-        applyTextModel(model);
-    }
-
-    /**
-     * 暂后添加文本模型。
-     * 流程：关闭文本 AI 润色说明弹窗，页面空状态会继续提示用户补充文本模型。
-     * 参数：无。
-     * 返回：无返回值。
-     * 边界：不会清除已经选中的 ASR 模型。
-     */
-    function handleDeferTextModel(): void {
-        textPolishPromptOpen.value = false;
-    }
-
-    /**
-     * 立即进入文本模型添加流程。
-     * 流程：关闭说明弹窗后打开文本模型新增弹窗，用户添加成功后即可满足语音润色完整配置。
-     * 参数：无。
-     * 返回：无返回值。
-     * 边界：如果用户关闭新增弹窗，页面仍保持“添加大模型（文本模型）”引导。
-     */
-    function handleAddTextModelNow(): void {
-        textPolishPromptOpen.value = false;
-        openGuidedModelDialog('text');
-    }
-
-    /**
-     * 选中新添加的文本模型。
-     * 流程：保留当前 ASR 选择，只更新语音润色使用的文本大模型。
-     * 参数：model 为刚写入模型仓库的文本模型配置。
-     * 返回：无返回值。
-     * 边界：调用方保证传入模型属于 text 分组。
-     */
-    function applyTextModel(model: ModelItemModel): void {
-        store.updateModelSelection(store.selectedAsrModelId, model.id);
-    }
-
-    /**
-     * 语音润色模型设置弹窗模式。
-     * 业务含义：约束不同入口只展示对应模型设置区域。
-     */
-    type VoicePolishModelSettingMode = 'asr' | 'text' | 'all';
 </script>

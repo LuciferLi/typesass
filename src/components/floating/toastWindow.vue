@@ -1,7 +1,7 @@
 <template>
     <main class="flex h-full items-center justify-center bg-transparent">
         <ui-card class="mx-3 w-full px-4 py-3">
-            <div class="text-[13px] font-medium">typesass</div>
+            <div class="text-[13px] font-medium">CodexMan</div>
             <div
                 v-if="message"
                 class="mt-1 line-clamp-2 text-[13px] leading-5 text-muted-foreground">

@@ -21,29 +21,12 @@
                 class="rounded-md border border-border bg-muted/30 p-4">
                 <ui-field-content>
                     <ui-field-label>开机自动启动</ui-field-label>
-                    <ui-field-description>登录 macOS 后自动启动 typesass。</ui-field-description>
+                    <ui-field-description>登录 macOS 后自动启动 CodexMan。</ui-field-description>
                 </ui-field-content>
                 <ui-switch
                     :model-value="store.settings.launchAtLogin"
                     :disabled="store.saving"
-                    @update:model-value="store.toggleLaunchAtLogin" />
-            </ui-field>
-            <ui-field
-                orientation="horizontal"
-                class="rounded-md border border-destructive/35 bg-destructive/5 p-4">
-                <ui-field-content>
-                    <ui-field-label>恢复表结构</ui-field-label>
-                    <ui-field-description
-                        >应用最新任务管理表结构，并清空项目、任务、会话和执行记录。</ui-field-description
-                    >
-                </ui-field-content>
-                <ui-button
-                    variant="destructive"
-                    type="button"
-                    :disabled="store.saving"
-                    @click="handleResetSessionTaskSchema">
-                    {{ store.saving ? '恢复中' : '恢复表结构' }}
-                </ui-button>
+                    @update:model-value="handleToggleLaunchAtLogin" />
             </ui-field>
             <p
                 v-if="store.message"
@@ -56,8 +39,9 @@
 </template>
 
 <script setup lang="ts">
+    import { toast } from 'vue-sonner';
+
     import { Alert as UiAlert } from '@/components/ui/alert';
-    import { Button as UiButton } from '@/components/ui/button';
     import {
         Field as UiField,
         FieldContent as UiFieldContent,
@@ -75,14 +59,34 @@
     const store = useSettingsStore();
 
     /**
-     * 触发任务管理业务表恢复。
-     * 流程：调用设置 store 的恢复动作，Rust 端会重建 SQLite 业务表并清空任务数据。
-     * 参数：无。
+     * 弹出设置操作失败提示。
+     * 流程：优先展示 Error 中的安全错误说明；未知异常使用兜底文案。
+     * 参数：title 为短提示标题，error 为捕获异常，fallbackDescription 为兜底说明。
      * 返回：无返回值。
-     * 边界：只影响会话和任务管理业务库，不会删除 JSON 设置。
+     * 边界：初始化读取失败仍保留页面级 message，不转为短提示。
      */
-    function handleResetSessionTaskSchema(): void {
-        void store.resetSessionTaskSchema();
+    function showSettingsOperationError(title: string, error: unknown, fallbackDescription: string): void {
+        toast.error(title, {
+            description: error instanceof Error ? error.message : fallbackDescription
+        });
+    }
+
+    /**
+     * 切换开机自动启动设置。
+     * 流程：委托 Store 调用系统设置，完成后用 Sonner 给出短反馈。
+     * 参数：enabled 为目标开关状态。
+     * 返回：无返回值。
+     * 边界：失败时 Store 保留原开关状态，页面只弹出失败说明。
+     */
+    function handleToggleLaunchAtLogin(enabled: boolean): void {
+        void store
+            .toggleLaunchAtLogin(enabled)
+            .then(() => {
+                toast.success(enabled ? '已开启开机自动启动' : '已关闭开机自动启动');
+            })
+            .catch((error: unknown) => {
+                showSettingsOperationError('保存系统设置失败', error, '开机自动启动设置保存失败。');
+            });
     }
 
     onMounted(() => {

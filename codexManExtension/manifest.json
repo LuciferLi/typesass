@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "codexManExtension",
+  "version": "0.1.0",
+  "description": "Select page elements, capture screenshots, and save selector reports.",
+  "action": {
+    "default_title": "codexManExtension",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "contentScript.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

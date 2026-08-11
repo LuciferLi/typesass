@@ -12,8 +12,7 @@
                     class="mb-4">
                     <ui-alert-title>网页预览无法测试模型</ui-alert-title>
                     <ui-alert-description>
-                        模型连通性测试需要连接 typesass
-                        客户端服务。当前可以查看和填写表单，但请在客户端服务连接后测试并添加模型。
+                        模型配置和密钥只允许通过 CodexMan 桌面端私有 IPC 保存。请在桌面客户端中完成测试和添加。
                     </ui-alert-description>
                 </ui-alert>
 
@@ -83,6 +82,14 @@
 
                     <template v-if="selectedVendorValue === 'custom'">
                         <ui-field>
+                            <ui-field-label>显示名称</ui-field-label>
+                            <ui-input
+                                v-model="customDisplayName"
+                                placeholder="请输入用于模型选择器展示的名称"
+                                @update:model-value="handleFormChanged" />
+                            <ui-field-description>只用于本机管理页和业务模型选择器展示。</ui-field-description>
+                        </ui-field>
+                        <ui-field>
                             <ui-field-label>请求路径</ui-field-label>
                             <ui-input
                                 v-model="customBaseUrl"
@@ -148,7 +155,7 @@
                                 class="animate-spin"
                                 theme="outline"
                                 size="15" />
-                            {{ submitting ? '验证中' : '添加' }}
+                            {{ submitting ? '验证中' : props.model ? '保存' : '添加' }}
                         </ui-button>
                     </div>
                 </ui-dialog-footer>
@@ -189,8 +196,9 @@
         SelectValue as UiSelectValue
     } from '@/components/ui/select';
     import { ModelVendorPresets } from '@/config/defaultModel';
-    import type { ModelFormModel, ModelGroupType, ModelVendorKey } from '@/model/modelManage';
-    import { checkClientHttpBridgeHealth, isTauriRuntime, processText, transcribeAudio } from '@/service/tauri/command';
+    import type { ModelFormModel, ModelGroupType, ModelVendorKey, PrivateModelItemModel } from '@/model/modelManage';
+    import { isTauriRuntime } from '@/service/tauri/command';
+    import { useModelManageStore } from '@/stores/modelManage';
 
     defineOptions({
         name: 'ModelManageModelFormDialog'
@@ -204,6 +212,8 @@
             title?: string;
             // 保存模型配置的业务回调，调用方应在这里完成客户端配置接口写入。
             saveModel?: (value: ModelFormModel) => Promise<void>;
+            // 待编辑的安全模型元数据；为空时表示新增。
+            model?: PrivateModelItemModel | null;
         }>(),
         {
             title: '添加模型'
@@ -216,61 +226,31 @@
     }>();
 
     const open = defineModel<boolean>('open', { default: false });
+    const modelManageStore = useModelManageStore();
     const selectedVendorValue = ref<ModelVendorKey | 'custom'>('custom');
     const apiKey = ref('');
     const apiKeyVisible = ref(false);
     const customBaseUrl = ref('');
+    const customDisplayName = ref('');
     const customModelName = ref('');
     const testing = ref(false);
     const submitting = ref(false);
     const testStatus = ref<'idle' | 'success' | 'error'>('idle');
     const testMessage = ref('');
-    const clientBridgeHealthy = ref(false);
     const vendorOptions = computed(() => ModelVendorPresets.filter((vendor) => vendor.group === props.group));
     const selectedVendor = computed(() => {
         if (selectedVendorValue.value === 'custom') return null;
         return vendorOptions.value.find((vendor) => vendor.key === selectedVendorValue.value) || null;
     });
     const apiKeyPlaceholder = computed(() => selectedVendor.value?.apiKeyPlaceholder || '请输入中转站 API Key');
-    const apiKeyHelp = computed(() => selectedVendor.value?.apiKeyHelp || '请填写中转站或代理服务提供的 API Key。');
+    const apiKeyHelp = computed(() => {
+        if (props.model?.hasApiKey) return '密钥已保存在本地配置中；留空会保留原密钥，填写则轮换密钥。';
+        return selectedVendor.value?.apiKeyHelp || '请填写中转站或代理服务提供的 API Key。';
+    });
     const apiKeyUrl = computed(() => selectedVendor.value?.apiKeyUrl || '');
     const apiKeyUrlLabel = computed(() => selectedVendor.value?.apiKeyUrlLabel || '');
     const operationRunning = computed(() => testing.value || submitting.value);
-    const canRunModelTest = computed(() => isTauriRuntime() || clientBridgeHealthy.value);
-
-    /**
-     * 刷新客户端桥接健康状态。
-     * 流程：打开弹窗或组件初始化时请求客户端本地 health 端点，成功后允许真实模型测试。
-     * 参数：无。
-     * 返回：刷新完成 Promise。
-     * 边界：客户端未启动、端口不可达或超时时保持不可测试状态，不抛出错误打断表单展示。
-     */
-    async function refreshClientBridgeHealth(): Promise<void> {
-        clientBridgeHealthy.value = await checkClientHttpBridgeHealth();
-    }
-
-    watch(
-        open,
-        (visible) => {
-            if (visible) {
-                void refreshClientBridgeHealth();
-            }
-        },
-        { immediate: true }
-    );
-
-    /**
-     * 模型测试音频模型。
-     * 业务含义：用于 ASR 连通性测试的最小 WAV 音频，不依赖用户现场录音权限。
-     */
-    type ModelTestAudioModel = {
-        // 音频 MIME 类型，传给 OpenAI 兼容 ASR 接口。
-        contentType: string;
-        // 音频 base64 内容，不包含 Data URL 头。
-        audioBase64: string;
-        // 模拟音频时长，毫秒。
-        durationMs: number;
-    };
+    const canRunModelTest = computed(() => isTauriRuntime());
 
     /**
      * 重置添加模型表单。
@@ -283,11 +263,16 @@
         selectedVendorValue.value = 'custom';
         apiKey.value = '';
         apiKeyVisible.value = false;
-        customBaseUrl.value = '';
-        customModelName.value = '';
+        customBaseUrl.value = props.model?.baseUrl ?? '';
+        customDisplayName.value = props.model?.displayName ?? '';
+        customModelName.value = props.model?.modelName ?? '';
         testStatus.value = 'idle';
         testMessage.value = '';
     }
+
+    watch(open, (visible) => {
+        if (visible) resetForm();
+    });
 
     /**
      * 表单内容变化后清理上一次测试状态。
@@ -311,7 +296,7 @@
      */
     function createFormModel(): ModelFormModel | null {
         const normalizedApiKey = apiKey.value.trim();
-        if (!normalizedApiKey) {
+        if (!normalizedApiKey && !props.model?.hasApiKey) {
             setTestError('请先填写 API Key。');
             return null;
         }
@@ -321,27 +306,33 @@
                 group: props.group,
                 baseUrl: selectedVendor.value.baseUrl,
                 model: selectedVendor.value.model,
-                apiKey: normalizedApiKey,
+                apiKey: normalizedApiKey || undefined,
                 source: 'vendor',
                 vendorKey: selectedVendor.value.key,
-                remark: selectedVendor.value.label
+                remark: selectedVendor.value.label,
+                enabled: true,
+                isDefault: false
             };
         }
         const normalizedBaseUrl = customBaseUrl.value.trim();
+        const normalizedDisplayName = customDisplayName.value.trim();
         const normalizedModelName = customModelName.value.trim();
-        if (!normalizedBaseUrl || !normalizedModelName) {
-            setTestError('请填写请求路径和模型名称。');
+        if (!normalizedBaseUrl || !normalizedDisplayName || !normalizedModelName) {
+            setTestError('请填写显示名称、请求路径和模型名称。');
             return null;
         }
         return {
-            name: normalizedModelName,
-            group: props.group,
+            id: props.model?.id,
+            name: normalizedDisplayName,
+            group: props.model?.capability ?? props.group,
             baseUrl: normalizedBaseUrl,
             model: normalizedModelName,
-            apiKey: normalizedApiKey,
+            apiKey: normalizedApiKey || undefined,
             source: 'custom',
             vendorKey: '',
-            remark: '自定义中转站'
+            remark: props.model?.provider ?? '自定义中转站',
+            enabled: props.model?.enabled ?? true,
+            isDefault: props.model?.isDefault ?? false
         };
     }
 
@@ -371,105 +362,15 @@
 
     /**
      * 确认当前环境能执行真实模型测试。
-     * 流程：先判断客户端运行环境或 HTTP 桥接健康状态，不能真实测试时直接写入提示并阻断字段校验。
+     * 流程：先判断桌面运行环境，不能使用私有 IPC 时直接写入提示并阻断字段校验。
      * 参数：无。
      * 返回：可真实测试返回 true，不可测试返回 false。
      * 边界：该方法不抛出异常，避免网页预览环境先出现 API Key 等次级字段错误。
      */
     function ensureClientRuntimeForModelTest(): boolean {
-        if (canRunModelTest.value) return true;
-        setTestError('网页预览无法真实测试模型连通性，请先打开 typesass 客户端。');
+        if (isTauriRuntime()) return true;
+        setTestError('网页预览无法真实测试模型连通性，请先打开 CodexMan 客户端。');
         return false;
-    }
-
-    /**
-     * 创建 ASR 测试音频。
-     * 流程：生成 16kHz、16bit、单声道的短 WAV 静音片段，作为不依赖麦克风的模拟语音输入。
-     * 参数：无。
-     * 返回：可直接传给 transcribeAudio 的音频类型、base64 内容和时长。
-     * 边界：该音频主要验证接口可用性，模型可能返回空转写文本。
-     */
-    function createAsrTestAudio(): ModelTestAudioModel {
-        const sampleRate = 16000;
-        const durationMs = 1000;
-        const sampleCount = sampleRate;
-        const headerSize = 44;
-        const bytesPerSample = 2;
-        const dataSize = sampleCount * bytesPerSample;
-        const buffer = new ArrayBuffer(headerSize + dataSize);
-        const view = new DataView(buffer);
-        const bytes = new Uint8Array(buffer);
-
-        writeAscii(view, 0, 'RIFF');
-        view.setUint32(4, 36 + dataSize, true);
-        writeAscii(view, 8, 'WAVE');
-        writeAscii(view, 12, 'fmt ');
-        view.setUint32(16, 16, true);
-        view.setUint16(20, 1, true);
-        view.setUint16(22, 1, true);
-        view.setUint32(24, sampleRate, true);
-        view.setUint32(28, sampleRate * bytesPerSample, true);
-        view.setUint16(32, bytesPerSample, true);
-        view.setUint16(34, 16, true);
-        writeAscii(view, 36, 'data');
-        view.setUint32(40, dataSize, true);
-
-        let binary = '';
-        bytes.forEach((byte) => {
-            binary += String.fromCharCode(byte);
-        });
-        return {
-            contentType: 'audio/wav',
-            audioBase64: btoa(binary),
-            durationMs
-        };
-    }
-
-    /**
-     * 向 DataView 写入 ASCII 字符串。
-     * 流程：逐字符写入 Uint8 编码，用于构造 WAV 文件头。
-     * 参数：view 为目标二进制视图；offset 为写入起点；value 为 ASCII 字符串。
-     * 返回：无返回值。
-     * 边界：调用方必须保证 value 只包含 ASCII 字符。
-     */
-    function writeAscii(view: DataView, offset: number, value: string): void {
-        for (let index = 0; index < value.length; index += 1) {
-            view.setUint8(offset + index, value.charCodeAt(index));
-        }
-    }
-
-    /**
-     * 测试当前模型配置。
-     * 流程：文本模型调用文本处理接口，ASR 模型发送模拟 WAV 音频；接口成功响应即视为该配置可用。
-     * 参数：form 为待测试的模型配置。
-     * 返回：测试通过时 resolve，失败时向外抛出异常。
-     * 边界：不会写入模型列表，也不会修改用户已保存的模型选择。
-     */
-    async function testModelConnection(form: ModelFormModel): Promise<void> {
-        if (form.group === 'text') {
-            await processText({
-                apiKey: form.apiKey,
-                baseUrl: form.baseUrl,
-                textModel: form.model,
-                mode: 'polish',
-                text: '这是一段用于验证文本模型连通性的测试文本。',
-                audioDurationMs: 0,
-                dictionary: [],
-                targetLanguages: [],
-                contextApp: 'model-manage',
-                styleInstruction: '请原样返回或简短润色，用于验证模型是否可用。'
-            });
-            return;
-        }
-        const audio = createAsrTestAudio();
-        await transcribeAudio({
-            apiKey: form.apiKey,
-            baseUrl: form.baseUrl,
-            asrModel: form.model,
-            language: 'auto',
-            contentType: audio.contentType,
-            audioBase64: audio.audioBase64
-        });
     }
 
     /**
@@ -488,8 +389,15 @@
         testStatus.value = 'idle';
         testMessage.value = form.group === 'asr' ? '正在测试 ASR 模型。' : '正在测试文本模型。';
         try {
-            await testModelConnection(form);
-            setTestSuccess(form.group === 'asr' ? 'ASR 模型真实请求通过。' : '文本模型真实请求通过。');
+            const result = await modelManageStore.testModel(form);
+            if (!result.success) {
+                const errorCode = result.errorCode || 'MODEL_CONNECTION_TEST_FAILED';
+                setTestError(`${result.message || '模型测试失败。'}（错误码：${errorCode}）`);
+                return;
+            }
+            setTestSuccess(
+                result.message || (form.group === 'asr' ? 'ASR 模型真实请求通过。' : '文本模型真实请求通过。')
+            );
         } catch (error) {
             setTestError(error instanceof Error ? error.message : '模型测试失败。');
         } finally {
@@ -499,7 +407,7 @@
 
     /**
      * 提交新增模型配置。
-     * 流程：先归一化表单并进入添加 loading，再调用模型测试；测试通过后才写入模型列表并关闭弹窗。
+     * 流程：归一化表单后提交私有 IPC，由原生端强制执行真实能力探测并在通过后原子保存，成功才关闭弹窗。
      * 参数：无。
      * 返回：无返回值。
      * 边界：必要字段为空或模型测试失败时直接中断，不写入模型列表。
@@ -511,22 +419,18 @@
         if (!form) return;
         submitting.value = true;
         testStatus.value = 'idle';
-        testMessage.value = form.group === 'asr' ? '正在验证 ASR 模型。' : '正在验证文本模型。';
+        testMessage.value = form.group === 'asr' ? '正在验证并保存 ASR 模型。' : '正在验证并保存文本模型。';
         try {
-            await testModelConnection(form);
-            testMessage.value = '模型验证通过，正在保存到客户端。';
             if (props.saveModel) {
                 await props.saveModel(form);
             } else {
                 emit('submit', form);
             }
-            setTestSuccess('模型验证通过，已添加。');
+            setTestSuccess(props.model ? '模型验证通过，已保存。' : '模型验证通过，已添加。');
             resetForm();
             open.value = false;
         } catch (error) {
-            const fallbackMessage = testMessage.value.includes('保存')
-                ? '保存模型配置失败。'
-                : '模型验证失败，暂未添加。';
+            const fallbackMessage = props.model ? '模型验证或保存失败，配置未更新。' : '模型验证失败，暂未添加。';
             setTestError(error instanceof Error ? error.message : fallbackMessage);
         } finally {
             submitting.value = false;

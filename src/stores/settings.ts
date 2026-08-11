@@ -3,12 +3,11 @@ import { defineStore } from 'pinia';
 import { StorageKey } from '@/config/storageKey';
 import type { AppThemeMode, SettingsModel } from '@/model/settings';
 import { readClientJson, writeClientJson } from '@/service/storage/clientJsonStorage';
-import {
-    getLoginLaunch,
-    resetSessionTaskSchema as resetSessionTaskSchemaCommand,
-    setLoginLaunch
-} from '@/service/tauri/command';
+import { getLoginLaunch, isTauriRuntime, setLoginLaunch } from '@/service/tauri/command';
 
+/**
+ * 设置页状态，用于聚合持久化偏好、原生设置读取状态和操作反馈。
+ */
 interface SettingsState {
     // 系统设置表单。
     settings: SettingsModel;
@@ -71,25 +70,27 @@ export const useSettingsStore = defineStore('settings', {
 
         /**
          * 应用界面主题模式。
-         * 流程：先根据传入模式更新 html.dark 类名，再保存本地设置，保证刷新后继续沿用用户选择。
+         * 流程：先根据传入模式更新 html.dark 类名；桌面端再保存客户端设置，普通 Web 仅维护当前页面状态。
          * 参数：themeMode 为目标主题模式。
          * 返回：无返回值。
-         * 边界：运行在非浏览器环境时不访问 document，避免服务端或测试环境报错。
+         * 边界：运行在非浏览器环境时不访问 document；普通 Web 不调用 Tauri IPC，避免产生无效错误日志。
          */
         applyThemeMode(themeMode: AppThemeMode): void {
             this.settings.themeMode = themeMode;
             if (typeof document !== 'undefined') {
                 document.documentElement.classList.toggle('dark', themeMode === 'dark');
             }
-            void writeClientJson(StorageKey.settings, this.settings);
+            if (isTauriRuntime()) {
+                void writeClientJson(StorageKey.settings, this.settings);
+            }
         },
 
         /**
          * 切换界面主题模式。
-         * 流程：根据开关状态映射 dark/light，再复用 applyThemeMode 完成 DOM 类名和本地存储更新。
+         * 流程：根据开关状态映射 dark/light，再复用 applyThemeMode 完成 DOM 类名和桌面端配置更新。
          * 参数：enabled 表示是否启用深色主题。
          * 返回：无返回值。
-         * 边界：重复切换同一状态时仍会写入本地存储，确保缺失字段被补齐。
+         * 边界：桌面端重复切换同一状态时仍会写入配置；普通 Web 仅更新当前页面。
          */
         toggleThemeMode(enabled: boolean): void {
             this.applyThemeMode(enabled ? 'dark' : 'light');
@@ -104,11 +105,18 @@ export const useSettingsStore = defineStore('settings', {
          */
         toggleSmartVoiceEnhancement(enabled: boolean): void {
             this.settings.smartVoiceEnhancement = enabled;
-            void writeClientJson(StorageKey.settings, this.settings);
-            this.message = '声音设置已保存。';
+            if (isTauriRuntime()) {
+                void writeClientJson(StorageKey.settings, this.settings);
+            }
+            this.message = '';
         },
 
-        // 初始化系统设置，优先读取原生开机启动真实状态。
+        /**
+         * 初始化原生系统设置。
+         * 流程：读取真实开机启动状态并同步当前客户端 JSON。
+         * 返回：初始化完成 Promise。
+         * 边界：IPC 失败时保留现有状态并展示错误，不伪报已开启。
+         */
         async initSettings(): Promise<void> {
             this.initializing = true;
             try {
@@ -121,35 +129,22 @@ export const useSettingsStore = defineStore('settings', {
             }
         },
 
-        // 切换开机自动启动状态。
+        /**
+         * 切换开机自动启动。
+         * 流程：先调用 Tauri 修改系统状态，成功后更新页面并持久化。
+         * 参数：enabled 表示目标开关状态。
+         * 返回：保存完成 Promise。
+         * 边界：系统调用失败时不修改本地显示状态。
+         */
         async toggleLaunchAtLogin(enabled: boolean): Promise<void> {
             this.saving = true;
             try {
                 await setLoginLaunch(enabled);
                 this.settings.launchAtLogin = enabled;
                 void writeClientJson(StorageKey.settings, this.settings);
-                this.message = '系统设置已保存。';
+                this.message = '';
             } catch (error) {
                 this.message = error instanceof Error ? error.message : '保存系统设置失败。';
-            } finally {
-                this.saving = false;
-            }
-        },
-
-        /**
-         * 恢复会话和任务管理最新表结构。
-         * 流程：调用 Tauri 删除并重建任务管理 SQLite 业务表，同时清空项目、任务、会话和事件数据。
-         * 参数：无。
-         * 返回：恢复完成 Promise。
-         * 边界：不会清理客户端 JSON 设置、主题、快捷键、模型配置或钥匙串 API Key。
-         */
-        async resetSessionTaskSchema(): Promise<void> {
-            this.saving = true;
-            try {
-                await resetSessionTaskSchemaCommand();
-                this.message = '会话和任务管理表结构已恢复，任务数据已清空。';
-            } catch (error) {
-                this.message = error instanceof Error ? error.message : '恢复表结构失败。';
                 throw error;
             } finally {
                 this.saving = false;

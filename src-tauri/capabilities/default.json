@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认窗口权限",
-  "windows": ["main", "hub", "toast", "result", "subtitle", "subtitleHistory"],
+  "description": "Hub 主窗口权限",
+  "windows": ["hub"],
   "permissions": [
     "core:default",
     "core:window:allow-internal-toggle-maximize",

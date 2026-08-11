@@ -6,15 +6,9 @@ import {
     hasShortcutProfileValue,
     normalizeShortcutProfileValue
 } from '@/service/shortcut/shortcutProfile';
-import {
-    migrateBrowserStorageToClientJson,
-    readClientJson,
-    watchClientJson
-} from '@/service/storage/clientJsonStorage';
-import { registerShortcuts } from '@/service/tauri/command';
-import { useModelManageStore } from '@/stores/modelManage';
+import { readClientJson, watchClientJson } from '@/service/storage/clientJsonStorage';
+import { isTauriRuntime, registerShortcuts } from '@/service/tauri/command';
 import { useSettingsStore } from '@/stores/settings';
-import { useSubtitleStore } from '@/stores/subtitle';
 import { useTextPolishStore } from '@/stores/textPolish';
 import { useVoicePolishStore } from '@/stores/voicePolish';
 
@@ -26,15 +20,10 @@ import { useVoicePolishStore } from '@/stores/voicePolish';
  * 边界：缺失分区不会覆盖当前状态，避免外部手动删除单个 key 时影响当前会话的运行态。
  */
 function applyClientJsonSnapshot(snapshot: LocalConfigChangedPayloadModel): void {
-    const modelManageStore = useModelManageStore();
     const settingsStore = useSettingsStore();
     const voicePolishStore = useVoicePolishStore();
     const textPolishStore = useTextPolishStore();
-    const subtitleStore = useSubtitleStore();
 
-    if (StorageKey.modelManage in snapshot.items) {
-        modelManageStore.applyPersistedModels(snapshot.items[StorageKey.modelManage]);
-    }
     if (StorageKey.settings in snapshot.items) {
         settingsStore.applyPersistedSettings(snapshot.items[StorageKey.settings]);
     }
@@ -43,9 +32,6 @@ function applyClientJsonSnapshot(snapshot: LocalConfigChangedPayloadModel): void
     }
     if (StorageKey.textPolish in snapshot.items) {
         textPolishStore.applyPersistedTextPolish(snapshot.items[StorageKey.textPolish]);
-    }
-    if (StorageKey.subtitle in snapshot.items) {
-        subtitleStore.applyPersistedSubtitle(snapshot.items[StorageKey.subtitle]);
     }
     if (StorageKey.shortcuts in snapshot.items && hasShortcutProfileValue(snapshot.items[StorageKey.shortcuts])) {
         void registerShortcuts(
@@ -69,25 +55,21 @@ async function registerPersistedShortcuts(): Promise<void> {
 
 /**
  * 初始化客户端 JSON 配置同步。
- * 流程：先迁移历史浏览器 localStorage，再分别水合各业务 Store，最后启动客户端文件监听。
+ * 流程：分别水合各业务 Store，最后启动客户端文件监听；首次上线不执行任何历史数据迁移。
  * 参数：无。
  * 返回：初始化完成 Promise。
  * 边界：任一读取失败不会阻塞应用启动；文件监听失败时仅失去外部变更实时刷新能力。
  */
 export async function initClientJsonConfigSync(): Promise<void> {
-    await migrateBrowserStorageToClientJson();
-    const modelManageStore = useModelManageStore();
+    if (!isTauriRuntime()) return;
     const settingsStore = useSettingsStore();
     const voicePolishStore = useVoicePolishStore();
     const textPolishStore = useTextPolishStore();
-    const subtitleStore = useSubtitleStore();
 
     await Promise.all([
-        modelManageStore.hydrateModelManage(),
         settingsStore.hydrateSettings(),
         voicePolishStore.hydrateVoicePolish(),
         textPolishStore.hydrateTextPolish(),
-        subtitleStore.hydrateSubtitle(),
         registerPersistedShortcuts()
     ]);
     await watchClientJson(applyClientJsonSnapshot);

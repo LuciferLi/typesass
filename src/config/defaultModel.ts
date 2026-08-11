@@ -1,7 +1,4 @@
-import type { ModelItemModel, ModelVendorPresetModel } from '@/model/modelManage';
-
-// 默认模型列表，用户未主动添加模型前保持为空，避免把厂商预设误展示成用户模型。
-export const DefaultModels: ModelItemModel[] = [];
+import type { ModelVendorPresetModel } from '@/model/modelManage';
 
 // 厂商预设列表，用于添加模型时快速生成请求地址和模型 ID。
 export const ModelVendorPresets: ModelVendorPresetModel[] = [

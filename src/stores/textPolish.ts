@@ -3,12 +3,12 @@ import { defineStore } from 'pinia';
 import { StorageKey } from '@/config/storageKey';
 import type { TextPolishHistoryItemModel } from '@/model/textPolish';
 import { readClientJson, writeClientJson } from '@/service/storage/clientJsonStorage';
-import { pasteText, processText, readSelectedText } from '@/service/tauri/command';
+import { isTauriRuntime, pasteText, processText, readSelectedText, showResultWindow } from '@/service/tauri/command';
 import { useModelManageStore } from '@/stores/modelManage';
 
 interface TextPolishState {
-    // 当前选择的文本模型 ID。
-    selectedTextModelId: string;
+    // 当前文本模型的不透明服务目录 ID。
+    textModelId: string;
     // 模块内历史记录。
     history: TextPolishHistoryItemModel[];
     // 本模块输出偏好。
@@ -24,7 +24,7 @@ interface TextPolishState {
 }
 
 const defaultState = {
-    selectedTextModelId: '',
+    textModelId: '',
     history: [],
     styleInstruction: '',
     inputText: ''
@@ -65,35 +65,44 @@ export const useTextPolishStore = defineStore('textPolish', {
         applyPersistedTextPolish(state: unknown): void {
             if (!state || typeof state !== 'object') return;
             const nextState = state as Partial<TextPolishPersistedState>;
-            this.selectedTextModelId =
-                typeof nextState.selectedTextModelId === 'string' ? nextState.selectedTextModelId : '';
+            this.textModelId = typeof nextState.textModelId === 'string' ? nextState.textModelId : '';
             this.history = Array.isArray(nextState.history) ? nextState.history : [];
             this.styleInstruction = typeof nextState.styleInstruction === 'string' ? nextState.styleInstruction : '';
             this.inputText = typeof nextState.inputText === 'string' ? nextState.inputText : '';
         },
 
-        // 持久化文字润色模块状态到客户端 JSON 配置文件。
+        /**
+         * 持久化文字润色状态。
+         * 流程：桌面端把历史、偏好和输入草稿写入客户端 JSON；普通 Web 保持会话内状态。
+         * 返回：无。
+         * 边界：异步写入失败由统一配置服务记录，不把未落盘状态伪报为跨窗口同步成功。
+         */
         persistTextPolish(): void {
+            if (!isTauriRuntime()) return;
             void writeClientJson(StorageKey.textPolish, {
-                selectedTextModelId: this.selectedTextModelId,
+                textModelId: this.textModelId,
                 history: this.history,
                 styleInstruction: this.styleInstruction,
                 inputText: this.inputText
             });
         },
 
-        // 更新文本模型选择。
-        updateTextModel(modelId: string): void {
-            this.selectedTextModelId = modelId;
-            this.persistTextPolish();
-        },
-
-        // 润色页面输入框中的文本。
+        /**
+         * 润色页面输入框文本。
+         * 流程：把当前输入和空目标应用交给统一 polishText 链路。
+         * 返回：处理完成 Promise。
+         * 边界：空输入由统一链路拒绝，不发 HTTP 请求。
+         */
         async polishInputText(): Promise<void> {
             await this.polishText(this.inputText, '');
         },
 
-        // 从外部应用读取选中文本并润色后粘贴回去。
+        /**
+         * 润色桌面端选中文本。
+         * 流程：通过 Tauri IPC 读取选区和目标应用，再调用统一 HTTP 润色及粘贴链路。
+         * 返回：处理完成 Promise。
+         * 边界：普通 Web 不可调用；读取或粘贴失败会保留结果并展示可排障信息。
+         */
         async polishSelectedText(): Promise<void> {
             this.running = true;
             try {
@@ -104,31 +113,36 @@ export const useTextPolishStore = defineStore('textPolish', {
             }
         },
 
-        // 执行文本润色。
+        /**
+         * 执行文本润色主链路。
+         * 流程：校验正文、调用 FastAPI、记录历史；桌面目标存在时尝试粘贴并核验插入结果。
+         * 参数：text 为待处理正文，targetApp 为桌面目标应用；Web 传空字符串。
+         * 返回：处理完成 Promise。
+         * 边界：HTTP 错误包含稳定 code/requestId；未确认插入时打开结果窗口且不宣称成功。
+         */
         async polishText(text: string, targetApp: string): Promise<void> {
-            const modelStore = useModelManageStore();
-            const textModel = modelStore.modelById(this.selectedTextModelId);
-            if (!textModel) {
-                this.message = '请先选择可用的文本模型。';
-                return;
-            }
             const normalizedText = text.trim();
             if (!normalizedText) {
                 this.message = '请输入或选中需要润色的文字。';
                 return;
             }
             this.running = true;
-            this.message = '正在润色文字。';
+            let fallbackMessage = '';
             try {
+                const modelManageStore = useModelManageStore();
+                await modelManageStore.refreshServiceModels();
+                const selection = modelManageStore.resolveSelection('text', this.textModelId, '文本润色');
+                if (!selection.modelId) throw new Error(selection.message);
+                this.textModelId = selection.modelId;
+                this.persistTextPolish();
+                fallbackMessage = selection.message;
+                this.message = fallbackMessage || '正在润色文字。';
                 const processed = await processText({
-                    apiKey: textModel.apiKey,
-                    baseUrl: textModel.baseUrl,
-                    textModel: textModel.model,
+                    modelId: this.textModelId,
                     mode: 'polish',
                     text: normalizedText,
                     audioDurationMs: 0,
                     dictionary: [],
-                    targetLanguages: [],
                     contextApp: targetApp,
                     styleInstruction: this.styleInstruction
                 });
@@ -141,10 +155,22 @@ export const useTextPolishStore = defineStore('textPolish', {
                 });
                 this.history = this.history.slice(0, 80);
                 this.persistTextPolish();
-                if (targetApp) await pasteText(processed.processedText, targetApp);
-                this.message = '文字润色已完成。';
+                if (targetApp) {
+                    const pasteResult = await pasteText(processed.processedText, targetApp);
+                    if (!pasteResult.insertionVerified) {
+                        await showResultWindow(
+                            processed.processedText,
+                            pasteResult.message,
+                            pasteResult.requiresAccessibility
+                        );
+                        this.message = '文字已生成，但未能确认已插入目标输入框，请在结果窗口复制。';
+                        return;
+                    }
+                }
+                this.message = fallbackMessage ? `${fallbackMessage} 文字润色已完成。` : '文字润色已完成。';
             } catch (error) {
-                this.message = error instanceof Error ? error.message : '文字润色失败。';
+                const errorMessage = error instanceof Error ? error.message : '文字润色失败。';
+                this.message = fallbackMessage ? `${fallbackMessage} ${errorMessage}` : errorMessage;
             } finally {
                 this.running = false;
             }

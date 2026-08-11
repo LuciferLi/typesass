@@ -67,6 +67,7 @@
 
 <script setup lang="ts">
     import { Copy, FolderOpen, Refresh } from '@icon-park/vue-next';
+    import { toast } from 'vue-sonner';
 
     import { Button as UiButton } from '@/components/ui/button';
     import {
@@ -118,26 +119,34 @@
      * 边界：剪贴板权限不可用时静默失败，不影响工作空间选择。
      */
     function handleCopyWorkspacePath(workspaceCwd: string): void {
-        void copyTextToClipboard(workspaceCwd);
+        void copyTextToClipboard(workspaceCwd).then((copied) => {
+            if (copied) {
+                toast.success('工作空间路径已复制');
+                return;
+            }
+            toast.error('复制工作空间路径失败', {
+                description: '当前环境不允许写入剪贴板。'
+            });
+        });
     }
 
     /**
      * 写入文本到系统剪贴板。
      * 流程：先尝试标准 Clipboard API，失败或不可用时使用选区复制兜底。
      * 参数：text 为需要复制的文本。
-     * 返回：复制完成 Promise。
-     * 边界：无 DOM 环境或浏览器禁止写入时直接返回，不向用户抛出异常。
+     * 返回：复制成功时返回 true；环境禁止复制时返回 false。
+     * 边界：无 DOM 环境或浏览器禁止写入时不抛异常，由调用方用短提示说明。
      */
-    async function copyTextToClipboard(text: string): Promise<void> {
+    async function copyTextToClipboard(text: string): Promise<boolean> {
         try {
             if (navigator.clipboard?.writeText) {
                 await navigator.clipboard.writeText(text);
-                return;
+                return true;
             }
         } catch {
             // 继续走 textarea 兜底。
         }
-        if (typeof document === 'undefined') return;
+        if (typeof document === 'undefined') return false;
         const textarea = document.createElement('textarea');
         textarea.value = text;
         textarea.setAttribute('readonly', 'true');
@@ -145,9 +154,9 @@
         document.body.appendChild(textarea);
         textarea.select();
         try {
-            document.execCommand('copy');
+            return document.execCommand('copy');
         } catch {
-            // 当前环境禁止复制时静默失败，避免影响工作空间选择。
+            return false;
         } finally {
             document.body.removeChild(textarea);
         }

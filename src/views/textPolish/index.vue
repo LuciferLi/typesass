@@ -11,21 +11,21 @@
                 </ui-button>
             </div>
             <ui-field>
-                <ui-field-label>文本大模型</ui-field-label>
+                <ui-field-label>文本模型</ui-field-label>
                 <ui-select-root v-model="selectedTextModelId">
                     <ui-select-trigger>
-                        <ui-select-value placeholder="选择模型" />
+                        <ui-select-value placeholder="暂无可用文本模型" />
                     </ui-select-trigger>
                     <ui-select-content>
                         <ui-select-item
-                            v-for="model in modelStore.groupModels('text')"
+                            v-for="model in textModels"
                             :key="model.id"
                             :value="model.id">
-                            {{ model.name }} · {{ model.model }}
+                            {{ model.displayName }}
                         </ui-select-item>
                     </ui-select-content>
                 </ui-select-root>
-                <ui-field-description>选择用于润色文字的文本大模型。</ui-field-description>
+                <ui-field-description>选择服务目录中已启用的模型，业务请求只发送不透明模型 ID。</ui-field-description>
             </ui-field>
             <ui-field>
                 <ui-field-label>实时输入</ui-field-label>
@@ -108,9 +108,32 @@
     });
 
     const store = useTextPolishStore();
-    const modelStore = useModelManageStore();
+    const modelManageStore = useModelManageStore();
+    const textModels = computed(() => modelManageStore.enabledServiceModels('text'));
     const selectedTextModelId = computed({
-        get: () => store.selectedTextModelId,
-        set: (value: string) => store.updateTextModel(value)
+        get: () => store.textModelId,
+        set: (modelId: string) => {
+            store.textModelId = modelId;
+            store.persistTextPolish();
+        }
+    });
+
+    /**
+     * 初始化文本润色模型选择。
+     * 流程：读取公共安全目录，校正已保存 ID 并持久化服务端默认回退结果。
+     * 参数：无。
+     * 返回：初始化完成 Promise。
+     * 边界：目录不可达或无文本能力时保留空 ID并展示明确提示，润色动作会阻止请求。
+     */
+    async function initializeTextModelSelection(): Promise<void> {
+        await modelManageStore.hydrateModelManage();
+        const selection = modelManageStore.resolveSelection('text', store.textModelId, '文本润色');
+        store.textModelId = selection.modelId;
+        store.persistTextPolish();
+        store.message = modelManageStore.message || selection.message;
+    }
+
+    onMounted(() => {
+        void initializeTextModelSelection();
     });
 </script>

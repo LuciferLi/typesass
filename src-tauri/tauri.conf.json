@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "typesass",
+  "productName": "CodexMan",
   "version": "0.0.2",
   "identifier": "asia.aijob.aitool",
   "build": {
     "beforeDevCommand": "npm run dev:frontend",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:sidecar && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "typesass",
+        "title": "CodexMan",
         "width": 132,
         "height": 46,
         "minWidth": 132,
@@ -34,7 +34,7 @@
       {
         "label": "hub",
         "url": "index.html?mode=hub",
-        "title": "typesass",
+        "title": "CodexMan",
         "width": 1200,
         "height": 800,
         "minWidth": 960,
@@ -57,7 +57,7 @@
       {
         "label": "toast",
         "url": "index.html?mode=toast",
-        "title": "typesass 提示",
+        "title": "CodexMan 提示",
         "width": 460,
         "height": 86,
         "minWidth": 460,
@@ -78,7 +78,7 @@
       {
         "label": "result",
         "url": "index.html?mode=result",
-        "title": "typesass 结果",
+        "title": "CodexMan 结果",
         "width": 520,
         "height": 320,
         "minWidth": 520,
@@ -95,52 +95,10 @@
         "alwaysOnTop": true,
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true
-      },
-      {
-        "label": "subtitle",
-        "url": "index.html?mode=subtitle",
-        "title": "typesass 实时字幕",
-        "width": 1000,
-        "height": 170,
-        "minWidth": 1000,
-        "minHeight": 170,
-        "maxWidth": 1000,
-        "maxHeight": 170,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
-        "focus": false,
-        "focusable": false,
-        "visible": false,
-        "alwaysOnTop": true,
-        "visibleOnAllWorkspaces": true,
-        "skipTaskbar": true
-      },
-      {
-        "label": "subtitleHistory",
-        "url": "index.html?mode=subtitleHistory",
-        "title": "typesass 字幕历史",
-        "width": 360,
-        "height": 460,
-        "minWidth": 360,
-        "minHeight": 460,
-        "maxWidth": 360,
-        "maxHeight": 460,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "shadow": false,
-        "focus": false,
-        "focusable": true,
-        "visible": false,
-        "alwaysOnTop": true,
-        "visibleOnAllWorkspaces": true,
-        "skipTaskbar": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:18080 ws://127.0.0.1:1420"
     }
   },
   "bundle": {
@@ -154,7 +112,8 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/typesass-process-tap"
+      "binaries/codexman-process-tap",
+      "binaries/codexman-ai-sidecar"
     ],
     "macOS": {
       "signingIdentity": "Developer ID Application: Tamba Trading Co., Ltd. (9VKQ2P8P6N)",

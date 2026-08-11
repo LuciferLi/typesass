@@ -23,14 +23,10 @@ export type DictionaryItemModel = {
     createdAt: string;
 };
 
-// 语音转写请求模型，映射 Tauri transcribe_audio 命令参数。
+// 语音转写请求模型，映射公共 HTTP 服务参数。
 export type TranscribeRequestModel = {
-    // API Key，空字符串时由原生侧读取会话、钥匙串或环境变量。
-    apiKey: string;
-    // OpenAI 兼容接口地址。
-    baseUrl: string;
-    // 语音识别模型名称。
-    asrModel: string;
+    // 服务目录返回的不透明 ASR 模型 ID。
+    modelId: string;
     // 识别语言，auto 表示自动识别。
     language: string;
     // 音频 MIME 类型。
@@ -45,21 +41,17 @@ export type TranscribeResponseModel = {
     text: string;
     // 服务端耗时，毫秒。
     elapsedMs: number;
-    // 实际响应模型。
-    model: string;
+    // 服务端实际采用的不透明模型 ID。
+    modelId: string;
 };
 
 // 文本处理模式类型，复用原生侧已有模式枚举。
 export type ProcessModeType = 'dictate' | 'polish';
 
-// 文本处理请求模型，映射 Tauri process_text 命令参数。
+// 文本处理请求模型，映射公共 HTTP 服务参数。
 export type ProcessTextRequestModel = {
-    // API Key，空字符串时由原生侧读取会话、钥匙串或环境变量。
-    apiKey: string;
-    // OpenAI 兼容接口地址。
-    baseUrl: string;
-    // 文本模型名称。
-    textModel: string;
+    // 服务目录返回的不透明文本模型 ID。
+    modelId: string;
     // 文本处理模式。
     mode: ProcessModeType;
     // 待处理文本。
@@ -68,8 +60,6 @@ export type ProcessTextRequestModel = {
     audioDurationMs: number;
     // 词典词条列表。
     dictionary: string[];
-    // 目标语言列表，当前保留为空。
-    targetLanguages: string[];
     // 触发时的前台应用。
     contextApp: string;
     // 本模块输出偏好。
@@ -82,6 +72,6 @@ export type ProcessTextResponseModel = {
     processedText: string;
     // 服务端耗时，毫秒。
     elapsedMs: number;
-    // 实际响应模型。
-    model: string;
+    // 服务端实际采用的不透明模型 ID。
+    modelId: string;
 };

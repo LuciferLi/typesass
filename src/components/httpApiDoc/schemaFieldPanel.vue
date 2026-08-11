@@ -89,7 +89,7 @@
      */
     function formatSchema(schema: HttpApiSchemaModel | HttpApiReferenceModel | null): string {
         if (!schema) return '';
-        return JSON.stringify(schema, null, 2);
+        return JSON.stringify(resolveSchema(schema) ?? schema, null, 2);
     }
 
     /**
@@ -132,7 +132,8 @@
     function schemaTypeSummary(schema: HttpApiSchemaModel | HttpApiReferenceModel | null): string {
         if (!schema) return '无';
         if (isReference(schema)) return schema.$ref.replace('#/components/schemas/', '');
-        if (schema.oneOf) return 'oneOf';
+        if (schema.oneOf) return schema.oneOf.map((item) => schemaTypeSummary(item)).join(' | ');
+        if (schema.anyOf) return schema.anyOf.map((item) => schemaTypeSummary(item)).join(' | ');
         if (schema.type === 'array') return `array<${schema.items ? schemaTypeSummary(schema.items) : 'unknown'}>`;
         if (schema.type) return schema.type;
         const resolvedSchema = resolveSchema(schema);
@@ -141,7 +142,7 @@
 
     /**
      * 生成 schema 字段规则摘要。
-     * 流程：拼接 description、enum、const、minLength、minimum、pattern 和 additionalProperties。
+     * 流程：拼接说明、枚举、长度、数组数量、数值范围、正则、默认值和额外字段规则。
      * 参数：schema 为字段 schema 或引用。
      * 返回：用户可读规则说明。
      * 边界：引用 schema 会先解析实际定义；没有规则时返回短横线。
@@ -155,7 +156,12 @@
             resolvedSchema.enum ? `枚举：${resolvedSchema.enum.join('、')}` : '',
             resolvedSchema.const !== undefined ? `固定值：${String(resolvedSchema.const)}` : '',
             resolvedSchema.minLength !== undefined ? `最小长度：${resolvedSchema.minLength}` : '',
+            resolvedSchema.maxLength !== undefined ? `最大长度：${resolvedSchema.maxLength}` : '',
+            resolvedSchema.minItems !== undefined ? `最少项数：${resolvedSchema.minItems}` : '',
+            resolvedSchema.maxItems !== undefined ? `最多项数：${resolvedSchema.maxItems}` : '',
             resolvedSchema.minimum !== undefined ? `最小值：${resolvedSchema.minimum}` : '',
+            resolvedSchema.maximum !== undefined ? `最大值：${resolvedSchema.maximum}` : '',
+            resolvedSchema.default !== undefined ? `默认值：${String(resolvedSchema.default)}` : '',
             resolvedSchema.pattern ? `正则：${resolvedSchema.pattern}` : '',
             resolvedSchema.additionalProperties === false ? '不允许额外字段' : ''
         ].filter((item) => item && item.trim().length > 0);

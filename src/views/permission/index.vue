@@ -3,7 +3,7 @@
         <div class="flex flex-wrap items-center justify-between gap-4">
             <div class="grid gap-1">
                 <p class="max-w-[640px] text-[13px] leading-6 text-muted-foreground">
-                    检查 typesass 在这台电脑上录音、读取选中文本、自动粘贴和响应全局快捷键所需的系统授权。
+                    检查 CodexMan 在这台电脑上录音、读取选中文本、自动粘贴和响应全局快捷键所需的系统授权。
                 </p>
             </div>
             <ui-button
@@ -165,7 +165,7 @@
                                 <ui-table-cell class="w-[160px] text-right">
                                     <ui-switch
                                         :model-value="settingsStore.settings.smartVoiceEnhancement"
-                                        @update:model-value="settingsStore.toggleSmartVoiceEnhancement" />
+                                        @update:model-value="handleToggleSmartVoiceEnhancement" />
                                 </ui-table-cell>
                             </ui-table-row>
                         </ui-table-body>
@@ -179,10 +179,10 @@
                 <ui-dialog-header class="gap-1.5">
                     <ui-dialog-title>系统权限说明</ui-dialog-title>
                     <p class="text-[13px] leading-5 text-muted-foreground">
-                        typesass 只在本机使用这些系统能力，用来完成语音输入、读取选区和快捷操作。
+                        CodexMan 只在本机使用这些系统能力，用来完成语音输入、读取选区和快捷操作。
                     </p>
                     <ui-dialog-description class="sr-only"
-                        >说明 typesass 需要本机系统权限的原因。</ui-dialog-description
+                        >说明 CodexMan 需要本机系统权限的原因。</ui-dialog-description
                     >
                 </ui-dialog-header>
                 <div class="grid gap-3.5 text-[14px] leading-6 text-muted-foreground">
@@ -218,6 +218,7 @@
 <script setup lang="ts">
     import { Info, KeyboardOne, Microphone, Permissions, Shield, TextRecognition } from '@icon-park/vue-next';
     import type { Component } from 'vue';
+    import { toast } from 'vue-sonner';
 
     import { Badge as UiBadge } from '@/components/ui/badge';
     import { Button as UiButton } from '@/components/ui/button';
@@ -264,9 +265,9 @@
 
     /**
      * 权限页展示键类型。
-     * 业务含义：权限页只展示电脑授权相关状态，API Key 属于账号/模型配置能力，不在本页展示。
+     * 业务含义：权限页只展示电脑授权相关状态，HTTP 服务状态由主界面统一展示。
      */
-    type PermissionDisplayKeyType = Exclude<PermissionKeyType, 'apiKey'>;
+    type PermissionDisplayKeyType = Exclude<PermissionKeyType, 'httpApi'>;
 
     /**
      * 权限页展示项模型。
@@ -319,7 +320,7 @@
         {
             title: '为什么需要系统权限',
             description:
-                'typesass 是桌面端输入辅助工具，需要在本机完成录音、读取当前选中文本、把结果写回目标应用，以及在后台响应快捷键。',
+                'CodexMan 是桌面端输入辅助工具，需要在本机完成录音、读取当前选中文本、把结果写回目标应用，以及在后台响应快捷键。',
             icon: Shield
         },
         {
@@ -336,7 +337,7 @@
         {
             title: '全局快捷键',
             description:
-                '用于在应用处于后台时快速开始语音、字幕或润色动作。快捷键不可用时，只能回到应用窗口内手动操作。',
+                '用于在应用处于后台时快速开始语音转文字、语音润色或选中文本润色。快捷键不可用时，只能回到应用窗口内手动操作。',
             icon: KeyboardOne
         }
     ];
@@ -350,6 +351,18 @@
             }))
             .filter((group) => group.items.length > 0);
     });
+
+    /**
+     * 切换智能识音增强。
+     * 流程：委托设置 Store 持久化偏好，完成后用 Sonner 给出短反馈。
+     * 参数：enabled 为目标开关状态。
+     * 返回：无返回值。
+     * 边界：该偏好不会触发系统权限请求，只影响后续录音参数。
+     */
+    function handleToggleSmartVoiceEnhancement(enabled: boolean): void {
+        settingsStore.toggleSmartVoiceEnhancement(enabled);
+        toast.success(enabled ? '智能识音增强已开启' : '智能识音增强已关闭');
+    }
 
     onMounted(() => {
         void store.refreshPermissions();

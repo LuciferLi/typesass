@@ -66,7 +66,7 @@
             v-else
             class="overflow-hidden rounded-lg border border-border bg-card">
             <div
-                class="grid grid-cols-[minmax(0,1fr)_120px_120px] gap-4 border-b border-border px-4 py-3 text-[12px] font-medium text-muted-foreground">
+                class="grid grid-cols-[minmax(0,1fr)_140px_280px] gap-4 border-b border-border px-4 py-3 text-[12px] font-medium text-muted-foreground">
                 <span>模型</span>
                 <span>来源</span>
                 <span class="text-right">操作</span>
@@ -77,21 +77,52 @@
                 <div
                     v-for="model in activeModels"
                     :key="model.id"
-                    class="grid grid-cols-[minmax(0,1fr)_120px_120px] gap-4 px-4 py-4">
+                    class="grid grid-cols-[minmax(0,1fr)_140px_280px] gap-4 px-4 py-4">
                     <div class="flex min-w-0 items-start gap-3">
                         <model-manage-vendor-mark
-                            :vendor-key="model.vendorKey"
-                            :label="model.name" />
+                            :vendor-key="model.provider"
+                            :label="model.displayName" />
                         <div class="min-w-0">
-                            <div class="truncate text-[14px] font-medium text-foreground">{{ model.name }}</div>
-                            <div class="mt-1 truncate text-[12px] text-muted-foreground">{{ model.model }}</div>
+                            <div class="truncate text-[14px] font-medium text-foreground">{{ model.displayName }}</div>
+                            <div class="mt-1 truncate text-[12px] text-muted-foreground">{{ model.modelName }}</div>
                             <div class="mt-1 truncate text-[12px] text-muted-foreground">{{ model.baseUrl }}</div>
                         </div>
                     </div>
                     <div class="flex items-start">
-                        <ui-badge variant="secondary">{{ model.source === 'vendor' ? '厂商' : '自定义' }}</ui-badge>
+                        <div class="grid gap-2">
+                            <ui-badge variant="secondary">{{ model.provider || '自定义' }}</ui-badge>
+                            <ui-badge
+                                v-if="model.isDefault"
+                                variant="outline">
+                                默认
+                            </ui-badge>
+                        </div>
                     </div>
-                    <div class="flex justify-end">
+                    <div class="flex flex-wrap items-center justify-end gap-1">
+                        <label class="flex items-center gap-2 text-[12px] text-muted-foreground">
+                            <span>{{ model.enabled ? '已启用' : '已禁用' }}</span>
+                            <ui-switch
+                                :model-value="model.enabled"
+                                :disabled="store.saving"
+                                @update:model-value="handleToggleModel(model, $event)" />
+                        </label>
+                        <ui-button
+                            v-if="!model.isDefault"
+                            variant="ghost"
+                            size="sm"
+                            type="button"
+                            :disabled="store.saving || !model.enabled"
+                            @click="handleSetDefault(model)">
+                            设为默认
+                        </ui-button>
+                        <ui-button
+                            variant="ghost"
+                            size="sm"
+                            type="button"
+                            :disabled="store.saving"
+                            @click="handleOpenEditDialog(model)">
+                            编辑
+                        </ui-button>
                         <ui-button
                             variant="ghost"
                             size="sm"
@@ -107,15 +138,17 @@
 
         <model-manage-model-form-dialog
             v-model:open="modelDialogOpen"
-            :group="activeGroup"
-            :save-model="handleAddModel" />
+            :group="pendingEditing?.capability ?? activeGroup"
+            :model="pendingEditing"
+            :title="pendingEditing ? '编辑模型' : '添加模型'"
+            :save-model="handleSaveModel" />
         <ui-dialog v-model:open="deleteDialogOpen">
             <ui-dialog-content>
                 <ui-dialog-header>
                     <ui-dialog-title>删除模型</ui-dialog-title>
                     <ui-dialog-description class="sr-only">确认删除当前选中的模型配置。</ui-dialog-description>
                 </ui-dialog-header>
-                <div class="text-sm text-muted-foreground">{{ pendingRemoval?.name }}</div>
+                <div class="text-sm text-muted-foreground">{{ pendingRemoval?.displayName }}</div>
                 <ui-dialog-footer class="mt-5">
                     <ui-button
                         variant="outline"
@@ -140,6 +173,7 @@
 <script setup lang="ts">
     import { Magic, Microphone, Plus } from '@icon-park/vue-next';
     import type { Component } from 'vue';
+    import { toast } from 'vue-sonner';
 
     import ModelManageModelFormDialog from '@/components/modelManage/modelFormDialog.vue';
     import ModelManageVendorMark from '@/components/modelManage/vendorMark.vue';
@@ -154,8 +188,9 @@
         DialogTitle as UiDialogTitle
     } from '@/components/ui/dialog';
     import { PageState as UiPageState } from '@/components/ui/pageState';
+    import { Switch as UiSwitch } from '@/components/ui/switch';
     import { Tabs as UiTabs, TabsList as UiTabsList, TabsTrigger as UiTabsTrigger } from '@/components/ui/tabs';
-    import type { ModelFormModel, ModelGroupType, ModelItemModel } from '@/model/modelManage';
+    import type { ModelFormModel, ModelGroupType, PrivateModelItemModel } from '@/model/modelManage';
     import { useModelManageStore } from '@/stores/modelManage';
 
     defineOptions({
@@ -165,7 +200,8 @@
     const store = useModelManageStore();
     const modelDialogOpen = ref(false);
     const activeGroup = ref<ModelGroupType>('text');
-    const pendingRemoval = ref<ModelItemModel | null>(null);
+    const pendingEditing = ref<PrivateModelItemModel | null>(null);
+    const pendingRemoval = ref<PrivateModelItemModel | null>(null);
     const deleteDialogOpen = computed({
         get: () => Boolean(pendingRemoval.value),
         set: (value: boolean) => {
@@ -198,24 +234,128 @@
         return '添加 ASR 模型后，语音转文字和语音转文字润色会使用这里的模型识别声音。';
     });
 
-    // 打开添加模型弹窗，并沿用当前 Tab 作为新增模型类型。
+    /**
+     * 弹出模型管理操作失败提示。
+     * 流程：优先展示 Error 中的安全错误说明；未知异常使用兜底文案。
+     * 参数：title 为短提示标题，error 为捕获异常，fallbackDescription 为兜底说明。
+     * 返回：无返回值。
+     * 边界：只处理用户主动操作失败，目录加载失败仍保留页面状态说明。
+     */
+    function showModelOperationError(title: string, error: unknown, fallbackDescription: string): void {
+        toast.error(title, {
+            description: error instanceof Error ? error.message : fallbackDescription
+        });
+    }
+
+    /**
+     * 打开添加模型弹窗。
+     * 流程：保留当前能力 Tab 并打开表单，弹窗据此展示对应厂商预设。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：不会创建模型或初始化密钥字段。
+     */
     function handleOpenModelDialog(): void {
+        pendingEditing.value = null;
         modelDialogOpen.value = true;
     }
 
-    // 校验模型表单后通过客户端配置接口写入当前类型的模型列表。
-    async function handleAddModel(form: ModelFormModel): Promise<void> {
-        await store.addModel(form);
+    /**
+     * 打开模型编辑弹窗。
+     * 流程：保存脱敏元数据作为编辑上下文，弹窗只回显非敏感字段且 API Key 保持为空。
+     * 参数：model 为待编辑的本机安全模型元数据。
+     * 返回：无返回值。
+     * 边界：不会读取或回填本地配置中的密钥正文。
+     */
+    function handleOpenEditDialog(model: PrivateModelItemModel): void {
+        pendingEditing.value = model;
+        modelDialogOpen.value = true;
     }
 
-    // 二次确认后通过客户端配置接口删除指定模型，避免误删当前业务正在使用的模型。
+    /**
+     * 保存新增模型。
+     * 流程：把已测试的内存表单交给 Store，通过私有 Tauri IPC 写入本地配置和密钥。
+     * 参数：form 为弹窗校验后的模型表单。
+     * 返回：保存完成 Promise。
+     * 异常：原生端保存失败时向弹窗透传，表单保持打开以便重试。
+     */
+    async function handleSaveModel(form: ModelFormModel): Promise<void> {
+        try {
+            await store.saveModel(form);
+            toast.success(form.id ? '模型配置已更新' : '模型配置已保存', {
+                description: store.message || undefined
+            });
+            store.message = '';
+            pendingEditing.value = null;
+        } catch (error) {
+            store.message = '';
+            showModelOperationError('保存模型配置失败', error, '模型配置保存失败。');
+            throw error;
+        }
+    }
+
+    /**
+     * 切换模型启用状态。
+     * 流程：通过统一 save_private_model IPC 保存状态，原生端按 ID 保留现有本地密钥。
+     * 参数：model 为目标模型，enabled 为用户选择的目标状态。
+     * 返回：操作完成 Promise。
+     * 边界：失败时 Store 保留原列表并展示错误，不做乐观状态切换。
+     */
+    async function handleToggleModel(model: PrivateModelItemModel, enabled: boolean): Promise<void> {
+        try {
+            await store.updateModelStatus(model, { enabled });
+            toast.success(enabled ? '模型已启用' : '模型已禁用', {
+                description: store.message || undefined
+            });
+            store.message = '';
+        } catch (error) {
+            store.message = '';
+            showModelOperationError('更新模型状态失败', error, '模型状态更新失败。');
+        }
+    }
+
+    /**
+     * 把模型设为能力默认项。
+     * 流程：通过统一 save_private_model IPC 设置 isDefault，原生端负责取消同能力旧默认项。
+     * 参数：model 为目标已启用模型。
+     * 返回：操作完成 Promise。
+     * 边界：禁用模型按钮不可用；失败时不修改前端默认标记。
+     */
+    async function handleSetDefault(model: PrivateModelItemModel): Promise<void> {
+        try {
+            await store.updateModelStatus(model, { isDefault: true });
+            toast.success('默认模型已更新', {
+                description: store.message || undefined
+            });
+            store.message = '';
+        } catch (error) {
+            store.message = '';
+            showModelOperationError('设置默认模型失败', error, '默认模型设置失败。');
+        }
+    }
+
+    /**
+     * 删除当前确认模型。
+     * 流程：通过私有 Tauri IPC 删除模型配置和本地密钥，成功后关闭确认弹窗。
+     * 参数：无，目标来自 pendingRemoval。
+     * 返回：删除完成 Promise。
+     * 边界：没有目标时直接返回；失败时保留弹窗并由 Store 展示错误。
+     */
     async function handleRemoveModel(): Promise<void> {
         if (!pendingRemoval.value) return;
         try {
             await store.removeModel(pendingRemoval.value.id);
             pendingRemoval.value = null;
-        } catch {
-            // Store 已经恢复删除前列表并记录错误提示，弹窗保持打开便于用户重试。
+            toast.success('模型配置已删除', {
+                description: store.message || undefined
+            });
+            store.message = '';
+        } catch (error) {
+            store.message = '';
+            showModelOperationError('删除模型配置失败', error, '模型配置删除失败。');
         }
     }
+
+    onMounted(() => {
+        void store.hydrateModelManage();
+    });
 </script>

@@ -2,7 +2,10 @@
     <sidebar-provider class="h-full min-h-0 bg-transparent text-foreground">
         <sidebar
             collapsible="none"
-            :class="['windowDragRegion w-[212px] bg-transparent px-4 pb-5', isClientRuntime ? 'pt-12' : 'pt-4']"
+            :class="[
+                'windowDragRegion hidden w-[212px] bg-transparent px-4 pb-5 md:flex',
+                isClientRuntime ? 'pt-12' : 'pt-4'
+            ]"
             data-tauri-drag-region="deep">
             <sidebar-header
                 class="mb-4 cursor-default select-none p-0"
@@ -21,7 +24,7 @@
                         <div
                             class="truncate text-[16px] font-normal leading-none text-sidebar-foreground"
                             data-tauri-drag-region>
-                            typesass
+                            CodexMan
                         </div>
                         <div
                             class="mt-1 truncate text-[10px] leading-none text-sidebar-foreground/55"
@@ -35,7 +38,7 @@
                 <sidebar-menu>
                     <sidebar-menu-item
                         v-for="item in navItems"
-                        :key="item.key">
+                        :key="item.routeName">
                         <sidebar-menu-button
                             :is-active="isNavItemActive(item.routeName)"
                             class="h-8 px-2 text-[13px] font-normal text-sidebar-foreground data-[active=true]:font-normal [&>span:last-child]:leading-5"
@@ -83,21 +86,90 @@
                 <button
                     type="button"
                     class="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent focus-visible:ring-2"
+                    :class="codexConnectionTextClass"
+                    data-disable-window-drag
+                    @click="codexConnectionStore.openDialog">
+                    <span
+                        class="h-1.5 w-1.5 shrink-0 rounded-full"
+                        :class="codexConnectionDotClass"></span>
+                    <span class="truncate">{{ codexConnectionText }}</span>
+                </button>
+                <button
+                    type="button"
+                    class="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] outline-none ring-sidebar-ring transition-colors hover:bg-sidebar-accent focus-visible:ring-2"
                     :class="clientBridgeHealthTextClass"
                     data-disable-window-drag
                     @click="handleOpenHttpApiDoc">
                     <span
                         class="h-1.5 w-1.5 shrink-0 rounded-full"
                         :class="clientBridgeHealthDotClass"></span>
-                    <span class="truncate">{{ clientBridgeHealthText }}</span>
+                    <span class="truncate">{{ publicApiHealthText }}</span>
                 </button>
             </sidebar-footer>
         </sidebar>
         <sidebar-inset
-            :class="['min-h-0 overflow-hidden bg-transparent pb-4 pr-4', isClientRuntime ? 'pt-12' : 'pt-4']">
+            :class="[
+                'min-h-0 overflow-hidden bg-transparent p-2 md:pb-4 md:pr-4',
+                isClientRuntime ? 'md:pt-12' : 'md:pt-4'
+            ]">
+            <nav
+                class="windowNoDrag mb-2 flex h-11 shrink-0 items-center gap-1 overflow-x-auto rounded-lg border border-border/70 bg-card/65 px-2 md:hidden"
+                aria-label="移动端主导航">
+                <img
+                    class="mr-1 h-7 w-7 shrink-0 rounded-md"
+                    :src="brandLogoUrl"
+                    alt="CodexMan" />
+                <button
+                    v-for="item in navItems"
+                    :key="`mobile-${item.routeName}`"
+                    type="button"
+                    class="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                    :class="isNavItemActive(item.routeName) ? 'bg-accent text-accent-foreground' : ''"
+                    :aria-label="item.label"
+                    :title="item.label"
+                    @click="handleNavigate(item.routeName)">
+                    <component
+                        :is="item.icon"
+                        theme="outline"
+                        size="17" />
+                </button>
+                <button
+                    type="button"
+                    class="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                    :class="route.name === HubRouteName.Settings ? 'bg-accent text-accent-foreground' : ''"
+                    aria-label="系统设置"
+                    title="系统设置"
+                    @click="handleNavigate(HubRouteName.Settings)">
+                    <setting
+                        theme="outline"
+                        size="17" />
+                </button>
+                <button
+                    type="button"
+                    class="grid h-8 w-8 shrink-0 place-items-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    :class="codexConnectionTextClass"
+                    :aria-label="codexConnectionText"
+                    :title="codexConnectionText"
+                    @click="codexConnectionStore.openDialog">
+                    <terminal
+                        theme="outline"
+                        size="17" />
+                </button>
+                <button
+                    type="button"
+                    class="ml-auto grid h-8 w-8 shrink-0 place-items-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    :class="clientBridgeHealthTextClass"
+                    aria-label="HTTP API 文档"
+                    title="HTTP API 文档"
+                    @click="handleOpenHttpApiDoc">
+                    <link-break
+                        theme="outline"
+                        size="17" />
+                </button>
+            </nav>
             <div
                 v-if="isClientRuntime"
-                class="windowDragRegion absolute inset-x-0 top-0 z-20 h-12 cursor-default select-none"
+                class="windowDragRegion absolute inset-x-0 top-0 z-20 hidden h-12 cursor-default select-none md:block"
                 data-tauri-drag-region="deep"></div>
             <div
                 v-if="isClientRuntime"
@@ -108,7 +180,8 @@
                 class="windowDragRegion absolute inset-x-0 bottom-0 h-4"
                 data-tauri-drag-region="deep"></div>
             <div
-                class="windowNoDrag relative min-h-0 flex-1 overflow-y-auto rounded-lg border border-border/70 bg-card/65 p-6 backdrop-blur">
+                class="windowNoDrag relative min-h-0 flex-1 rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6"
+                :class="route.name === HubRouteName.TaskManage ? 'overflow-hidden' : 'overflow-y-auto'">
                 <router-view v-slot="{ Component, route: viewRoute }">
                     <transition
                         mode="out-in"
@@ -135,9 +208,9 @@
                                     size="22" />
                             </span>
                             <div class="grid gap-1.5">
-                                <h2 class="text-[17px] font-semibold leading-7 text-foreground">APP 服务未连接</h2>
+                                <h2 class="text-[17px] font-semibold leading-7 text-foreground">HTTP 服务未连接</h2>
                                 <p class="text-[13px] leading-6 text-muted-foreground">
-                                    当前 Web 页面还没有连接到本机 typesass App。连接恢复后，这层提示会自动消失。
+                                    当前 Web 页面无法连接 CodexMan HTTP 服务。服务恢复后，这层提示会自动消失。
                                 </p>
                             </div>
                         </section>
@@ -145,6 +218,7 @@
                 </transition>
             </div>
         </sidebar-inset>
+        <codex-connection-dialog />
     </sidebar-provider>
 </template>
 
@@ -162,7 +236,8 @@
         Terminal
     } from '@icon-park/vue-next';
 
-    import brandLogoUrl from '@/assets/typesass-logo.png';
+    import brandLogoUrl from '@/assets/codexManLogo.png';
+    import CodexConnectionDialog from '@/components/layout/codexConnectionDialog.vue';
     import {
         Sidebar,
         SidebarContent,
@@ -176,7 +251,8 @@
     } from '@/components/ui/sidebar';
     import { Switch as UiSwitch } from '@/components/ui/switch';
     import { HubRouteName } from '@/router';
-    import { checkClientHttpBridgeHealth, isTauriRuntime, listenEvent } from '@/service/tauri/command';
+    import { checkPublicApiHealth, isTauriRuntime, listenEvent } from '@/service/tauri/command';
+    import { useCodexConnectionStore } from '@/stores/codexConnection';
     import { usePermissionStore } from '@/stores/permission';
     import { useSettingsStore } from '@/stores/settings';
     import { useTextPolishStore } from '@/stores/textPolish';
@@ -187,12 +263,15 @@
     });
 
     const permissionStore = usePermissionStore();
+    const codexConnectionStore = useCodexConnectionStore();
     const settingsStore = useSettingsStore();
     const textPolishStore = useTextPolishStore();
     const voicePolishStore = useVoicePolishStore();
     const route = useRoute();
     const router = useRouter();
     const isClientRuntime = isTauriRuntime();
+    /** 公共 HTTP 健康检查间隔；30 秒可及时恢复状态，同时避免高频请求淹没业务访问日志。 */
+    const PUBLIC_API_HEALTH_INTERVAL_MS = 30_000;
     const clientBridgeHealthy = ref(false);
     let clientBridgeHealthTimer: number | undefined;
 
@@ -208,20 +287,62 @@
     const showClientBridgeOverlay = computed(() => {
         return !isClientRuntime && !clientBridgeHealthy.value && route.name !== HubRouteName.HttpApiDoc;
     });
-    const clientBridgeHealthText = computed(() => (clientBridgeHealthy.value ? 'APP 服务已连接' : 'APP 服务未连接'));
+    const publicApiHealthText = computed(() => (clientBridgeHealthy.value ? 'HTTP 服务已连接' : 'HTTP 服务未连接'));
     const clientBridgeHealthDotClass = computed(() =>
         clientBridgeHealthy.value ? 'bg-emerald-500' : 'bg-sidebar-foreground/35'
     );
     const clientBridgeHealthTextClass = computed(() =>
         clientBridgeHealthy.value ? 'text-sidebar-foreground' : 'text-sidebar-foreground/45'
     );
+    /** Codex 连接状态行的实时中文文案。 */
+    const codexConnectionText = computed<string>(() => {
+        if (codexConnectionStore.connectionState === 'checking') return 'Codex 检测中';
+        if (codexConnectionStore.connectionState === 'connected') return 'Codex 已连接';
+        if (codexConnectionStore.connectionState === 'disconnected') return 'Codex 未连接';
+        if (codexConnectionStore.connectionState === 'restarting') return 'Codex 重启中';
+        if (codexConnectionStore.connectionState === 'blocked') return 'Codex 连接受阻';
+        if (codexConnectionStore.connectionState === 'unsupported') return 'Codex 不受支持';
+        return 'Codex 状态未知';
+    });
+    /** Codex 状态圆点颜色；检测和重启使用脉冲提示状态仍在变化。 */
+    const codexConnectionDotClass = computed<string>(() => {
+        if (codexConnectionStore.connectionState === 'connected') return 'bg-emerald-500';
+        if (
+            codexConnectionStore.connectionState === 'disconnected' ||
+            codexConnectionStore.connectionState === 'blocked'
+        ) {
+            return 'bg-destructive';
+        }
+        if (
+            codexConnectionStore.connectionState === 'checking' ||
+            codexConnectionStore.connectionState === 'restarting'
+        ) {
+            return 'animate-pulse bg-primary';
+        }
+        return 'bg-sidebar-foreground/35';
+    });
+    /** Codex 状态入口文字颜色，明确断连使用危险色，其余状态保持侧栏层级。 */
+    const codexConnectionTextClass = computed<string>(() => {
+        if (
+            codexConnectionStore.connectionState === 'disconnected' ||
+            codexConnectionStore.connectionState === 'blocked'
+        ) {
+            return 'text-destructive';
+        }
+        if (
+            codexConnectionStore.connectionState === 'unknown' ||
+            codexConnectionStore.connectionState === 'unsupported'
+        ) {
+            return 'text-sidebar-foreground/45';
+        }
+        return 'text-sidebar-foreground';
+    });
 
     /**
      * Tauri Hub 事件传入的视图键与真实页面路由的映射。
-     * 业务含义：原生托盘或快捷键仍可以按旧 view key 通知前端，但前端统一落到 Vue Router 页面。
+     * 业务含义：原生托盘或快捷键只能通知当前真实存在的页面，首发版本不兼容已下线的旧入口。
      */
     const routeNameByHubView = {
-        subtitle: HubRouteName.VoicePolish,
         voicePolish: HubRouteName.VoicePolish,
         textPolish: HubRouteName.TextPolish,
         sessionManage: HubRouteName.SessionManage,
@@ -262,11 +383,11 @@
     }
 
     /**
-     * 打开 App HTTP API 文档页。
-     * 流程：点击侧边栏底部 App 服务状态时跳转到文档路由，由文档页读取 `/openapi.json` 渲染。
+     * 打开公共 HTTP API 文档页。
+     * 流程：点击侧边栏底部服务状态时跳转到文档路由，由文档页读取 `/openapi.json` 渲染。
      * 参数：无。
      * 返回：无返回值。
-     * 边界：App 服务未连接时仍允许进入页面，页面会展示文档读取失败原因。
+     * 边界：HTTP 服务未连接时仍允许进入页面，页面会展示文档读取失败原因。
      */
     function handleOpenHttpApiDoc(): void {
         handleNavigate(HubRouteName.HttpApiDoc);
@@ -287,18 +408,18 @@
     }
 
     /**
-     * 刷新 App HTTP 桥接健康状态。
-     * 流程：请求客户端 `/health` 端点，并把成功结果同步到侧边栏状态行。
+     * 刷新公共 HTTP 服务健康状态。
+     * 流程：请求独立服务 `/health` 端点，并把成功结果同步到侧边栏状态行。
      * 参数：无。
      * 返回：刷新完成 Promise。
      * 边界：客户端未启动、端口不可达或响应异常时统一显示未连接，不打断页面其它功能。
      */
     async function refreshClientBridgeHealth(): Promise<void> {
-        clientBridgeHealthy.value = await checkClientHttpBridgeHealth();
+        clientBridgeHealthy.value = await checkPublicApiHealth();
     }
 
     /**
-     * 启动 App HTTP 桥接健康状态轮询。
+     * 启动公共 HTTP 服务健康状态轮询。
      * 流程：页面挂载后立即检查一次，再按固定间隔持续刷新。
      * 参数：无。
      * 返回：无返回值。
@@ -308,12 +429,13 @@
         void refreshClientBridgeHealth();
         clientBridgeHealthTimer = window.setInterval(() => {
             void refreshClientBridgeHealth();
-        }, 3000);
+        }, PUBLIC_API_HEALTH_INTERVAL_MS);
     }
 
     onMounted(async () => {
         settingsStore.applyThemeMode(settingsStore.settings.themeMode);
         startClientBridgeHealthPolling();
+        codexConnectionStore.startPolling();
         await permissionStore.refreshPermissions();
         await listenEvent<string>('hub-switch-view', (view) => {
             if (isHubSwitchViewKey(view)) {
@@ -331,6 +453,7 @@
     });
 
     onUnmounted(() => {
+        codexConnectionStore.stopPolling();
         if (clientBridgeHealthTimer !== undefined) {
             window.clearInterval(clientBridgeHealthTimer);
         }

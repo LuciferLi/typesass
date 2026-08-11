@@ -14,10 +14,10 @@
                         </ui-select-trigger>
                         <ui-select-content>
                             <ui-select-item
-                                v-for="model in modelStore.groupModels('asr')"
+                                v-for="model in modelStore.enabledServiceModels('asr')"
                                 :key="model.id"
                                 :value="model.id">
-                                {{ model.name }} · {{ model.model }}
+                                {{ model.displayName }}
                             </ui-select-item>
                         </ui-select-content>
                     </ui-select-root>
@@ -31,10 +31,10 @@
                         </ui-select-trigger>
                         <ui-select-content>
                             <ui-select-item
-                                v-for="model in modelStore.groupModels('text')"
+                                v-for="model in modelStore.enabledServiceModels('text')"
                                 :key="model.id"
                                 :value="model.id">
-                                {{ model.name }} · {{ model.model }}
+                                {{ model.displayName }}
                             </ui-select-item>
                         </ui-select-content>
                     </ui-select-root>
@@ -125,11 +125,21 @@
         return '选择语音转文字润色使用的 ASR 模型和润色模型。';
     });
     const asrModelId = computed({
-        get: () => store.selectedAsrModelId,
-        set: (value: string) => store.updateModelSelection(value, store.selectedTextModelId)
+        get: () => store.asrModelId,
+        set: (value: string) => {
+            store.asrModelId = value;
+            store.persistVoicePolish();
+        }
     });
     const textModelId = computed({
-        get: () => store.selectedTextModelId,
-        set: (value: string) => store.updateModelSelection(store.selectedAsrModelId, value)
+        get: () => store.textModelId,
+        set: (value: string) => {
+            store.textModelId = value;
+            store.persistVoicePolish();
+        }
+    });
+
+    onMounted(() => {
+        void modelStore.hydrateModelManage();
     });
 </script>

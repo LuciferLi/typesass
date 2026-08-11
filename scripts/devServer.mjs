@@ -27,7 +27,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(port, () => {
-  process.stdout.write(`typesass 网页预览：http://127.0.0.1:${port}\n`);
+  process.stdout.write(`CodexMan 网页预览：http://127.0.0.1:${port}\n`);
 });
 
 /** 提供构建后的前端静态资源。 */
