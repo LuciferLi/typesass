@@ -1,6 +1,6 @@
 <template>
-    <section class="h-full min-h-0 w-full max-w-full overflow-hidden">
-        <div class="grid h-full min-h-0 w-full grid-cols-5 gap-3">
+    <section class="flex h-full min-h-0 w-full max-w-full overflow-x-auto overflow-y-hidden pb-2">
+        <div class="grid h-full min-h-0 w-full min-w-[1180px] max-w-[1480px] grid-cols-5 gap-3 overflow-hidden">
             <section
                 v-for="column in columns"
                 :key="column.status"
@@ -31,13 +31,20 @@
                         </ui-button>
                     </div>
                 </header>
-                <div class="grid min-h-0 flex-1 basis-0 content-start gap-2 overflow-y-auto overscroll-contain p-2">
+                <div
+                    class="flex min-h-0 flex-1 basis-0 flex-col gap-2 overflow-y-auto overscroll-contain p-2 pr-1"
+                    data-disable-window-drag>
                     <article
                         v-for="task in taskListByStatus(column.status)"
                         :key="task.id"
-                        class="grid gap-3 rounded-md border border-border bg-background p-3 shadow-sm"
+                        class="grid shrink-0 cursor-pointer gap-3 rounded-md border border-border bg-background p-3 shadow-sm transition-colors hover:border-primary/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                         draggable="true"
-                        @dragstart="handleDragStart(task)">
+                        role="button"
+                        tabindex="0"
+                        @click="emit('detail', task)"
+                        @dragstart="handleDragStart(task)"
+                        @keydown.enter.prevent="emit('detail', task)"
+                        @keydown.space.prevent="emit('detail', task)">
                         <div class="flex items-start justify-between gap-2">
                             <div class="min-w-0">
                                 <div class="line-clamp-2 text-[13px] font-medium leading-5 text-foreground">
@@ -52,7 +59,7 @@
                                 size="icon-sm"
                                 type="button"
                                 :disabled="!task.externalThreadId"
-                                @click="emit('open', task.externalThreadId)">
+                                @click.stop="emit('open', task.externalThreadId)">
                                 <focus
                                     theme="outline"
                                     size="15" />
@@ -75,7 +82,7 @@
                                     type="button"
                                     :disabled="saving"
                                     title="修改任务"
-                                    @click="emit('edit', task)">
+                                    @click.stop="emit('edit', task)">
                                     <edit
                                         theme="outline"
                                         size="15" />
@@ -87,7 +94,7 @@
                                     size="icon-sm"
                                     type="button"
                                     :disabled="saving"
-                                    @click="emit('queue', task.id)">
+                                    @click.stop="emit('queue', task.id)">
                                     <play-one
                                         theme="outline"
                                         size="15" />
@@ -99,7 +106,7 @@
                                     size="icon-sm"
                                     type="button"
                                     :disabled="saving"
-                                    @click="emit('complete', task.id)">
+                                    @click.stop="emit('complete', task.id)">
                                     <check-one
                                         theme="outline"
                                         size="15" />
@@ -112,7 +119,7 @@
                                     type="button"
                                     :disabled="saving"
                                     title="删除任务"
-                                    @click="emit('delete', task)">
+                                    @click.stop="emit('delete', task)">
                                     <delete
                                         theme="outline"
                                         size="15" />
@@ -164,6 +171,8 @@
         edit: [task: SessionTaskModel];
         // 删除非进行中任务。
         delete: [task: SessionTaskModel];
+        // 查看任务详情。
+        detail: [task: SessionTaskModel];
     }>();
 
     const draggingTask = ref<SessionTaskModel | null>(null);

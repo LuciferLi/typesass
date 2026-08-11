@@ -1,6 +1,6 @@
 <template>
-    <div class="grid h-full min-h-0 min-w-0 overflow-hidden">
-        <section class="grid h-full min-h-0 min-w-0 grid-rows-[auto_auto_minmax(0,1fr)] gap-4 overflow-hidden">
+    <div class="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+        <section class="flex h-full min-h-0 min-w-0 flex-col gap-4 overflow-hidden">
             <div class="grid min-w-0 grid-cols-[minmax(280px,420px)_minmax(0,1fr)_auto] items-center gap-3">
                 <div class="grid min-w-[280px] max-w-full gap-2 sm:w-[420px]">
                     <span class="text-[13px] font-medium text-foreground">工作空间</span>
@@ -81,7 +81,7 @@
                 {{ store.message }}
             </p>
 
-            <div class="h-full min-h-0 min-w-0 flex-1 overflow-hidden">
+            <div class="min-h-0 min-w-0 flex-1 overflow-hidden">
                 <ui-page-state
                     v-if="store.loading"
                     :icon="Folder"
@@ -112,6 +112,7 @@
                     :tasks="store.tasks"
                     :saving="store.saving"
                     @create="handleOpenTaskDialog"
+                    @detail="handleOpenTaskDetailSheet"
                     @edit="handleOpenEditTaskDialog"
                     @delete="handleOpenDeleteTaskDialog"
                     @queue="handleQueueTask"
@@ -119,6 +120,10 @@
                     @open="handleOpenThread" />
             </div>
         </section>
+
+        <task-manage-task-detail-sheet
+            v-model:open="taskDetailSheetOpen"
+            :task="detailTask" />
 
         <ui-dialog v-model:open="projectDialogOpen">
             <ui-dialog-content>
@@ -264,6 +269,7 @@
     import { toast } from 'vue-sonner';
 
     import TaskManageTaskBoard from '@/components/taskManage/taskBoard.vue';
+    import TaskManageTaskDetailSheet from '@/components/taskManage/taskDetailSheet.vue';
     import { Button as UiButton } from '@/components/ui/button';
     import {
         Dialog as UiDialog,
@@ -305,6 +311,8 @@
     const editingTaskId = ref('');
     const deleteTaskDialogOpen = ref(false);
     const pendingDeleteTask = ref<SessionTaskModel | null>(null);
+    const taskDetailSheetOpen = ref(false);
+    const detailTask = ref<SessionTaskModel | null>(null);
     const projectForm = reactive({
         name: '',
         workspacePath: ''
@@ -468,6 +476,18 @@
         if (task.status === 'running') return;
         pendingDeleteTask.value = task;
         deleteTaskDialogOpen.value = true;
+    }
+
+    /**
+     * 打开任务详情侧窗。
+     * 流程：记录当前点击的任务对象，并打开右侧 Sheet 展示完整任务信息。
+     * 参数：task 为当前点击的看板任务。
+     * 返回：无返回值。
+     * 边界：任务按钮事件会阻止冒泡，不会误触发详情侧窗。
+     */
+    function handleOpenTaskDetailSheet(task: SessionTaskModel): void {
+        detailTask.value = task;
+        taskDetailSheetOpen.value = true;
     }
 
     /**
