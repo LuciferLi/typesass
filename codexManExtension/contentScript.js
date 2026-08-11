@@ -24,6 +24,11 @@ const CODEXMAN_OVERLAY_STYLE = `
     font-size: 13px;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     --codexman-blue: #0069fb;
+    --typesass-primary: #8b5cf6;
+    --typesass-border: #27272a;
+    --typesass-surface: #18181b;
+    --typesass-foreground: #f4f4f5;
+    --typesass-muted: #a1a1aa;
   }
 
   .interaction-layer {
@@ -96,14 +101,14 @@ const CODEXMAN_OVERLAY_STYLE = `
     width: max-content;
     max-width: 200px;
     border-radius: 8px;
-    outline: 1px solid rgba(15, 23, 42, 0.08);
-    background: white;
-    color: rgb(15, 23, 42);
+    outline: 1px solid var(--typesass-border);
+    background: var(--typesass-surface);
+    color: var(--typesass-foreground);
     padding: 8px 10px;
     box-sizing: border-box;
     font-size: 13px;
     line-height: 1.25;
-    box-shadow: 0px 2px 4px -1px rgba(0, 0, 0, 0.08);
+    box-shadow: 0px 12px 32px rgba(0, 0, 0, 0.24);
     pointer-events: none;
   }
 
@@ -119,7 +124,7 @@ const CODEXMAN_OVERLAY_STYLE = `
     min-width: 0;
     max-width: 90px;
     overflow: hidden;
-    color: rgb(28, 28, 28);
+    color: var(--typesass-foreground);
     font-weight: 700;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -128,7 +133,7 @@ const CODEXMAN_OVERLAY_STYLE = `
   .element-metadata-size,
   .element-metadata-selector {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-    color: rgb(100, 116, 139);
+    color: var(--typesass-muted);
   }
 
   .element-metadata-size {
@@ -146,11 +151,12 @@ const CODEXMAN_OVERLAY_STYLE = `
   .comment-editor {
     position: fixed;
     z-index: 4;
-    width: 260px;
+    width: 276px;
     padding: 10px;
-    border-radius: 10px;
-    background: #ffffff;
-    box-shadow: 0 16px 42px rgba(15, 23, 42, 0.26);
+    border: 1px solid var(--typesass-border);
+    border-radius: 8px;
+    background: var(--typesass-surface);
+    box-shadow: 0 16px 42px rgba(0, 0, 0, 0.32);
     pointer-events: auto;
   }
 
@@ -159,10 +165,11 @@ const CODEXMAN_OVERLAY_STYLE = `
     width: 100%;
     min-height: 82px;
     resize: vertical;
-    border: 1px solid #d8e1ef;
+    border: 1px solid #3f3f46;
     border-radius: 8px;
     padding: 8px;
-    color: #172033;
+    color: var(--typesass-foreground);
+    background: #09090b;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 13px;
     line-height: 1.5;
@@ -191,12 +198,12 @@ const CODEXMAN_OVERLAY_STYLE = `
 
   .button-primary {
     color: #ffffff;
-    background: var(--codexman-blue);
+    background: var(--typesass-primary);
   }
 
   .button-plain {
-    color: #32415c;
-    background: #eef3fb;
+    color: #e4e4e7;
+    background: #27272a;
   }
 
   .button-danger {
@@ -213,16 +220,16 @@ const CODEXMAN_OVERLAY_STYLE = `
     align-items: center;
     gap: 8px;
     padding: 8px;
-    border: 1px solid rgba(0, 105, 251, 0.22);
-    border-radius: 10px;
-    background: #ffffff;
-    box-shadow: 0 14px 34px rgba(15, 23, 42, 0.22);
+    border: 1px solid var(--typesass-border);
+    border-radius: 8px;
+    background: var(--typesass-surface);
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
     pointer-events: auto;
   }
 
   .action-bar-count {
     min-width: 54px;
-    color: #475569;
+    color: var(--typesass-muted);
     font-size: 13px;
     font-weight: 600;
   }
@@ -236,32 +243,14 @@ const CODEXMAN_OVERLAY_STYLE = `
     padding: 10px 14px;
     border-radius: 8px;
     color: #ffffff;
-    background: rgba(23, 32, 51, 0.94);
-    box-shadow: 0 12px 28px rgba(15, 23, 42, 0.22);
+    background: rgba(24, 24, 27, 0.96);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
     transform: translateX(-50%);
     font-size: 13px;
     line-height: 1.5;
     pointer-events: none;
   }
 
-  @media (prefers-color-scheme: dark) {
-    .element-metadata-tooltip,
-    .comment-editor,
-    .action-bar {
-      background: rgba(15, 23, 42, 0.95);
-      color: white;
-    }
-
-    .element-metadata-tag {
-      color: white;
-    }
-
-    .element-metadata-size,
-    .element-metadata-selector,
-    .action-bar-count {
-      color: rgba(226, 232, 240, 0.72);
-    }
-  }
 `;
 
 /**
@@ -523,7 +512,7 @@ function createMarker(id) {
   marker.className = "marker";
   marker.dataset.browserCommentMarker = "true";
   marker.dataset.annotationId = String(id);
-  marker.setAttribute("aria-label", `编辑第 ${id} 个浏览器评论`);
+  marker.setAttribute("aria-label", `编辑第 ${id} 个 Typesass 浏览器评论`);
   marker.innerHTML = `
     <svg aria-hidden="true" class="marker-icon" height="25" viewBox="0 0 26 25" width="26">
       <path d="M12.6504 0.824799C6.21496 0.824799 0.825466 5.77554 0.825195 12.0885C0.825245 14.2375 1.46183 16.2421 2.55176 17.943L2.02148 20.235L1.99316 20.3756C1.77603 21.655 2.78945 22.7791 4.02832 22.7691L4.0791 22.8209L4.53418 22.7047L7.12305 22.0426C8.77593 22.8778 10.6577 23.3531 12.6504 23.3531C19.086 23.3531 24.4754 18.4014 24.4756 12.0885C24.4753 5.77554 19.0858 0.824799 12.6504 0.824799Z" fill="#0069FB" stroke="white" stroke-width="1.65"></path>
@@ -548,7 +537,7 @@ function createMarker(id) {
 function updateAnnotationId(annotation, id) {
   annotation.id = id;
   annotation.marker.dataset.annotationId = String(id);
-  annotation.marker.setAttribute("aria-label", `编辑第 ${id} 个浏览器评论`);
+  annotation.marker.setAttribute("aria-label", `编辑第 ${id} 个 Typesass 浏览器评论`);
   const label = annotation.marker.querySelector(".marker-label");
   if (label) {
     label.textContent = String(id);
@@ -937,6 +926,7 @@ function sendAnnotations() {
     return;
   }
   closeEditor();
+  showToast("正在创建 Typesass 任务");
   void chrome.runtime.sendMessage({
     type: "CODEXMAN_COMMENTS_CONFIRMED",
     payload: {
@@ -1179,7 +1169,10 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "CODEXMAN_DOWNLOAD_REPORT") {
     restoreAnnotationDisplay();
     downloadReportHtml(message.html, message.filename);
-    showToast("Browser comments 报告已保存到下载目录");
+    showToast("任务已创建，Browser comments 报告已保存");
+  }
+  if (message?.type === "TYPESASS_TASK_CREATED") {
+    showToast(`任务已创建：${message.payload?.title || message.payload?.createdTaskId || ""}`);
   }
   if (message?.type === "CODEXMAN_PREPARE_COMMENT_SCREENSHOT") {
     prepareCommentScreenshot(message.annotationId);

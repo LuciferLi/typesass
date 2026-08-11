@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "codexManExtension",
+  "name": "typesass-extension",
   "version": "0.1.0",
-  "description": "Select page elements, capture screenshots, and save selector reports.",
+  "description": "Select page elements and create Typesass tasks with Codex Browser comments evidence.",
   "action": {
-    "default_title": "codexManExtension",
+    "default_title": "typesass-extension",
     "default_popup": "popup.html"
   },
   "background": {

@@ -31,6 +31,17 @@
                         size="icon-sm"
                         variant="outline"
                         type="button"
+                        title="浏览器插件"
+                        @click="browserExtensionDialogOpen = true">
+                        <puzzle
+                            theme="outline"
+                            size="15" />
+                        <span class="sr-only">浏览器插件</span>
+                    </ui-button>
+                    <ui-button
+                        size="icon-sm"
+                        variant="outline"
+                        type="button"
                         :disabled="store.loading"
                         @click="handleRefreshWorkspaces">
                         <refresh
@@ -261,11 +272,64 @@
                 </ui-dialog-footer>
             </ui-dialog-content>
         </ui-dialog>
+
+        <ui-dialog v-model:open="browserExtensionDialogOpen">
+            <ui-dialog-content class="max-w-[560px]">
+                <ui-dialog-header>
+                    <ui-dialog-title>浏览器插件</ui-dialog-title>
+                    <ui-dialog-description>
+                        下载 typesass-extension 后，在 Chrome 中加载已解压的扩展即可从网页创建任务。
+                    </ui-dialog-description>
+                </ui-dialog-header>
+                <div class="grid gap-4">
+                    <div class="rounded-lg border border-border bg-card p-4">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="grid gap-1">
+                                <span class="text-[13px] font-medium text-foreground">插件下载</span>
+                                <span class="text-[12px] leading-5 text-muted-foreground">
+                                    ZIP 包内是完整 Chrome 插件源码，解压后可直接加载。
+                                </span>
+                            </div>
+                            <ui-button
+                                type="button"
+                                @click="handleDownloadBrowserExtension">
+                                <download
+                                    theme="outline"
+                                    size="16" />
+                                <span>下载 ZIP</span>
+                            </ui-button>
+                        </div>
+                    </div>
+                    <div class="rounded-lg border border-border bg-card p-4">
+                        <div class="grid gap-2">
+                            <span class="text-[13px] font-medium text-foreground">使用说明</span>
+                            <p class="text-[12px] leading-5 text-muted-foreground">
+                                将下载的 ZIP 解压，打开 Chrome
+                                的扩展管理页，开启开发者模式，把解压后的插件目录拖入浏览器即可安装。
+                            </p>
+                            <p class="text-[12px] leading-5 text-muted-foreground">
+                                首次使用时在插件弹窗中获取 App 授权码并选择任务项目；之后在任意网页右键启用 Typesass
+                                选择器，选择一个或多个元素，填写描述后点击发送全部，插件会把同 Codex Browser comments
+                                一致的标注格式写入任务内容，并在当前项目中创建任务。
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                <ui-dialog-footer>
+                    <ui-button
+                        variant="outline"
+                        type="button"
+                        @click="browserExtensionDialogOpen = false">
+                        关闭
+                    </ui-button>
+                </ui-dialog-footer>
+            </ui-dialog-content>
+        </ui-dialog>
     </div>
 </template>
 
 <script setup lang="ts">
-    import { Delete, Edit, Folder, FolderPlus, Plus, Refresh } from '@icon-park/vue-next';
+    import { Delete, Download, Edit, Folder, FolderPlus, Plus, Puzzle, Refresh } from '@icon-park/vue-next';
     import { toast } from 'vue-sonner';
 
     import TaskManageTaskBoard from '@/components/taskManage/taskBoard.vue';
@@ -313,6 +377,7 @@
     const pendingDeleteTask = ref<SessionTaskModel | null>(null);
     const taskDetailSheetOpen = ref(false);
     const detailTask = ref<SessionTaskModel | null>(null);
+    const browserExtensionDialogOpen = ref(false);
     const projectForm = reactive({
         name: '',
         workspacePath: ''
@@ -650,6 +715,23 @@
         void store.openExternalThread(threadId).catch((error: unknown) => {
             showTaskOperationError('打开 CodeX 会话失败', error, '打开 CodeX 会话失败。');
         });
+    }
+
+    /**
+     * 下载浏览器插件 ZIP 包。
+     * 流程：通过静态资源地址创建一次隐藏链接并触发浏览器下载。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：下载文件由构建前的插件打包产物提供，页面不在运行时拼接 ZIP。
+     */
+    function handleDownloadBrowserExtension(): void {
+        const link = document.createElement('a');
+        link.href = '/downloads/typesass-extension.zip';
+        link.download = 'typesass-extension.zip';
+        link.rel = 'noopener';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
     }
 
     onMounted(() => {

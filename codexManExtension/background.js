@@ -1,4 +1,9 @@
-const CODEXMAN_CONTEXT_MENU_ID = "codexman-start-picker";
+const CODEXMAN_CONTEXT_MENU_ID = "typesass-start-picker";
+const TYPESASS_API_BASE_URL = "http://127.0.0.1:18080";
+const TYPESASS_STORAGE_KEYS = {
+  accessToken: "typesassAccessToken",
+  projectId: "typesassProjectId"
+};
 
 /**
  * 注册浏览器右键菜单入口，便于在页面内直接启用选择器。
@@ -8,10 +13,187 @@ function registerContextMenu() {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
       id: CODEXMAN_CONTEXT_MENU_ID,
-      title: "启用 CodexMan 选择器",
+      title: "启用 Typesass 选择器",
       contexts: ["page", "selection", "link", "image", "video", "audio", "editable"]
     });
   });
+}
+
+/**
+ * 读取插件本地保存的 App 授权码和任务项目 ID。
+ * @returns {Promise<{accessToken:string, projectId:string}>} 当前插件设置。
+ */
+async function getTypesassSettings() {
+  const settings = await chrome.storage.local.get([
+    TYPESASS_STORAGE_KEYS.accessToken,
+    TYPESASS_STORAGE_KEYS.projectId
+  ]);
+  return {
+    accessToken: String(settings[TYPESASS_STORAGE_KEYS.accessToken] || ""),
+    projectId: String(settings[TYPESASS_STORAGE_KEYS.projectId] || "")
+  };
+}
+
+/**
+ * 保存插件与 Typesass App 通信用的授权码和任务项目 ID。
+ * @param {{accessToken?:string, projectId?:string}} settings 待保存设置。
+ * @returns {Promise<void>} 无返回值。
+ */
+async function saveTypesassSettings(settings) {
+  await chrome.storage.local.set({
+    [TYPESASS_STORAGE_KEYS.accessToken]: String(settings.accessToken || "").trim(),
+    [TYPESASS_STORAGE_KEYS.projectId]: String(settings.projectId || "").trim()
+  });
+}
+
+/**
+ * 调用 Typesass App 本机 HTTP 服务。
+ * @param {string} path 接口路径。
+ * @param {{method?:string, payload?:unknown, token?:string, timeoutMs?:number}=} options 请求配置。
+ * @returns {Promise<unknown>} 解析后的 JSON 响应。
+ */
+async function requestTypesassApi(path, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs || 12000);
+  const headers = { Accept: "application/json", "X-Request-ID": crypto.randomUUID() };
+  if (options.payload !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (options.token) {
+    headers.Authorization = `Bearer ${options.token}`;
+  }
+  try {
+    const response = await fetch(`${TYPESASS_API_BASE_URL}${path}`, {
+      method: options.method || "GET",
+      headers,
+      body: options.payload === undefined ? undefined : JSON.stringify(options.payload),
+      cache: "no-store",
+      signal: controller.signal
+    });
+    const text = await response.text();
+    const json = text ? JSON.parse(text) : null;
+    if (response.ok) {
+      return json;
+    }
+    const error = json?.error || {};
+    throw new Error(error.message || `Typesass HTTP 请求失败（${response.status}）`);
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Typesass App HTTP 服务请求超时，请确认 App 已打开。");
+    }
+    if (error instanceof TypeError) {
+      throw new Error("无法连接 Typesass App，请先打开 App 后重试。");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 检查 Typesass App 本机 HTTP 服务是否可用。
+ * @returns {Promise<{ok:boolean, name:string}>} 健康检查结果。
+ */
+async function checkTypesassHealth() {
+  return await requestTypesassApi("/health", { timeoutMs: 1600 });
+}
+
+/**
+ * 申请 App 授权码并保存到插件本地。
+ * @returns {Promise<{accessToken:string, expiresAt:string|null}>} 已批准的明文授权码。
+ */
+async function requestTypesassAccessToken() {
+  const response = await requestTypesassApi("/v1/access-tokens/request", {
+    method: "POST",
+    payload: {
+      name: "typesass-extension",
+      expiresAt: null
+    }
+  });
+  if (response?.status !== "approved" || !response.accessToken) {
+    throw new Error("授权申请未通过，请在 Typesass App 中确认授权。");
+  }
+  const settings = await getTypesassSettings();
+  await saveTypesassSettings({ ...settings, accessToken: response.accessToken });
+  return response;
+}
+
+/**
+ * 读取 App 任务项目列表，供插件选择创建任务的目标项目。
+ * @param {string} token App 授权码。
+ * @returns {Promise<Array<{id:string,name:string,workspacePath:string}>>} 项目列表。
+ */
+async function listTypesassProjects(token) {
+  if (!token) {
+    throw new Error("请先在插件中获取并保存 App 授权码。");
+  }
+  const data = await requestTypesassApi("/v1/task-workspace/query", {
+    method: "POST",
+    payload: {},
+    token
+  });
+  return Array.isArray(data?.projects) ? data.projects : [];
+}
+
+/**
+ * 解析本次创建任务使用的项目 ID。
+ * @param {string} token App 授权码。
+ * @returns {Promise<string>} 任务项目 ID。
+ */
+async function resolveTypesassProjectId(token) {
+  const settings = await getTypesassSettings();
+  if (settings.projectId) {
+    return settings.projectId;
+  }
+  const projects = await listTypesassProjects(token);
+  if (projects.length === 1 && projects[0]?.id) {
+    await saveTypesassSettings({ ...settings, projectId: projects[0].id });
+    return projects[0].id;
+  }
+  if (projects.length === 0) {
+    throw new Error("Typesass App 中还没有任务项目，请先在任务管理页面创建项目。");
+  }
+  throw new Error("检测到多个任务项目，请先在插件弹窗中选择目标项目。");
+}
+
+/**
+ * 根据多个点位描述生成任务标题。
+ * @param {Array<{comment?:string}>} comments 浏览器评论列表。
+ * @returns {string} 任务标题。
+ */
+function buildTaskTitle(comments) {
+  const descriptions = comments
+    .map((comment) => String(comment.comment || "").trim())
+    .filter(Boolean);
+  const title = descriptions.length > 0 ? descriptions.join(" / ") : "浏览器元素标注任务";
+  return title.slice(0, 200);
+}
+
+/**
+ * 调用 App HTTP 接口创建任务，任务内容保持 Codex Browser comments 格式。
+ * @param {{markdown:string, comments:Array<{comment?:string}>}} payload 多点标注数据。
+ * @returns {Promise<{createdTaskId:string, title:string}>} 创建结果。
+ */
+async function createTypesassTask(payload) {
+  const settings = await getTypesassSettings();
+  if (!settings.accessToken) {
+    throw new Error("请先在插件弹窗中获取 App 授权码。");
+  }
+  const projectId = await resolveTypesassProjectId(settings.accessToken);
+  const title = buildTaskTitle(payload.comments || []);
+  const response = await requestTypesassApi("/v1/tasks", {
+    method: "POST",
+    token: settings.accessToken,
+    payload: {
+      projectId,
+      title,
+      prompt: payload.markdown || title
+    }
+  });
+  if (!response?.createdTaskId) {
+    throw new Error("Typesass App 没有返回创建的任务 ID。");
+  }
+  return { createdTaskId: response.createdTaskId, title };
 }
 
 /**
@@ -86,7 +268,7 @@ function buildReportHtml(payload, screenshotDataUrl) {
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <title>CodexMan element report</title>
+    <title>Typesass element report</title>
     <style>
       body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f7f9fc; }
       main { max-width: 1080px; margin: 0 auto; }
@@ -101,7 +283,7 @@ function buildReportHtml(payload, screenshotDataUrl) {
   </head>
   <body>
     <main>
-      <h1>CodexMan element report</h1>
+      <h1>Typesass element report</h1>
       <p>${escapeReportHtml(String(pageTitle))}</p>
       <section>
         <h2>Selector</h2>
@@ -137,21 +319,21 @@ function buildCommentsReportHtml(payload, screenshots) {
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <title>CodexMan browser comments report</title>
+    <title>Typesass browser comments report</title>
     <style>
-      body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f7f9fc; }
+      body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #f4f4f5; background: #09090b; }
       main { max-width: 1080px; margin: 0 auto; }
       h1 { margin: 0 0 8px; font-size: 24px; }
-      p { margin: 0 0 18px; color: #5f6f89; }
-      section { margin-top: 18px; padding: 18px; border: 1px solid #d8e1ef; border-radius: 8px; background: #fff; }
+      p { margin: 0 0 18px; color: #a1a1aa; }
+      section { margin-top: 18px; padding: 18px; border: 1px solid #27272a; border-radius: 8px; background: #18181b; }
       h2 { margin: 0 0 12px; font-size: 16px; }
-      img { display: block; max-width: 100%; border: 1px solid #d8e1ef; border-radius: 6px; background: #fff; }
-      pre { overflow: auto; max-height: 520px; margin: 0; padding: 12px; border-radius: 6px; color: #dbeafe; background: #111827; white-space: pre-wrap; }
+      img { display: block; max-width: 100%; border: 1px solid #3f3f46; border-radius: 6px; background: #09090b; }
+      pre { overflow: auto; max-height: 520px; margin: 0; padding: 12px; border-radius: 6px; color: #e4e4e7; background: #09090b; white-space: pre-wrap; }
     </style>
   </head>
   <body>
     <main>
-      <h1>CodexMan browser comments report</h1>
+      <h1>Typesass browser comments report</h1>
       <p>统一发送导出的多点元素选择消息。</p>
       <section>
         <h2>Browser Comments</h2>
@@ -203,7 +385,7 @@ async function createElementReport(sender, payload) {
   await chrome.tabs.sendMessage(tabId, {
     type: "CODEXMAN_DOWNLOAD_REPORT",
     html,
-    filename: `codexManExtension-element-report-${timestamp}.html`
+    filename: `typesass-extension-element-report-${timestamp}.html`
   });
 }
 
@@ -237,12 +419,17 @@ async function createCommentsReport(sender, payload) {
   } finally {
     await chrome.tabs.sendMessage(tabId, { type: "CODEXMAN_RESTORE_ANNOTATIONS" }).catch(() => undefined);
   }
+  const task = await createTypesassTask(payload);
   const html = buildCommentsReportHtml(payload, screenshots);
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   await chrome.tabs.sendMessage(tabId, {
+    type: "TYPESASS_TASK_CREATED",
+    payload: task
+  });
+  await chrome.tabs.sendMessage(tabId, {
     type: "CODEXMAN_DOWNLOAD_REPORT",
     html,
-    filename: `codexManExtension-browser-comments-${timestamp}.html`
+    filename: `typesass-extension-browser-comments-${timestamp}.html`
   });
 }
 
@@ -312,7 +499,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   });
 });
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "CODEXMAN_ELEMENT_CONFIRMED") {
     void createElementReport(sender, message.payload).catch(async (error) => {
       if (sender.tab?.id) {
@@ -333,6 +520,41 @@ chrome.runtime.onMessage.addListener((message, sender) => {
           reason: error instanceof Error ? error.message : "报告生成失败"
         });
       }
+    });
+    return true;
+  }
+
+  if (message?.type === "TYPESASS_GET_SETTINGS") {
+    void getTypesassSettings().then(sendResponse).catch((error) => {
+      sendResponse({ error: error instanceof Error ? error.message : "读取插件设置失败" });
+    });
+    return true;
+  }
+
+  if (message?.type === "TYPESASS_SAVE_SETTINGS") {
+    void saveTypesassSettings(message.payload || {}).then(() => sendResponse({ ok: true })).catch((error) => {
+      sendResponse({ error: error instanceof Error ? error.message : "保存插件设置失败" });
+    });
+    return true;
+  }
+
+  if (message?.type === "TYPESASS_CHECK_HEALTH") {
+    void checkTypesassHealth().then(sendResponse).catch((error) => {
+      sendResponse({ error: error instanceof Error ? error.message : "检测 App 服务失败" });
+    });
+    return true;
+  }
+
+  if (message?.type === "TYPESASS_REQUEST_ACCESS_TOKEN") {
+    void requestTypesassAccessToken().then(sendResponse).catch((error) => {
+      sendResponse({ error: error instanceof Error ? error.message : "请求授权码失败" });
+    });
+    return true;
+  }
+
+  if (message?.type === "TYPESASS_LIST_PROJECTS") {
+    void getTypesassSettings().then((settings) => listTypesassProjects(settings.accessToken)).then(sendResponse).catch((error) => {
+      sendResponse({ error: error instanceof Error ? error.message : "读取项目失败" });
     });
     return true;
   }

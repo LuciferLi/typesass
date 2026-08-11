@@ -3,17 +3,47 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>codexManExtension</title>
+    <title>typesass-extension</title>
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main class="codexman-popup">
-      <header class="codexman-popup__header">
-        <strong>codexManExtension</strong>
-        <span id="statusBadge">待选择</span>
+    <main class="typesass-popup">
+      <header class="typesass-popup__header">
+        <div>
+          <strong>typesass-extension</strong>
+          <p>浏览器元素标注与任务创建</p>
+        </div>
+        <span id="statusBadge">检测中</span>
       </header>
-      <button id="startPickerButton" type="button">开始选择元素</button>
-      <p id="messageText">点击后在页面上移动鼠标，选中元素并确认后会下载报告文件。</p>
+
+      <section class="typesass-panel">
+        <div class="typesass-panel__row">
+          <span>App 服务</span>
+          <button id="healthButton" type="button">重新检测</button>
+        </div>
+        <p id="healthText">正在检测 Typesass App 是否已打开。</p>
+      </section>
+
+      <section class="typesass-panel">
+        <label>
+          <span>App 授权码</span>
+          <input id="accessTokenInput" type="password" placeholder="点击获取授权码后自动保存">
+        </label>
+        <button id="requestTokenButton" type="button">获取授权码</button>
+      </section>
+
+      <section class="typesass-panel">
+        <label>
+          <span>任务项目</span>
+          <select id="projectSelect">
+            <option value="">请先读取项目</option>
+          </select>
+        </label>
+        <button id="refreshProjectsButton" type="button">读取项目</button>
+      </section>
+
+      <button id="startPickerButton" class="typesass-primary" type="button">开始选择元素</button>
+      <p id="messageText">发送后会在选中的任务项目里创建任务，任务内容使用 Codex Browser comments 格式。</p>
     </main>
     <script src="popup.js"></script>
   </body>
