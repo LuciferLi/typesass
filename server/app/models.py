@@ -641,6 +641,86 @@ class AccessTokenResponse(BaseModel):
     client_id: str = Field(alias="clientId", description="该 Token 绑定的调用方 ID。")
 
 
+class AppAccessTokenWriteRequest(StrictRequestModel):
+    """App 授权码创建请求。
+
+    用途：由系统设置页或授权码申请流程创建一条可长期查看的明文授权码。
+    流程：HTTP 校验名称和可选过期时间边界，具体时间语义由授权码服务规范化。
+    边界：不包含权限范围、不换取短期 session token，也不生成 pending 授权申请。
+    """
+
+    name: StrictText = Field(
+        max_length=100,
+        description="授权码名称，用于在系统设置页区分调用方。",
+        examples=["Chrome 插件"],
+    )
+    expires_at: Optional[str] = Field(
+        default=None,
+        alias="expiresAt",
+        max_length=64,
+        description="授权码到期时间；null 表示永久有效，非空时必须为带时区的 ISO 时间。",
+        examples=[None, "2026-09-01T00:00:00Z"],
+    )
+
+
+class AppAccessTokenResponse(BaseModel):
+    """App 授权码响应。
+
+    用途：系统设置页展示和复制明文授权码，并让接口测试确认创建、撤销和最近使用时间。
+    流程：由授权码服务从明文 SQLite 记录映射，状态按撤销和过期时间动态计算。
+    边界：本响应会包含明文 token，仅用于 App 管理和授权码申请结果，不写入日志。
+    """
+
+    id: str = Field(description="授权码稳定 ID。", examples=["token_abc"])
+    name: str = Field(description="授权码名称。", examples=["Chrome 插件"])
+    token: str = Field(description="明文授权码，可长期查看和复制。", examples=["typesass_xxx"])
+    expires_at: Optional[str] = Field(
+        default=None,
+        alias="expiresAt",
+        description="到期时间；null 表示永久有效。",
+        examples=[None, "2026-09-01T00:00:00Z"],
+    )
+    status: Literal["active", "expired", "revoked"] = Field(
+        description="授权码状态：有效、已过期或已撤销。",
+        examples=["active"],
+    )
+    created_at: str = Field(alias="createdAt", description="创建时间。")
+    revoked_at: Optional[str] = Field(
+        default=None, alias="revokedAt", description="撤销时间；未撤销时为 null。"
+    )
+    last_used_at: Optional[str] = Field(
+        default=None,
+        alias="lastUsedAt",
+        description="最近使用时间；尚未使用时为 null。",
+    )
+
+
+class AccessTokenRequestResponse(BaseModel):
+    """请求授权码响应。
+
+    用途：没有授权码的客户端在 App 用户确认后直接拿到授权码。
+    流程：不创建 pending 记录，确认时立即创建授权码并返回 approved。
+    边界：拒绝时返回 rejected 且不包含 token。
+    """
+
+    status: Literal["approved", "rejected"] = Field(
+        description="授权申请结果；当前接口成功创建时返回 approved。",
+        examples=["approved"],
+    )
+    access_token: Optional[str] = Field(
+        default=None,
+        alias="accessToken",
+        description="用户确认后生成的明文授权码；拒绝时为空。",
+        examples=["typesass_xxx"],
+    )
+    expires_at: Optional[str] = Field(
+        default=None,
+        alias="expiresAt",
+        description="授权码到期时间；null 表示永久有效。",
+        examples=[None],
+    )
+
+
 class DeviceAuthorizationResponse(BaseModel):
     """浏览器设备授权启动响应。
 

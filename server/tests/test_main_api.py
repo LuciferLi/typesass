@@ -15,7 +15,7 @@ import pytest
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import main
-from app.auth import AccessTokenService, DeviceAuthorizationService
+from app.auth import AppAccessTokenService
 from app.config import (
     ModelCatalogItem,
     PUBLIC_MAX_AUDIO_BYTES,
@@ -85,11 +85,14 @@ def assert_error(response: httpx.Response, status: int, code: str) -> None:
 async def session_headers(
     client: httpx.AsyncClient, request_id: Optional[str] = None
 ) -> dict[str, str]:
-    """通过真实 Basic 交换链路取得短期 Bearer Header。"""
+    """通过真实授权码申请接口取得业务接口 Bearer Header。"""
 
-    response = await client.post("/v1/auth/token", auth=(CLIENT_ID, CLIENT_SECRET))
+    response = await client.post(
+        "/v1/access-tokens/request", json={"name": "pytest", "expiresAt": None}
+    )
     assert response.status_code == 200
     headers = {"Authorization": "Bearer {0}".format(response.json()["accessToken"])}
+    headers["Origin"] = "https://public.example"
     if request_id is not None:
         headers["X-Request-ID"] = request_id
     return headers
@@ -181,16 +184,22 @@ async def test_tc_api_001a_lifespan_starts_without_models(
 
 
 @pytest.mark.parametrize(
-    "headers",
+    ("headers", "code"),
     [
-        {},
-        {"Authorization": "Bearer wrong-fake-token-0000"},
-        {"Authorization": "Basic fake"},
+        ({}, "ORIGIN_REQUIRED"),
+        ({"Origin": "https://public.example"}, "UNAUTHORIZED"),
+        (
+            {"Origin": "https://public.example", "Authorization": "Bearer wrong-fake-token-0000"},
+            "UNAUTHORIZED",
+        ),
+        ({"Origin": "https://public.example", "Authorization": "Basic fake"}, "UNAUTHORIZED"),
     ],
 )
 @pytest.mark.asyncio
-async def test_tc_api_002_authentication_failures(headers: dict[str, str]) -> None:
-    """TC-API-002 缺失、错误或非 Bearer 鉴权统一返回 401。"""
+async def test_tc_api_002_authentication_failures(
+    headers: dict[str, str], code: str
+) -> None:
+    """TC-API-002 缺失 Origin、缺失授权码、错误授权码或非 Bearer 鉴权均返回 401。"""
 
     async with api_client() as client:
         response = await client.post(
@@ -203,30 +212,47 @@ async def test_tc_api_002_authentication_failures(headers: dict[str, str]) -> No
                 "audioDurationMs": 0,
             },
         )
-    assert_error(response, 401, "UNAUTHORIZED")
+    assert_error(response, 401, code)
     assert response.headers["www-authenticate"] == "Bearer"
 
 
 @pytest.mark.asyncio
-async def test_tc_api_002a_token_exchange_success_and_failures() -> None:
-    """TC-API-002A Basic 长期凭据仅在交换接口签发短期 Token，失败统一挑战 Basic。"""
+async def test_tc_api_002a_access_token_create_list_revoke_and_origin_rules() -> None:
+    """TC-API-002A 授权码创建、列表、撤销、内网免授权和公网鉴权形成接口闭环。"""
 
     async with api_client() as client:
-        success = await client.post("/v1/auth/token", auth=(CLIENT_ID, CLIENT_SECRET))
-        missing = await client.post("/v1/auth/token")
-        wrong = await client.post(
-            "/v1/auth/token",
-            auth=(CLIENT_ID, "fake-wrong-client-secret-000000000001"),
+        requested = await client.post(
+            "/v1/access-tokens/request",
+            json={"name": "Chrome 插件", "expiresAt": None},
         )
-    assert success.status_code == 200
-    assert success.json()["tokenType"] == "Bearer"
-    assert success.json()["expiresIn"] == 28800
-    assert success.json()["clientId"] == CLIENT_ID
-    assert success.json()["accessToken"].count(".") == 1
-    assert CLIENT_SECRET not in success.text
-    for response in (missing, wrong):
-        assert_error(response, 401, "INVALID_CLIENT")
-        assert response.headers["www-authenticate"] == "Basic"
+        access_token = requested.json()["accessToken"]
+        auth_headers = {
+            "Origin": "https://public.example",
+            "Authorization": "Bearer {0}".format(access_token),
+        }
+        listed = await client.get("/v1/access-tokens", headers=auth_headers)
+        internal = await client.get("/v1/models", headers={"Origin": "http://127.0.0.1:4006"})
+        public_success = await client.get("/v1/models", headers=auth_headers)
+        revoked = await client.post(
+            "/v1/access-tokens/{0}/revoke".format(listed.json()[0]["id"]),
+            headers=auth_headers,
+        )
+        after_revoke = await client.get("/v1/models", headers=auth_headers)
+        missing_origin = await client.get(
+            "/v1/models", headers={"Authorization": "Bearer {0}".format(access_token)}
+        )
+    assert requested.status_code == 200
+    assert requested.json()["status"] == "approved"
+    assert access_token.startswith("typesass_")
+    assert listed.status_code == 200
+    assert listed.json()[0]["name"] == "Chrome 插件"
+    assert listed.json()[0]["token"] == access_token
+    assert internal.status_code == 200
+    assert public_success.status_code == 200
+    assert revoked.status_code == 200
+    assert revoked.json()["status"] == "revoked"
+    assert_error(after_revoke, 401, "UNAUTHORIZED")
+    assert_error(missing_origin, 401, "ORIGIN_REQUIRED")
 
 
 @pytest.mark.asyncio
@@ -292,7 +318,7 @@ async def test_tc_api_003a_safe_model_catalog_and_empty_catalog(
             settings_factory(model_catalog=()), current_service.client
         )  # type: ignore[operator]
         empty = await client.get("/v1/models", headers=headers)
-    assert_error(unauthorized, 401, "UNAUTHORIZED")
+    assert_error(unauthorized, 401, "ORIGIN_REQUIRED")
     assert configured.status_code == 200
     assert configured.json() == [
         {
@@ -677,105 +703,46 @@ async def test_tc_api_008_framework_and_unexpected_errors(
 
 
 @pytest.mark.asyncio
-async def test_tc_api_008a_device_authorization_flow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TC-API-008A 浏览器创建、等待、管理员 Basic 批准、一次领取和重复领取闭环。"""
+async def test_tc_api_008a_access_token_expiry_revoke_and_invalid_id() -> None:
+    """TC-API-008A 授权码过期、撤销幂等和未知 ID 返回稳定接口结果。"""
 
-    clock = [1000.0]
-    monkeypatch.setattr("app.auth.time.time", lambda: clock[0])
     async with api_client() as client:
+        expired = await client.post(
+            "/v1/access-tokens/request",
+            json={"name": "过期授权码", "expiresAt": "2020-01-01T00:00:00Z"},
+        )
+        permanent = await client.post(
+            "/v1/access-tokens/request",
+            json={"name": "永久授权码", "expiresAt": None},
+        )
+        headers = {
+            "Origin": "https://public.example",
+            "Authorization": "Bearer {0}".format(permanent.json()["accessToken"]),
+        }
+        missing = await client.post(
+            "/v1/access-tokens/missing-token/revoke", headers=headers
+        )
         created = await client.post(
-            "/v1/auth/device", headers={"X-Request-ID": "device-create"}
+            "/v1/access-tokens",
+            headers=headers,
+            json={"name": "手动授权码", "expiresAt": None},
         )
-        device_code = created.json()["deviceCode"]
-        user_code = created.json()["userCode"]
-        pending = await client.post(
-            "/v1/auth/device/token", json={"deviceCode": device_code}
+        first_revoke = await client.post(
+            "/v1/access-tokens/{0}/revoke".format(created.json()["id"]),
+            headers=headers,
         )
-        missing_basic = await client.post(
-            "/v1/auth/device/approve",
-            json={"userCode": user_code},
+        second_revoke = await client.post(
+            "/v1/access-tokens/{0}/revoke".format(created.json()["id"]),
+            headers=headers,
         )
-        wrong_user_code = await client.post(
-            "/v1/auth/device/approve",
-            auth=(CLIENT_ID, CLIENT_SECRET),
-            json={"userCode": "FFFF-FFFF"},
-        )
-        approved = await client.post(
-            "/v1/auth/device/approve",
-            auth=(CLIENT_ID, CLIENT_SECRET),
-            json={"userCode": user_code},
-        )
-        clock[0] += main.app.state.device_authorizations.interval
-        issued = await client.post(
-            "/v1/auth/device/token", json={"deviceCode": device_code}
-        )
-        reused = await client.post(
-            "/v1/auth/device/token", json={"deviceCode": device_code}
-        )
+    assert_error(expired, 422, "VALIDATION_ERROR")
+    assert permanent.status_code == 200
+    assert_error(missing, 404, "ACCESS_TOKEN_NOT_FOUND")
     assert created.status_code == 200
-    assert created.headers["x-request-id"] == "device-create"
-    assert created.json()["expiresIn"] == 600
-    assert created.json()["interval"] == 2
-    assert created.json()["approvalMethod"] == "codexman-app"
-    assert "CodexMan App" in created.json()["approvalInstruction"]
-    assert "verification" + "Uri" not in created.json()
-    assert_error(pending, 428, "AUTHORIZATION_PENDING")
-    assert pending.headers["retry-after"] == "2"
-    assert_error(missing_basic, 401, "INVALID_CLIENT")
-    assert missing_basic.headers["www-authenticate"] == "Basic"
-    assert_error(wrong_user_code, 400, "INVALID_DEVICE_CODE")
-    assert approved.json() == {"ok": True, "name": "device-authorized"}
-    assert issued.status_code == 200
-    assert issued.json()["clientId"] == CLIENT_ID
-    assert issued.json()["expiresIn"] == 28800
-    assert_error(reused, 400, "INVALID_DEVICE_CODE")
-
-
-@pytest.mark.asyncio
-async def test_tc_api_008b_device_approval_permissions_and_capacity(
-    settings_factory: object,
-) -> None:
-    """TC-API-008B API 层返回批准白名单 403、跨批准方 409 和设备容量 429。"""
-
-    settings = settings_factory(  # type: ignore[operator]
-        api_tokens=(
-            (CLIENT_ID, CLIENT_SECRET),
-            (SECONDARY_ID, SECONDARY_SECRET),
-            (ORDINARY_ID, ORDINARY_SECRET),
-        ),
-        device_approver_client_ids=(CLIENT_ID, SECONDARY_ID),
-    )
-    async with api_client() as client:
-        token_service = AccessTokenService(settings)
-        service = DeviceAuthorizationService(token_service)
-        main.app.state.access_tokens = token_service
-        main.app.state.device_authorizations = service
-        created = await client.post("/v1/auth/device")
-        user_code = created.json()["userCode"]
-        forbidden = await client.post(
-            "/v1/auth/device/approve",
-            auth=(ORDINARY_ID, ORDINARY_SECRET),
-            json={"userCode": user_code},
-        )
-        approved = await client.post(
-            "/v1/auth/device/approve",
-            auth=(CLIENT_ID, CLIENT_SECRET),
-            json={"userCode": user_code},
-        )
-        conflict = await client.post(
-            "/v1/auth/device/approve",
-            auth=(SECONDARY_ID, SECONDARY_SECRET),
-            json={"userCode": user_code},
-        )
-        service.max_pending = 0
-        capacity = await client.post("/v1/auth/device")
-    assert_error(forbidden, 403, "DEVICE_APPROVAL_FORBIDDEN")
-    assert approved.status_code == 200
-    assert_error(conflict, 409, "DEVICE_ALREADY_APPROVED")
-    assert_error(capacity, 429, "DEVICE_AUTHORIZATION_CAPACITY")
-    assert capacity.headers["retry-after"] == "2"
+    assert created.json()["token"].startswith("typesass_")
+    assert first_revoke.status_code == 200
+    assert second_revoke.status_code == 200
+    assert first_revoke.json()["revokedAt"] == second_revoke.json()["revokedAt"]
 
 
 @pytest.mark.asyncio
@@ -793,7 +760,7 @@ async def test_tc_api_008c_access_logs_real_error_codes(
         root_logger.addHandler(caplog.handler)
         try:
             with caplog.at_level("INFO", logger="aitool.access"):
-                validation = await client.post("/v1/auth/device/token", json={})
+                validation = await client.post("/v1/access-tokens/request", json={})
                 too_large = await client.post(
                     "/v1/text/process",
                     headers={"Content-Type": "application/json"},
@@ -842,7 +809,12 @@ async def test_tc_api_009_direct_handlers_and_dependency_release(
 ) -> None:
     """TC-API-009 业务/校验 handler 和并发依赖成功路径均覆盖稳定行为。"""
 
-    scope = {"type": "http", "app": main.app, "state": {"request_id": "direct-id"}}
+    scope = {
+        "type": "http",
+        "app": main.app,
+        "state": {"request_id": "direct-id"},
+        "headers": [(b"origin", b"https://public.example")],
+    }
     request = Request(scope)
     api_response = await main.handle_api_error(
         request,
@@ -856,15 +828,15 @@ async def test_tc_api_009_direct_handlers_and_dependency_release(
     validation_response = await main.handle_validation_error(request, validation)
     assert validation_response.status_code == 422
 
-    token_service = AccessTokenService(settings_factory())  # type: ignore[operator]
-    token = token_service.exchange(CLIENT_ID, CLIENT_SECRET)
+    token_service = AppAccessTokenService(str(tmp_path / "direct-token.sqlite3"))  # type: ignore[operator]
+    token = str(token_service.create("direct", None)["token"])
 
     class Credential:
         credentials = token
 
-    main.app.state.access_tokens = token_service
-    assert await main.require_session_token(request, Credential()) == CLIENT_ID  # type: ignore[arg-type]
-    assert request.state.client_id == CLIENT_ID
+    main.app.state.app_access_tokens = token_service
+    assert await main.require_api_access(request, Credential())  # type: ignore[arg-type]
+    assert str(request.state.client_id).startswith("token_")
     main.app.state.settings = settings_factory(  # type: ignore[operator]
         enable_dev_bearer_token=True,
         dev_bearer_token="codexman-dev-bearer-token-000000000001",
@@ -873,8 +845,8 @@ async def test_tc_api_009_direct_handlers_and_dependency_release(
     class DevCredential:
         credentials = "codexman-dev-bearer-token-000000000001"
 
-    assert await main.require_session_token(request, DevCredential()) == "dev-curl"  # type: ignore[arg-type]
-    assert request.state.client_id == "dev-curl"
+    assert await main.require_api_access(request, DevCredential()) == "dev-access-token"  # type: ignore[arg-type]
+    assert request.state.client_id == "dev-access-token"
     main.app.state.client_rate_limiter = ClientRateLimiter(
         10,
         10,
@@ -899,17 +871,16 @@ async def test_tc_api_010_openapi_contract() -> None:
     schema = response.json()
     assert schema["info"]["title"] == "CodexMan AI API"
     assert schema["info"]["version"] == "1.0.0"
-    assert "浏览器来源不参与访问判断" in schema["info"]["description"]
-    assert "敏感接口统一依赖" in schema["info"]["description"]
+    assert "App 授权码管理" in schema["info"]["description"]
+    assert "缺失 Origin 的业务请求直接拦截" in schema["info"]["description"]
     assert schema["servers"] == [
         {"url": "http://127.0.0.1:18080", "description": "固定本机 sidecar"}
     ]
     assert set(schema["paths"]) == {
         "/health",
-        "/v1/auth/token",
-        "/v1/auth/device",
-        "/v1/auth/device/approve",
-        "/v1/auth/device/token",
+        "/v1/access-tokens",
+        "/v1/access-tokens/request",
+        "/v1/access-tokens/{tokenId}/revoke",
         "/v1/models",
         "/v1/audio/transcriptions",
         "/v1/text/process",
@@ -934,17 +905,19 @@ async def test_tc_api_010_openapi_contract() -> None:
         parameter["name"] == "X-Request-ID" and parameter["in"] == "header"
         for parameter in health_parameters
     )
-    token_operation = schema["paths"]["/v1/auth/token"]["post"]
-    assert token_operation["security"] == [{"CallerCredentials": []}]
-    assert token_operation["x-error-codes"]["401"][0]["code"] == "INVALID_CLIENT"
-    assert token_operation["x-error-codes"]["401"][0]["retryable"] is False
-    assert schema["paths"]["/v1/auth/device/approve"]["post"]["security"] == [
-        {"CallerCredentials": []}
+    request_token_operation = schema["paths"]["/v1/access-tokens/request"]["post"]
+    assert "security" not in request_token_operation
+    assert request_token_operation["x-error-codes"]["422"][0]["code"] == "VALIDATION_ERROR"
+    access_token_operation = schema["paths"]["/v1/access-tokens"]["post"]
+    assert access_token_operation["security"] == [{"AppAccessToken": []}]
+    assert schema["paths"]["/v1/access-tokens"]["get"]["security"] == [
+        {"AppAccessToken": []}
     ]
-    assert "security" not in schema["paths"]["/v1/auth/device"]["post"]
-    assert "security" not in schema["paths"]["/v1/auth/device/token"]["post"]
+    assert schema["paths"]["/v1/access-tokens/{tokenId}/revoke"]["post"][
+        "security"
+    ] == [{"AppAccessToken": []}]
     models_operation = schema["paths"]["/v1/models"]["get"]
-    assert models_operation["security"] == [{"CallerToken": []}]
+    assert models_operation["security"] == [{"AppAccessToken": []}]
     assert set(models_operation["responses"]) == {"200", "401", "413", "500"}
     expected_common_codes = {
         "UNAUTHORIZED",
@@ -963,7 +936,7 @@ async def test_tc_api_010_openapi_contract() -> None:
     }
     for path in ("/v1/audio/transcriptions", "/v1/text/process"):
         operation = schema["paths"][path]["post"]
-        assert operation["security"] == [{"CallerToken": []}]
+        assert operation["security"] == [{"AppAccessToken": []}]
         assert {"200", "400", "401", "413", "422", "429", "500", "502", "504"} <= set(
             operation["responses"]
         )
@@ -1031,10 +1004,13 @@ async def test_tc_api_010_openapi_contract() -> None:
     ]
     assert components["AudioTranscriptionRequest"]["additionalProperties"] is False
     assert components["TextProcessRequest"]["additionalProperties"] is False
-    assert components["AccessTokenResponse"]["required"] == [
-        "accessToken",
-        "expiresIn",
-        "clientId",
+    assert components["AccessTokenRequestResponse"]["required"] == ["status"]
+    assert components["AppAccessTokenResponse"]["required"] == [
+        "id",
+        "name",
+        "token",
+        "status",
+        "createdAt",
     ]
     assert components["ModelCatalogResponse"]["required"] == [
         "id",
@@ -1088,39 +1064,13 @@ async def test_tc_api_010_openapi_contract() -> None:
                     },
                 }
             ]
-    device_poll = schema["paths"]["/v1/auth/device/token"]["post"]
-    assert "Retry-After" in device_poll["responses"]["428"]["headers"]
-    assert device_poll["x-error-codes"]["428"] == [
-        {
-            "code": "AUTHORIZATION_PENDING",
-            "retryable": True,
-            "action": "按 Retry-After 持续轮询至批准或 600 秒过期；不计入转换请求最多 2 次重试。",
-        }
-    ]
-    device_create = schema["paths"]["/v1/auth/device"]["post"]
-    device_approve = schema["paths"]["/v1/auth/device/approve"]["post"]
-    assert set(device_create["responses"]) == {"200", "413", "429", "500"}
-    assert {"200", "400", "401", "403", "409", "422"} <= set(
-        device_approve["responses"]
-    )
-    assert {"200", "400", "422", "428", "429"} <= set(device_poll["responses"])
-    assert (
-        device_create["x-error-codes"]["429"][0]["code"]
-        == "DEVICE_AUTHORIZATION_CAPACITY"
-    )
-    assert (
-        device_approve["x-error-codes"]["403"][0]["code"] == "DEVICE_APPROVAL_FORBIDDEN"
-    )
-    assert (
-        device_approve["x-error-codes"]["409"][0]["code"] == "DEVICE_ALREADY_APPROVED"
-    )
-    for path in ("/health", "/v1/auth/token", "/v1/auth/device", "/v1/models"):
+    for path in ("/health", "/v1/models"):
         operation = next(iter(schema["paths"][path].values()))
         assert "422" not in operation["responses"]
         assert "422" not in operation["x-error-codes"]
     for path in (
-        "/v1/auth/device/approve",
-        "/v1/auth/device/token",
+        "/v1/access-tokens",
+        "/v1/access-tokens/request",
         "/v1/audio/transcriptions",
         "/v1/text/process",
     ):

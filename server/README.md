@@ -3,10 +3,10 @@
 仅监听本机回环地址的 FastAPI sidecar，当前 v1 只开放：
 
 - `GET /health`
-- `POST /v1/auth/token`
-- `POST /v1/auth/device`
-- `POST /v1/auth/device/approve`
-- `POST /v1/auth/device/token`
+- `POST /v1/access-tokens/request`
+- `POST /v1/access-tokens`
+- `GET /v1/access-tokens`
+- `POST /v1/access-tokens/{tokenId}/revoke`
 - `GET /v1/models`
 - `POST /v1/audio/transcriptions`
 - `POST /v1/text/process`
@@ -25,73 +25,47 @@
 
 桌面端、本机 WebView 和任意浏览器页面都固定调用 `http://127.0.0.1:18080`。本项目不支持远程服务器、公网反向代理或可配置域名拓扑。上游 API Key、URL 和模型名只通过受信 sidecar stdin bootstrap 进入运行内存，客户端只能提交 opaque `modelId`，不能覆盖私有连接参数。
 
-HTTP 服务不再按浏览器 `Origin` 做跨域拦截，CORS 预检允许任意来源、方法和请求头。Chrome/Edge 等浏览器可能在公网 HTTPS 页面首次访问 `127.0.0.1` 时弹出本地网络访问授权；若浏览器在请求到达 sidecar 前拦截，服务端不会产生 requestId 或访问日志。`/health` 和设备码创建等探针/引导接口无需 Token，模型、任务、Codex 状态等敏感接口统一依赖 Bearer Token、Basic 凭据或设备码流程鉴权。
+HTTP 服务不按浏览器 `Origin` 做 CORS 拦截，CORS 预检允许任意来源、方法和请求头。Chrome/Edge 等浏览器可能在公网 HTTPS 页面首次访问 `127.0.0.1` 时弹出本地网络访问授权；若浏览器在请求到达 sidecar 前拦截，服务端不会产生 requestId 或访问日志。`/health` 和授权码申请接口无需授权码；业务接口按 `Origin` 判定来源，内网来源可免授权码，公网来源必须携带 `Authorization: Bearer <App 授权码>`，缺失 `Origin` 的业务请求直接拒绝。
 
 ## 鉴权流程
 
-1. 桌面 App 每次启动自动生成独立临时 `clientId/secret` 并只保存在 Rust 与 sidecar 进程内存；独立部署 server 时，管理员才需要把长期调用方配置到 `AITOOL_API_KEYS_JSON` 和 `AITOOL_DEVICE_APPROVER_CLIENT_IDS`。
-2. 浏览器禁止接触 Basic secret：先调用 `/v1/auth/device` 创建设备码，用户在桌面 App 的 hub HTTP 文档页手工输入 userCode，Rust 通过私有 IPC 使用临时凭据调用 `/v1/auth/device/approve`，浏览器再轮询 `/v1/auth/device/token`。独立部署 server 时可由已配置的机密 CLI/BFF 代替桌面批准。
-3. 服务返回包含 `iss/aud/iat/exp/ver/clientId` 的 8 小时工作会话 Token。业务接口只接受 `Authorization: Bearer <会话Token>`。
-4. Token 过期后重新交换，不提供 refresh token。移除调用方并重启可吊销其全部 Token；轮换 `AITOOL_TOKEN_SIGNING_KEY` 可吊销全部会话。
-5. 浏览器只把短期 Token 保存在当前页面模块内存，刷新或关闭页面后立即失效；Token 和长期 secret 均不得进入 Web Storage、Vite 变量、bundle、客户端 JSON、日志或截图。
+1. App 系统设置维护明文授权码，支持创建、查询和撤销；授权码可长期查看，不做只展示一次。
+2. `/health` 和 `POST /v1/access-tokens/request` 不需要授权码；申请接口不保存 pending，当前版本在用户确认创建时直接返回授权码。
+3. 业务接口必须带 `Origin`。`localhost`、`127.0.0.1`、`::1`、私有网段 IP 和 `tauri.localhost` 视为内网来源，可免授权码；其它公网 IP 或域名必须携带 `Authorization: Bearer <App 授权码>`。
+4. 授权码不做 scope、refresh token、短期 session token 或 Basic 换 token。撤销或过期后再次访问业务接口统一返回 `401 UNAUTHORIZED`。
+5. 开发环境可启用固定授权码，使用 `AITOOL_ENABLE_DEV_BEARER_TOKEN=1` 和 `AITOOL_DEV_ACCESS_TOKEN=<至少 32 字符>`；该固定授权码不写入授权码列表，生产环境不得启用。
 
 示例：
 
 ```bash
-curl -u '<CLIENT_ID>:<CLIENT_SECRET>' \
+curl -X POST 'http://127.0.0.1:18080/v1/access-tokens/request' \
+  -H 'Content-Type: application/json' \
   -H 'X-Request-ID: partner-auth-001' \
-  -X POST 'http://127.0.0.1:18080/v1/auth/token'
+  -d '{"name":"Chrome 插件","expiresAt":null}'
 ```
 
 成功返回：
 
 ```json
 {
-  "accessToken": "<SESSION_TOKEN>",
-  "tokenType": "Bearer",
-  "expiresIn": 28800,
-  "clientId": "<CLIENT_ID>"
+  "status": "approved",
+  "accessToken": "typesass_xxx",
+  "expiresAt": null
 }
 ```
 
-浏览器设备码完整时序：
+公网来源访问业务接口：
 
 ```bash
-# 1. 浏览器创建授权请求；保存 deviceCode，只把 userCode 展示给批准方。
-curl -X POST 'http://127.0.0.1:18080/v1/auth/device' \
-  -H 'X-Request-ID: browser-device-create-001'
-
-# 响应包含仅由浏览器保存的 deviceCode、展示给用户的 userCode/批准步骤、600 秒有效期和 2 秒最小轮询间隔：
-# {"deviceCode":"...","userCode":"A1B2-C3D4","approvalMethod":"codexman-app","approvalInstruction":"打开本机 CodexMan App，进入 HTTP API 文档，在‘批准第三方 Web 设备码’中输入 userCode。","expiresIn":600,"interval":2}
-# approvalMethod=codexman-app 表示批准入口只在本机 App 中；approvalInstruction 应与 userCode 一起原样展示，不是可点击网页地址。
-
-# 2. 桌面模式：在 App 的 hub HTTP 文档页输入 userCode 并点击“批准设备码”。
-# 独立部署 server：已配置的机密批准方才在 CLI/BFF 中执行以下请求；浏览器不得持有 Basic secret。
-curl -u '<APPROVER_CLIENT_ID>:<APPROVER_CLIENT_SECRET>' \
-  -X POST 'http://127.0.0.1:18080/v1/auth/device/approve' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Request-ID: device-approve-001' \
-  -d '{"userCode":"A1B2-C3D4"}'
-
-# 3. 浏览器按创建响应的 interval 轮询，禁止更高频率。
-curl -X POST 'http://127.0.0.1:18080/v1/auth/device/token' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Request-ID: device-poll-001' \
-  -d '{"deviceCode":"<BROWSER_ONLY_DEVICE_CODE>"}'
-
-# 4. 批准后，上一条轮询一次性返回 8 小时会话 Token；随后使用 Bearer Token 访问业务接口。
 curl 'http://127.0.0.1:18080/v1/models' \
-  -H 'Authorization: Bearer <SESSION_TOKEN>' \
+  -H 'Origin: https://public.example' \
+  -H 'Authorization: Bearer typesass_xxx' \
   -H 'X-Request-ID: models-001'
 ```
 
-- `/v1/auth/token` 和 `/v1/auth/device/approve` 的 Basic 凭据必须来自 `AITOOL_API_KEYS_JSON`；只有同时列入 `AITOOL_DEVICE_APPROVER_CLIENT_IDS` 的 clientId 可以批准设备码。缺失或错误凭据不区分原因，统一返回 `401`。
-- 未批准返回 `428 AUTHORIZATION_PENDING`，按 `Retry-After` 继续；过快轮询返回 `429 DEVICE_POLLING_TOO_FAST`。设备轮询是授权工作流，不受转换请求“最多 2 次重试”限制。
-- 设备码有效期固定 600 秒，服务重启会使未完成授权失效；浏览器应重新创建，不复用旧码。
-- 待授权记录在每次创建、批准和轮询时清理，单 worker 最多保留 1000 条；满载返回 `429 DEVICE_AUTHORIZATION_CAPACITY`。
-- userCode 一旦绑定批准方，在 Token 被领取前也不能由另一个批准方覆盖；冲突返回 `409 DEVICE_ALREADY_APPROVED`。
-- deviceCode 只能由创建它的浏览器持有；userCode 才能展示给批准方。Token 领取后 deviceCode 立即失效，重复轮询返回 `400 INVALID_DEVICE_CODE`。
-- 桌面批准入口只存在于 `hub` WebView；普通浏览器不展示该区域，非 hub 窗口调用私有 IPC 返回 `DEVICE_APPROVAL_FORBIDDEN`。Rust 每分钟最多接收 5 次人工批准尝试，Basic secret 不跨 IPC、不进入日志。
+- 缺失 `Origin` 的业务请求返回 `401 ORIGIN_REQUIRED`。
+- 公网来源缺失、错误、过期或已撤销授权码返回 `401 UNAUTHORIZED`。
+- 授权码校验成功会更新列表中的 `lastUsedAt`。
 
 ## 本地启动
 
@@ -103,22 +77,24 @@ python3.9 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 
-export AITOOL_API_KEYS_JSON='{"local-web":"replace-with-at-least-32-random-characters"}'
-export AITOOL_DEVICE_APPROVER_CLIENT_IDS='local-web'
-export AITOOL_TOKEN_SIGNING_KEY='replace-with-an-independent-32-character-random-secret'
+export AITOOL_ACCESS_TOKEN_DATABASE_FILE='data/aitool-access-tokens.sqlite3'
+export AITOOL_QUOTA_DATABASE_FILE='data/aitool-quota.sqlite3'
+# 可选：开发环境固定授权码，生产环境不要启用。
+export AITOOL_ENABLE_DEV_BEARER_TOKEN=1
+export AITOOL_DEV_ACCESS_TOKEN='typesass-dev-access-token-000000000001'
 
 uvicorn app.main:app --host 127.0.0.1 --port 18080 --workers 1
 ```
 
-直接 Uvicorn 启动不具备桌面 App 注入的运行配置，因此模型目录为空、健康检查和鉴权可用，会话/任务接口返回 `503 PRIVATE_SERVICE_UNAVAILABLE`。生产桌面模式必须由 App 启动 sidecar；第三方只使用公开 HTTP 地址和 Bearer Token，不需要也不能配置内部业务桥接。
+直接 Uvicorn 启动不具备桌面 App 注入的运行配置，因此模型目录为空、健康检查和鉴权可用，会话/任务接口返回 `503 PRIVATE_SERVICE_UNAVAILABLE`。生产桌面模式必须由 App 启动 sidecar；第三方只使用公开 HTTP 地址和 App 授权码，不需要也不能配置内部业务桥接。
 
 ## 会话与任务 HTTP 流程
 
-会话管理和任务管理的所有页面操作都必须调用上述公共 HTTP 路由。FastAPI 是唯一公开入口，负责 Bearer 鉴权、严格 DTO、requestId、CORS、统一错误 envelope 和 OpenAPI；它不会打开任务 SQLite、不会启动 CodeX、不会复制任务状态机。鉴权通过后，HTTP 服务把请求交给桌面业务核心，由桌面业务核心继续负责路径校验、事务、CAS 状态转换、任务调度和系统打开动作；第三方不得绕过 HTTP 入口直接访问内部实现。
+会话管理和任务管理的所有页面操作都必须调用上述公共 HTTP 路由。FastAPI 是唯一公开入口，负责 Origin 与授权码鉴权、严格 DTO、requestId、CORS、统一错误 envelope 和 OpenAPI；它不会打开任务 SQLite、不会启动 CodeX、不会复制任务状态机。鉴权通过后，HTTP 服务把请求交给桌面业务核心，由桌面业务核心继续负责路径校验、事务、CAS 状态转换、任务调度和系统打开动作；第三方不得绕过 HTTP 入口直接访问内部实现。
 
 桌面 App 内部业务服务不属于公开接入面。第三方不得探测或依赖其地址、凭据、帧格式、方法名、并发拓扑或生命周期；这些实现会随桌面版本变化。公开稳定契约只有本 README 和 OpenAPI 中的 HTTP 路由、响应 schema、错误码、requestId 与重试语义。
 
-第三方接入流程为：先完成设备码授权或 Basic Token 交换，再携带 Bearer 和每次尝试唯一的 `X-Request-ID` 调用会话/任务接口。每条接口的 OpenAPI `x-error-codes` 会列出公开稳定错误码、HTTP 状态、是否可重试和处理动作；不要只按 HTTP 状态猜测业务原因。字段/schema 错误返回 `422 VALIDATION_ERROR`。显式查询未知项目和打开未知会话分别返回 `TASK_PROJECT_NOT_FOUND`、`CODEX_THREAD_NOT_FOUND`；update/delete/queue/complete 的未知 ID 当前由 Rust 收敛为各操作固定 409 错误码，不会回退操作其它资源。内部协议、鉴权、方法或序列化故障统一返回 `502 PRIVATE_SERVICE_PROTOCOL_ERROR`，不会透出内部错误码或响应正文；未就绪或 `RPC_BUSY` 过载返回 503，超时返回 504。
+第三方接入流程为：先取得 App 授权码，再携带 `Origin`、`Authorization: Bearer <授权码>` 和每次尝试唯一的 `X-Request-ID` 调用会话/任务接口。每条接口的 OpenAPI `x-error-codes` 会列出公开稳定错误码、HTTP 状态、是否可重试和处理动作；不要只按 HTTP 状态猜测业务原因。字段/schema 错误返回 `422 VALIDATION_ERROR`。显式查询未知项目和打开未知会话分别返回 `TASK_PROJECT_NOT_FOUND`、`CODEX_THREAD_NOT_FOUND`；update/delete/queue/complete 的未知 ID 当前由 Rust 收敛为各操作固定 409 错误码，不会回退操作其它资源。内部协议、鉴权、方法或序列化故障统一返回 `502 PRIVATE_SERVICE_PROTOCOL_ERROR`，不会透出内部错误码或响应正文；未就绪或 `RPC_BUSY` 过载返回 503，超时返回 504。
 
 任务接口的 `projectId/taskId/threadId` 只允许 1 到 128 字符的字母、数字、点、下划线、冒号和短横线；项目名最多 100 个 Unicode 字符，任务标题最多 200 个 Unicode 字符，提示词最多 50000 个 Unicode 字符。CodeX 会话搜索每页 1 到 60 条，offset 不得为负且最大 1000000，keyword 最多 200 字符。项目路径和工作空间路径最大 4096 字符，HTTP 的长度校验不替代 Rust 的绝对路径、存在性、普通文件/目录和访问边界校验。
 
@@ -126,7 +102,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 18080 --workers 1
 
 ```bash
 BASE_URL='http://127.0.0.1:18080'
-TOKEN='<SESSION_TOKEN>'
+TOKEN='<APP_ACCESS_TOKEN>'
 ```
 
 ### CodeX Desktop 连接与显式重启
@@ -334,10 +310,12 @@ curl -X POST "$BASE_URL/v1/projects/$EMPTY_PROJECT_ID/delete" \
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `AITOOL_API_KEYS_JSON` | 无 | 必填 JSON 对象；每个调用方使用独立的至少 32 字符高熵 secret |
-| `AITOOL_DEVICE_APPROVER_CLIENT_IDS` | 无 | 必填逗号分隔批准方 clientId；每项必须已存在于 `AITOOL_API_KEYS_JSON`，仅这些机密客户端可批准设备码 |
-| `AITOOL_TOKEN_SIGNING_KEY` | 无 | 必填且至少 32 字符；必须与调用 secret、模型 API Key 相互独立 |
-| 工作会话 Token TTL | 固定 `28800` | v1 固定 8 小时，覆盖一个工作日；退出桌面 App 或关闭浏览器标签页会立即清除客户端会话 |
+| `AITOOL_ACCESS_TOKEN_DATABASE_FILE` | `data/aitool-access-tokens.sqlite3` | App 明文授权码 SQLite 存储文件；桌面升级时必须保留该文件 |
+| `AITOOL_ENABLE_DEV_BEARER_TOKEN` | 关闭 | 开发环境固定授权码开关；生产环境禁止启用 |
+| `AITOOL_DEV_ACCESS_TOKEN` | 无 | 开发环境固定授权码，至少 32 个 ASCII 字符；启用后不要求 Origin，也不会写入授权码列表 |
+| `AITOOL_API_KEYS_JSON` | 无 | 旧 Basic 流程兼容配置；公开 HTTP 主链路不再需要 |
+| `AITOOL_DEVICE_APPROVER_CLIENT_IDS` | 无 | 旧设备码流程兼容配置；公开 HTTP 主链路不再需要 |
+| `AITOOL_TOKEN_SIGNING_KEY` | `unused-signing-key-for-removed-session-token` | 旧短 Token 兼容配置；公开 HTTP 主链路不再需要 |
 | `AITOOL_CLIENT_RATE_LIMIT_PER_MINUTE` | `60` | 每 clientId 滚动一分钟业务请求上限 |
 | `AITOOL_CLIENT_DAILY_QUOTA` | `10000` | 每 clientId 自然日业务请求上限 |
 | `AITOOL_QUOTA_DATABASE_FILE` | `data/aitool-quota.sqlite3` | 持久化 UTC 日额度 SQLite；桌面升级时必须保留该文件 |
@@ -351,13 +329,13 @@ curl -X POST "$BASE_URL/v1/projects/$EMPTY_PROJECT_ID/delete" \
 | `AITOOL_LOG_MAX_BYTES` | `10485760` | 单文件轮转阈值 |
 | `AITOOL_LOG_BACKUP_COUNT` | `5` | 轮转文件数量 |
 
-服务公开地址固定为 `http://127.0.0.1:18080`，OpenAPI `servers`、Token issuer 和设备授权 URI 都使用该值。首发版不提供地址覆盖环境变量；端口被占用时直接返回可诊断错误，不自动漂移、不终止无关进程。
+服务公开地址固定为 `http://127.0.0.1:18080`，OpenAPI `servers` 使用该值。首发版不提供地址覆盖环境变量；端口被占用时直接返回可诊断错误，不自动漂移、不终止无关进程。
 
 v1 公开契约固定为：请求体 12 MiB、base64 解码后音频 8 MiB、文本 20000 字符。这三个值不能通过环境变量覆盖，避免 OpenAPI 和运行时漂移。MIME 允许列表、音频解码上限、文本上限和词典单项 100 字符限制由 Service 返回稳定业务 code；字段缺失、类型错误、额外字段、非法 mode 和词典超过 100 项仍返回 `422 VALIDATION_ERROR`。
 
 ## 模型目录与请求契约
 
-`GET /v1/models` 要求短期 Bearer Token，返回数组项只包含：
+`GET /v1/models` 遵循统一 Origin 与授权码鉴权，返回数组项只包含：
 
 ```json
 {
@@ -386,7 +364,7 @@ v1 公开契约固定为：请求体 12 MiB、base64 解码后音频 8 MiB、文
 
 当前版本只支持单机、单 Uvicorn worker、固定 `127.0.0.1:18080`。分钟窗口和全局并发在单进程内执行，UTC 日额度用 SQLite `BEGIN IMMEDIATE` 持久化；桌面进程重启不会清零。禁止把本服务绑定公网、放到反向代理后或启动多个 worker；如未来需要远程服务或横向扩容，必须另行设计共享限流、额度、鉴权和 TLS 契约，不能复用当前部署说明。
 
-浏览器来源不参与本机 HTTP 服务访问判断。`/health` 和设备码创建可直接访问；模型、任务、Codex 状态等敏感接口统一依赖 Bearer/Basic/设备码流程鉴权。服务不使用 Cookie 鉴权，也不允许跨域凭据参与会话。
+浏览器来源参与业务接口鉴权判断。`/health` 和授权码申请可直接访问；模型、任务、Codex 状态等敏感接口按 Origin 区分内网免授权码与公网强制授权码。服务不使用 Cookie 鉴权，也不允许跨域凭据参与会话。
 
 ## 错误、重试与排障
 

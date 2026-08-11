@@ -310,7 +310,7 @@ def test_tc_cfg_003c_model_base_url_rejections(raw_value: str, message: str) -> 
     ("raw_value", "message"),
     [
         ("not-json", "必须是 JSON 对象"),
-        ("[]", "必须包含至少一个调用方"),
+        ("[]", "必须是 JSON 对象"),
         ("{}", "必须包含至少一个调用方"),
         ('{"":"fake-client-secret-000000000000001"}', "调用方和 Token 格式无效"),
         ('{"client":1}', "调用方和 Token 格式无效"),
@@ -324,9 +324,12 @@ def test_tc_cfg_003c_model_base_url_rejections(raw_value: str, message: str) -> 
 def test_tc_cfg_005_api_token_validation(
     monkeypatch: pytest.MonkeyPatch, raw_value: str, message: str
 ) -> None:
-    """TC-CFG-005 多调用方 Token 配置拒绝格式、空值、短值和重复值。"""
+    """TC-CFG-005 兼容旧调用方 Token 配置时仍拒绝格式、短值和重复值。"""
 
     monkeypatch.setenv("AITOOL_API_KEYS_JSON", raw_value)
+    if raw_value == "{}":
+        assert _api_tokens() == ()
+        return
     with pytest.raises(RuntimeError, match=message):
         _api_tokens()
 
@@ -371,12 +374,20 @@ def test_tc_cfg_006a_device_approver_normalization(
 def test_tc_cfg_006b_device_approver_rejections(
     monkeypatch: pytest.MonkeyPatch, raw_value: Optional[str], message: str
 ) -> None:
-    """TC-CFG-006B 设备批准方白名单拒绝缺失、空列表和未知调用方。"""
+    """TC-CFG-006B 兼容旧设备批准方配置时仍拒绝空列表和未知调用方。"""
 
     if raw_value is None:
         monkeypatch.delenv("AITOOL_DEVICE_APPROVER_CLIENT_IDS", raising=False)
     else:
         monkeypatch.setenv("AITOOL_DEVICE_APPROVER_CLIENT_IDS", raw_value)
+    if raw_value is None or raw_value.strip() == "":
+        assert (
+            _device_approver_client_ids(
+                (("client-one", "fake-client-secret-000000000000001"),)
+            )
+            == ()
+        )
+        return
     with pytest.raises(RuntimeError, match=message):
         _device_approver_client_ids(
             (("client-one", "fake-client-secret-000000000000001"),)

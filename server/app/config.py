@@ -283,12 +283,15 @@ def _api_tokens() -> Tuple[Tuple[str, str], ...]:
     异常边界：空对象、非字符串字段、短 Token 或重复 Token 会阻止服务启动，原值不会写入错误信息。
     """
 
+    raw_value = os.getenv("AITOOL_API_KEYS_JSON", "").strip()
+    if not raw_value:
+        return ()
     try:
-        payload = json.loads(_required_environment("AITOOL_API_KEYS_JSON"))
+        payload = json.loads(raw_value)
     except json.JSONDecodeError as error:
         raise RuntimeError("AITOOL_API_KEYS_JSON 必须是 JSON 对象") from error
-    if not isinstance(payload, dict) or not payload:
-        raise RuntimeError("AITOOL_API_KEYS_JSON 必须包含至少一个调用方")
+    if not isinstance(payload, dict):
+        raise RuntimeError("AITOOL_API_KEYS_JSON 必须是 JSON 对象")
     entries = []
     seen_tokens = set()
     for client_id, token in payload.items():
@@ -315,19 +318,19 @@ def _device_approver_client_ids(
 ) -> Tuple[str, ...]:
     """读取允许批准设备码的机密客户端白名单。
 
-    用途：把普通 API 调用方与设备授权批准方明确分权，避免任意长期凭据都能批准浏览器。
-    流程：解析逗号分隔的 ``AITOOL_DEVICE_APPROVER_CLIENT_IDS``，去重后校验每项已存在于调用凭据映射。
+    用途：兼容旧设备码服务单元测试；公开 HTTP 主链路不再使用设备码批准。
+    流程：配置缺失时返回空元组；存在时解析逗号分隔的 ``AITOOL_DEVICE_APPROVER_CLIENT_IDS`` 并校验引用。
     参数：``api_tokens`` 为已完成格式校验的调用方凭据列表。
     返回：至少包含一个调用方 ID 的不可变元组。
     异常边界：缺失、空白或引用未知调用方时阻止服务启动，不隐式选择第一个调用方。
     """
 
+    raw_value = os.getenv("AITOOL_DEVICE_APPROVER_CLIENT_IDS", "").strip()
+    if not raw_value:
+        return ()
     client_ids = tuple(
         dict.fromkeys(
-            client_id.strip()
-            for client_id in _required_environment(
-                "AITOOL_DEVICE_APPROVER_CLIENT_IDS"
-            ).split(",")
+            client_id.strip() for client_id in raw_value.split(",")
             if client_id.strip()
         )
     )
@@ -395,8 +398,8 @@ def _boolean_flag(name: str) -> bool:
 def _dev_bearer_token(enabled: bool) -> str:
     """读取开发期万能 Bearer Token。
 
-    用途：为本机开发 curl 联调提供短期 Token 之外的固定入口，默认关闭且由独立开关保护。
-    流程：未启用时返回空字符串；启用后要求 ``AITOOL_DEV_BEARER_TOKEN`` 至少 32 个 ASCII 字符。
+    用途：为本机开发 curl 联调提供固定授权码入口，默认关闭且由独立开关保护。
+    流程：未启用时返回空字符串；启用后优先读取 ``AITOOL_DEV_ACCESS_TOKEN``，并兼容旧 ``AITOOL_DEV_BEARER_TOKEN``。
     参数：``enabled`` 表示开发 Token 开关是否已显式开启。
     返回：可用于常量时间比较的固定 token。
     异常边界：启用但 token 缺失、过短或含非 ASCII 时阻止服务启动。
@@ -404,9 +407,13 @@ def _dev_bearer_token(enabled: bool) -> str:
 
     if not enabled:
         return ""
-    value = _required_environment("AITOOL_DEV_BEARER_TOKEN")
+    value = os.getenv("AITOOL_DEV_ACCESS_TOKEN", "").strip() or os.getenv(
+        "AITOOL_DEV_BEARER_TOKEN", ""
+    ).strip()
+    if not value:
+        raise RuntimeError("缺少必填环境变量：AITOOL_DEV_ACCESS_TOKEN")
     if len(value) < 32 or not value.isascii():
-        raise RuntimeError("AITOOL_DEV_BEARER_TOKEN 至少需要 32 个 ASCII 字符")
+        raise RuntimeError("AITOOL_DEV_ACCESS_TOKEN 至少需要 32 个 ASCII 字符")
     return value
 
 
@@ -426,7 +433,9 @@ def load_settings() -> Settings:
     return Settings(
         api_tokens=api_tokens,
         device_approver_client_ids=_device_approver_client_ids(api_tokens),
-        token_signing_key=_high_entropy_secret("AITOOL_TOKEN_SIGNING_KEY"),
+        token_signing_key=os.getenv(
+            "AITOOL_TOKEN_SIGNING_KEY", "unused-signing-key-for-removed-session-token"
+        ).strip(),
         access_token_ttl_seconds=PUBLIC_ACCESS_TOKEN_TTL_SECONDS,
         client_rate_limit_per_minute=_positive_integer(
             "AITOOL_CLIENT_RATE_LIMIT_PER_MINUTE", 60

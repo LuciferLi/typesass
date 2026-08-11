@@ -22,6 +22,10 @@ os.environ.setdefault(
     "AITOOL_QUOTA_DATABASE_FILE",
     "/tmp/aitool-pytest-quota-{0}.sqlite3".format(os.getpid()),
 )
+os.environ.setdefault(
+    "AITOOL_ACCESS_TOKEN_DATABASE_FILE",
+    "/tmp/aitool-pytest-access-token-{0}.sqlite3".format(os.getpid()),
+)
 os.environ.setdefault("AITOOL_LOG_FILE", "/tmp/aitool-pytest.log")
 os.environ.setdefault("AITOOL_MAX_BODY_BYTES", "512")
 os.environ.setdefault("AITOOL_MAX_AUDIO_BYTES", "4")
@@ -93,6 +97,7 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "client_rate_limit_per_minute": 60,
             "client_daily_quota": 10000,
             "quota_database_file": str(tmp_path / "quota.sqlite3"),
+            "access_token_database_file": str(tmp_path / "access-token.sqlite3"),
             "public_base_url": "http://127.0.0.1:18080",
             "model_catalog": (
                 ModelCatalogItem(

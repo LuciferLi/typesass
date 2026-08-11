@@ -3,24 +3,21 @@
 import asyncio
 from contextlib import asynccontextmanager
 import hmac
+import ipaddress
 import logging
 from typing import Annotated, AsyncIterator, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.security import (
-    HTTPAuthorizationCredentials,
-    HTTPBasic,
-    HTTPBasicCredentials,
-    HTTPBearer,
-)
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import httpx
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import Settings, load_settings
-from .auth import AccessTokenService, DeviceAuthorizationService
+from .auth import AppAccessTokenService
 from .errors import ApiError, is_retryable_error
 from .logging_config import configure_logging
 from .middleware import (
@@ -30,10 +27,9 @@ from .middleware import (
 from .models import (
     AudioTranscriptionRequest,
     AudioTranscriptionResponse,
-    AccessTokenResponse,
-    DeviceApprovalRequest,
-    DeviceAuthorizationResponse,
-    DeviceTokenRequest,
+    AccessTokenRequestResponse,
+    AppAccessTokenResponse,
+    AppAccessTokenWriteRequest,
     ErrorEnvelope,
     HealthResponse,
     ModelCatalogResponse,
@@ -61,13 +57,8 @@ from .rate_limit import ClientRateLimiter
 logger = logging.getLogger("aitool.app")
 bearer_scheme = HTTPBearer(
     auto_error=False,
-    scheme_name="CallerToken",
-    description="先使用 HTTP Basic 调用 /v1/auth/token 换取，再携带短期 Bearer Token。",
-)
-basic_scheme = HTTPBasic(
-    auto_error=False,
-    scheme_name="CallerCredentials",
-    description="管理员分配的 clientId 和至少 32 字符高熵 secret，仅用于换取短期 Token。",
+    scheme_name="AppAccessToken",
+    description="公网来源携带 App 系统设置页维护的授权码；开发环境可使用固定开发授权码。",
 )
 
 
@@ -92,9 +83,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
     app.state.settings = settings
     app.state.concurrency = asyncio.Semaphore(settings.concurrency_limit)
-    app.state.access_tokens = AccessTokenService(settings)
-    app.state.device_authorizations = DeviceAuthorizationService(
-        app.state.access_tokens
+    app.state.app_access_tokens = AppAccessTokenService(
+        settings.access_token_database_file
     )
     app.state.client_rate_limiter = ClientRateLimiter(
         settings.client_rate_limit_per_minute,
@@ -119,11 +109,11 @@ app = FastAPI(
     title="CodexMan AI API",
     version="1.0.0",
     description=(
-        "CodexMan 本机 HTTP sidecar，提供健康检查、短期鉴权、设备码授权、安全模型目录、音频转写、文本处理、"
+        "CodexMan 本机 HTTP sidecar，提供健康检查、App 授权码管理、安全模型目录、音频转写、文本处理、"
         "CodeX 会话查询以及任务项目完整管理。会话与任务接口统一交给桌面业务核心处理，"
         "HTTP 层不打开任务数据库、不启动 CodeX，也不复制任务状态机或暴露内部传输实现。"
-        "浏览器来源不参与访问判断；健康检查和设备码创建可直接访问，敏感接口统一依赖 "
-        "Bearer、Basic 或设备码流程鉴权。"
+        "健康检查和授权码申请可直接访问；内网来源业务请求可免授权码，公网来源业务请求必须携带 "
+        "Authorization: Bearer <授权码>；缺失 Origin 的业务请求直接拦截。"
     ),
     servers=[
         {
@@ -183,7 +173,7 @@ def build_error_responses(
             }
         if status_code == 401:
             headers["WWW-Authenticate"] = {
-                "description": "该接口要求的鉴权方案，Basic 或 Bearer。",
+                "description": "公网来源业务接口要求 Authorization: Bearer <App 授权码>。",
                 "schema": {"type": "string"},
             }
         responses[status_code] = {
@@ -218,7 +208,7 @@ def build_error_code_documentation(
     异常边界：仅生成 OpenAPI 元数据，不影响运行时响应或重试判断。
     """
 
-    documented_codes = {
+    documented_codes: Dict[str, List[Dict[str, object]]] = {
         "413": [
             {
                 "code": "REQUEST_BODY_TOO_LARGE",
@@ -234,7 +224,15 @@ def build_error_code_documentation(
             }
         ],
     }
-    documented_codes.update(error_codes)
+    for status_code, route_codes in error_codes.items():
+        existing_codes = {
+            str(entry.get("code", "")) for entry in documented_codes.get(status_code, [])
+        }
+        documented_codes.setdefault(status_code, []).extend(
+            entry
+            for entry in route_codes
+            if str(entry.get("code", "")) not in existing_codes
+        )
     return documented_codes
 
 
@@ -429,17 +427,42 @@ async def handle_unexpected_error(request: Request, error: Exception) -> JSONRes
     return _error_response(request, 500, "INTERNAL_ERROR", "服务内部错误。")
 
 
-async def require_session_token(
+def _is_internal_origin(origin: str) -> bool:
+    """判断请求 Origin 是否属于内网来源。
+
+    参数：``origin`` 为浏览器提交的 Origin Header。
+    流程：解析主机名，localhost 和私有网段 IP 视为内网，普通域名默认公网。
+    返回：是否可免授权码访问业务接口。
+    异常边界：非法或缺失 Origin 不在此处放行，由鉴权依赖统一拒绝。
+    """
+
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname in ("localhost", "127.0.0.1", "::1", "tauri.localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback
+
+
+async def require_api_access(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
 ) -> str:
-    """校验公共 API Bearer Token。
+    """校验公开业务接口访问权限。
 
-    用途：只允许持有短期签名 Token 的客户端访问模型接口。
-    流程：读取 HTTPBearer 凭据；开发开关启用且命中固定 dev token 时直接标记本机 curl 调用方，否则通过 AccessTokenService 验签验期，并写入 request.state 供日志和额度控制。
+    用途：落实“内网来源免授权码，公网来源必须授权码，缺失 Origin 直接拦截”的统一门禁。
+    流程：开发固定授权码优先放行；普通请求先检查 Origin，内网无 token 可放行，公网必须校验 App 明文授权码。
     参数：``request`` 用于读取配置，``credentials`` 为解析后的 Authorization。
     返回：验证通过的调用方 ID。
-    异常边界：缺失或错误 Token 均返回同一 401，不泄露配置状态。
+    异常边界：缺失 Origin、缺失授权码、错误授权码均返回稳定 401，不泄露授权码列表状态。
     """
 
     supplied_token = credentials.credentials if credentials is not None else ""
@@ -447,9 +470,26 @@ async def require_session_token(
     if settings.enable_dev_bearer_token and hmac.compare_digest(
         supplied_token, settings.dev_bearer_token
     ):
-        request.state.client_id = "dev-curl"
-        return "dev-curl"
-    token_service: AccessTokenService = request.app.state.access_tokens
+        request.state.client_id = "dev-access-token"
+        return "dev-access-token"
+
+    origin = request.headers.get("origin", "").strip()
+    if not origin:
+        raise ApiError(
+            401,
+            "ORIGIN_REQUIRED",
+            "业务请求缺少 Origin，已拒绝访问。",
+            {"WWW-Authenticate": "Bearer"},
+        )
+    token_service: AppAccessTokenService = request.app.state.app_access_tokens
+    if _is_internal_origin(origin):
+        if supplied_token:
+            client_id = token_service.verify(supplied_token)
+            request.state.client_id = client_id
+            return client_id
+        request.state.client_id = "internal-origin"
+        return "internal-origin"
+
     client_id = token_service.verify(supplied_token)
     request.state.client_id = client_id
     return client_id
@@ -457,12 +497,12 @@ async def require_session_token(
 
 async def limit_client_rate(
     request: Request,
-    client_id: str = Depends(require_session_token),
+    client_id: str = Depends(require_api_access),
 ) -> None:
     """执行按调用方限流与日配额。
 
     用途：避免任一第三方独占模型服务资源，并把额度失败与全局并发繁忙区分。
-    流程：复用短期 Token 鉴权结果，再由 ClientRateLimiter 原子检查和扣减额度。
+    流程：复用 App 授权码或开发固定授权码鉴权结果，再由 ClientRateLimiter 原子检查和扣减额度。
     参数：``request`` 提供额度器，``client_id`` 为已验签调用方。
     返回：无。
     异常边界：分钟或日额度耗尽分别返回 RATE_LIMIT 或 DAILY_QUOTA_EXCEEDED。
@@ -526,284 +566,235 @@ async def health() -> HealthResponse:
     return HealthResponse(ok=True, name="codexman-ai-api")
 
 
+ACCESS_TOKEN_RECORD_EXAMPLE = {
+    "id": "token_01J00000000000000000000000",
+    "name": "Chrome 插件",
+    "token": "typesass_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "expiresAt": None,
+    "status": "active",
+    "createdAt": "2026-08-12T00:00:00Z",
+    "revokedAt": None,
+    "lastUsedAt": None,
+}
+ACCESS_TOKEN_ERROR_CODES = {
+    "401": [
+        {
+            "code": "UNAUTHORIZED",
+            "retryable": False,
+            "action": "检查 Authorization Bearer 授权码是否正确、过期或已撤销。",
+        },
+        {
+            "code": "ORIGIN_REQUIRED",
+            "retryable": False,
+            "action": "浏览器业务请求必须携带 Origin；缺失时不按内网来源放行。",
+        },
+    ],
+    "404": [
+        {
+            "code": "ACCESS_TOKEN_NOT_FOUND",
+            "retryable": False,
+            "action": "刷新授权码列表后重新选择。",
+        }
+    ],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "修正授权码名称、过期时间或额外字段。",
+        }
+    ],
+    "500": [
+        {
+            "code": "ACCESS_TOKEN_STORE_FAILED",
+            "retryable": False,
+            "action": "携带 requestId 检查本机授权码存储。",
+        }
+    ],
+}
+
+
 @app.post(
-    "/v1/auth/token",
-    response_model=AccessTokenResponse,
+    "/v1/access-tokens/request",
+    response_model=AccessTokenRequestResponse,
     responses={
         200: success_response_documentation(
             {
-                "accessToken": "<SESSION_TOKEN>",
-                "tokenType": "Bearer",
-                "expiresIn": 28800,
-                "clientId": "partner",
-            }
-        ),
-        **build_error_responses({401: ("调用凭据无效。", "INVALID_CLIENT")}),
-    },
-    tags=["鉴权"],
-    summary="换取短期访问 Token",
-    description="使用 HTTP Basic：username=clientId、password=长期 secret。成功后只在业务接口携带返回的短期 Bearer Token。",
-    openapi_extra={
-        "parameters": [request_id_openapi_parameter()],
-        "x-error-codes": build_error_code_documentation(
-            {
-                "401": [
-                    {
-                        "code": "INVALID_CLIENT",
-                        "retryable": False,
-                        "action": "检查调用方 ID/secret 或联系管理员确认凭据未被吊销。",
-                    }
-                ]
-            }
-        ),
-    },
-)
-async def issue_access_token(
-    request: Request,
-    credentials: Optional[HTTPBasicCredentials] = Depends(basic_scheme),
-) -> AccessTokenResponse:
-    """换取短期访问 Token。
-
-    用途：把长期调用凭据限制在专用交换接口，业务请求只使用可过期 Token。
-    流程：读取 HTTP Basic，常量时间校验调用方 secret，签发绑定 clientId 和 TTL 的 HMAC Token。
-    参数：``request`` 提供 Token 服务，``credentials`` 为 Basic 凭据。
-    返回：Token、类型、有效期和绑定调用方。
-    异常边界：缺失、错误或已吊销凭据统一返回 INVALID_CLIENT，不泄露调用方是否存在。
-    """
-
-    token_service: AccessTokenService = request.app.state.access_tokens
-    if credentials is None:
-        raise ApiError(
-            401, "INVALID_CLIENT", "调用凭据无效。", {"WWW-Authenticate": "Basic"}
-        )
-    access_token = token_service.exchange(credentials.username, credentials.password)
-    request.state.client_id = credentials.username
-    return AccessTokenResponse(
-        accessToken=access_token,
-        expiresIn=token_service.ttl_seconds,
-        clientId=credentials.username,
-    )
-
-
-@app.post(
-    "/v1/auth/device",
-    response_model=DeviceAuthorizationResponse,
-    responses={
-        200: success_response_documentation(
-            {
-                "deviceCode": "<BROWSER_ONLY_DEVICE_CODE>",
-                "userCode": "A1B2-C3D4",
-                "approvalMethod": "codexman-app",
-                "approvalInstruction": "打开本机 CodexMan App，进入 HTTP API 文档，在“批准第三方 Web 设备码”中输入 userCode。",
-                "expiresIn": 600,
-                "interval": 2,
+                "status": "approved",
+                "accessToken": "typesass_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "expiresAt": None,
             }
         ),
         **build_error_responses(
-            {429: ("待授权设备达到容量上限。", "DEVICE_AUTHORIZATION_CAPACITY")}
-        ),
-    },
-    tags=["鉴权"],
-    summary="启动浏览器设备码授权",
-    description="Web/Tauri 无需长期 secret。创建后展示 userCode 给批准方，并按 interval 轮询设备 Token 接口；待授权记录最多 1000 条。",
-    openapi_extra={
-        "parameters": [request_id_openapi_parameter()],
-        "x-error-codes": build_error_code_documentation(
             {
-                "429": [
-                    {
-                        "code": "DEVICE_AUTHORIZATION_CAPACITY",
-                        "retryable": True,
-                        "action": "按 Retry-After 等待后重新创建；这是授权流程等待，不计入转换请求最多 2 次重试。",
-                    }
-                ]
-            }
-        ),
-    },
-)
-async def create_device_authorization(request: Request) -> DeviceAuthorizationResponse:
-    """启动无密钥设备授权。
-
-    用途：浏览器不接触长期调用 secret 即可发起短期 Token 授权。
-    流程：创建设备码和用户码，返回十分钟有效期与轮询间隔。
-    参数：``request`` 提供设备授权服务。
-    返回：设备授权响应。
-    异常边界：不绑定调用方，必须由已配置的机密批准方批准后才能领取 Token；容量耗尽时返回 429。
-    """
-
-    service: DeviceAuthorizationService = request.app.state.device_authorizations
-    device_code, user_code = service.create()
-    return DeviceAuthorizationResponse(
-        deviceCode=device_code,
-        userCode=user_code,
-        expiresIn=service.expires_in,
-        interval=service.interval,
-    )
-
-
-@app.post(
-    "/v1/auth/device/approve",
-    response_model=HealthResponse,
-    responses={
-        200: success_response_documentation({"ok": True, "name": "device-authorized"}),
-        **build_error_responses(
-            {
-                400: ("设备码无效或已过期。", "INVALID_DEVICE_CODE"),
-                401: ("管理员调用凭据无效。", "INVALID_CLIENT"),
-                403: ("调用方没有设备批准权限。", "DEVICE_APPROVAL_FORBIDDEN"),
-                409: ("设备码已绑定其它批准方。", "DEVICE_ALREADY_APPROVED"),
                 422: ("请求字段校验失败。", "VALIDATION_ERROR"),
+                500: ("授权码保存失败。", "ACCESS_TOKEN_STORE_FAILED"),
             }
         ),
     },
     tags=["鉴权"],
-    summary="批准方批准浏览器设备码",
-    description="仅供配置在 AITOOL_DEVICE_APPROVER_CLIENT_IDS 中的受信服务端或批准 CLI 调用。HTTP Basic 中携带 clientId/secret，浏览器禁止调用。",
+    summary="请求授权码",
+    description="没有授权码的客户端请求 App 用户确认授权；接口层不保存 pending，用户确认时直接创建授权码并返回。",
     openapi_extra={
         "parameters": [request_id_openapi_parameter()],
         "x-error-codes": build_error_code_documentation(
             {
-                "400": [
-                    {
-                        "code": "INVALID_DEVICE_CODE",
-                        "retryable": False,
-                        "action": "重新创建设备码。",
-                    }
-                ],
-                "401": [
-                    {
-                        "code": "INVALID_CLIENT",
-                        "retryable": False,
-                        "action": "检查管理员调用凭据。",
-                    }
-                ],
-                "403": [
-                    {
-                        "code": "DEVICE_APPROVAL_FORBIDDEN",
-                        "retryable": False,
-                        "action": "改用配置允许的批准方凭据。",
-                    }
-                ],
-                "409": [
-                    {
-                        "code": "DEVICE_ALREADY_APPROVED",
-                        "retryable": False,
-                        "action": "重新创建设备码，禁止覆盖现有绑定。",
-                    }
-                ],
-                "422": [
-                    {
-                        "code": "VALIDATION_ERROR",
-                        "retryable": False,
-                        "action": "修正 userCode 格式。",
-                    }
-                ],
+                "422": ACCESS_TOKEN_ERROR_CODES["422"],
+                "500": ACCESS_TOKEN_ERROR_CODES["500"],
             }
         ),
     },
 )
-async def approve_device_authorization(
-    request: Request,
-    payload: DeviceApprovalRequest,
-    credentials: Optional[HTTPBasicCredentials] = Depends(basic_scheme),
-) -> HealthResponse:
-    """批准设备授权。
+async def request_app_access_token(
+    request: Request, payload: AppAccessTokenWriteRequest
+) -> AccessTokenRequestResponse:
+    """请求创建 App 授权码。
 
-    用途：由机密环境把浏览器展示的 userCode 绑定到已配置批准方调用身份。
-    流程：校验 HTTP Basic 后批准用户码，浏览器下一次轮询即可领取短期 Token。
-    参数：请求、userCode 和 Basic 凭据。
-    返回：固定成功状态。
-    异常边界：长期 secret 只出现在该机密调用，不进入 Web/Tauri 运行时。
+    用途：给没有授权码的客户端提供在线申请入口。
+    流程：当前接口表示 App 用户已确认授权，不保存 pending，直接创建授权码并返回明文。
+    参数：``request`` 提供授权码服务，``payload`` 提供建议名称和有效期。
+    返回：approved 状态和明文授权码。
+    异常边界：用户拒绝流程后续由 App 弹窗接入时返回 rejected；本接口不轮询、不生成设备码。
     """
 
-    if credentials is None:
-        raise ApiError(
-            401, "INVALID_CLIENT", "调用凭据无效。", {"WWW-Authenticate": "Basic"}
-        )
-    service: DeviceAuthorizationService = request.app.state.device_authorizations
-    service.approve(payload.user_code, credentials.username, credentials.password)
-    request.state.client_id = credentials.username
-    return HealthResponse(ok=True, name="device-authorized")
+    token_service: AppAccessTokenService = request.app.state.app_access_tokens
+    record = token_service.create(payload.name, payload.expires_at)
+    return AccessTokenRequestResponse(
+        status="approved",
+        accessToken=str(record["token"]),
+        expiresAt=record["expiresAt"],
+    )
 
 
 @app.post(
-    "/v1/auth/device/token",
-    response_model=AccessTokenResponse,
+    "/v1/access-tokens",
+    response_model=AppAccessTokenResponse,
     responses={
-        200: success_response_documentation(
-            {
-                "accessToken": "<SESSION_TOKEN>",
-                "tokenType": "Bearer",
-                "expiresIn": 28800,
-                "clientId": "partner",
-            }
-        ),
+        200: success_response_documentation(ACCESS_TOKEN_RECORD_EXAMPLE),
         **build_error_responses(
             {
-                400: ("设备码无效或已过期。", "INVALID_DEVICE_CODE"),
                 422: ("请求字段校验失败。", "VALIDATION_ERROR"),
-                428: ("设备码等待批准方批准。", "AUTHORIZATION_PENDING"),
-                429: ("设备码轮询过于频繁。", "DEVICE_POLLING_TOO_FAST"),
+                500: ("授权码保存失败。", "ACCESS_TOKEN_STORE_FAILED"),
             }
         ),
     },
+    dependencies=[Depends(require_api_access)],
     tags=["鉴权"],
-    summary="浏览器轮询设备码 Token",
-    description="按启动响应 interval 轮询。未批准返回 428/Retry-After；批准后一次性返回 8 小时工作会话 Token。",
+    summary="创建授权码",
+    description="系统设置页手动创建明文授权码；创建后可长期查看和复制。",
     openapi_extra={
         "parameters": [request_id_openapi_parameter()],
         "x-error-codes": build_error_code_documentation(
             {
-                "400": [
-                    {
-                        "code": "INVALID_DEVICE_CODE",
-                        "retryable": False,
-                        "action": "重新创建设备码。",
-                    }
-                ],
-                "422": [
-                    {
-                        "code": "VALIDATION_ERROR",
-                        "retryable": False,
-                        "action": "修正 deviceCode。",
-                    }
-                ],
-                "428": [
-                    {
-                        "code": "AUTHORIZATION_PENDING",
-                        "retryable": True,
-                        "action": "按 Retry-After 持续轮询至批准或 600 秒过期；不计入转换请求最多 2 次重试。",
-                    }
-                ],
-                "429": [
-                    {
-                        "code": "DEVICE_POLLING_TOO_FAST",
-                        "retryable": True,
-                        "action": "停止当前轮询并按 Retry-After 延后；不计入转换请求最多 2 次重试。",
-                    }
-                ],
+                "401": ACCESS_TOKEN_ERROR_CODES["401"],
+                "422": ACCESS_TOKEN_ERROR_CODES["422"],
+                "500": ACCESS_TOKEN_ERROR_CODES["500"],
             }
         ),
     },
 )
-async def poll_device_token(
-    request: Request, payload: DeviceTokenRequest
-) -> AccessTokenResponse:
-    """轮询设备授权并领取 Token。
+async def create_app_access_token(
+    request: Request, payload: AppAccessTokenWriteRequest
+) -> object:
+    """手动创建 App 授权码。
 
-    用途：完成浏览器无 secret 鉴权闭环。
-    流程：检查设备码状态；批准后消费设备码并签发固定 8 小时工作会话 Token。
-    参数：请求与 deviceCode。
-    返回：短期访问 Token。
-    异常边界：未批准使用 428，不把等待状态伪装成 401 或成功。
+    流程：访问门禁通过后把名称和有效期交给授权码服务落库。
+    参数：``request`` 提供授权码服务；``payload`` 为创建字段。
+    返回：包含明文 token 的授权码记录。
+    异常边界：不支持权限范围和只展示一次，创建失败不返回伪 token。
     """
 
-    service: DeviceAuthorizationService = request.app.state.device_authorizations
-    access_token, client_id, expires_in = service.poll(payload.device_code)
-    request.state.client_id = client_id
-    return AccessTokenResponse(
-        accessToken=access_token, expiresIn=expires_in, clientId=client_id
-    )
+    token_service: AppAccessTokenService = request.app.state.app_access_tokens
+    return token_service.create(payload.name, payload.expires_at)
+
+
+@app.get(
+    "/v1/access-tokens",
+    response_model=List[AppAccessTokenResponse],
+    responses={
+        200: success_response_documentation([ACCESS_TOKEN_RECORD_EXAMPLE]),
+        **build_error_responses(
+            {500: ("授权码读取失败。", "ACCESS_TOKEN_STORE_FAILED")}
+        ),
+    },
+    dependencies=[Depends(require_api_access)],
+    tags=["鉴权"],
+    summary="查询授权码列表",
+    description="系统设置页查询所有明文授权码及状态；列表用于查看、复制和撤销。",
+    openapi_extra={
+        "parameters": [request_id_openapi_parameter()],
+        "x-error-codes": build_error_code_documentation(
+            {
+                "401": ACCESS_TOKEN_ERROR_CODES["401"],
+                "500": ACCESS_TOKEN_ERROR_CODES["500"],
+            }
+        ),
+    },
+)
+async def list_app_access_tokens(request: Request) -> object:
+    """查询 App 授权码列表。
+
+    流程：访问门禁通过后读取独立授权码存储，并计算 active/expired/revoked 状态。
+    参数：``request`` 提供授权码服务。
+    返回：包含明文 token 的授权码数组。
+    异常边界：数据库不可用时返回统一错误 envelope。
+    """
+
+    token_service: AppAccessTokenService = request.app.state.app_access_tokens
+    return token_service.list_tokens()
+
+
+@app.post(
+    "/v1/access-tokens/{tokenId}/revoke",
+    response_model=AppAccessTokenResponse,
+    responses={
+        200: success_response_documentation(
+            {**ACCESS_TOKEN_RECORD_EXAMPLE, "status": "revoked"}
+        ),
+        **build_error_responses(
+            {
+                404: ("授权码不存在。", "ACCESS_TOKEN_NOT_FOUND"),
+                422: ("路径参数校验失败。", "VALIDATION_ERROR"),
+                500: ("授权码撤销失败。", "ACCESS_TOKEN_STORE_FAILED"),
+            }
+        ),
+    },
+    dependencies=[Depends(require_api_access)],
+    tags=["鉴权"],
+    summary="撤销授权码",
+    description="系统设置页撤销指定授权码；撤销后公网业务接口不得继续放行该授权码。",
+    openapi_extra={
+        "parameters": [request_id_openapi_parameter()],
+        "x-error-codes": build_error_code_documentation(
+            {
+                "401": ACCESS_TOKEN_ERROR_CODES["401"],
+                "404": ACCESS_TOKEN_ERROR_CODES["404"],
+                "422": ACCESS_TOKEN_ERROR_CODES["422"],
+                "500": ACCESS_TOKEN_ERROR_CODES["500"],
+            }
+        ),
+    },
+)
+async def revoke_app_access_token(
+    request: Request,
+    token_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="tokenId",
+            description="待撤销授权码稳定 ID。",
+            examples=["token_01J00000000000000000000000"],
+        ),
+    ],
+) -> object:
+    """撤销 App 授权码。
+
+    流程：访问门禁通过后按 ID 撤销授权码；重复撤销保持幂等返回已撤销记录。
+    参数：``request`` 提供授权码服务，``token_id`` 为授权码稳定 ID。
+    返回：撤销后的授权码记录。
+    异常边界：未知 ID 返回 404，不删除记录，便于系统设置页保留历史状态。
+    """
+
+    token_service: AppAccessTokenService = request.app.state.app_access_tokens
+    return token_service.revoke(token_id)
 
 
 @app.get(
@@ -827,7 +818,7 @@ async def poll_device_token(
             }
         ),
     },
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["AI"],
     summary="读取安全模型目录",
     description="返回可供选择的 opaque ID 和安全元数据；不返回 provider、baseUrl、modelName、apiKey。空目录返回空数组。",
@@ -839,7 +830,7 @@ async def poll_device_token(
                     {
                         "code": "UNAUTHORIZED",
                         "retryable": False,
-                        "action": "重新交换短期 Token。",
+                        "action": "检查来源 Origin 和 App 授权码，或在开发环境使用固定授权码。",
                     }
                 ]
             }
@@ -920,7 +911,7 @@ async def list_models(request: Request) -> List[ModelCatalogResponse]:
                     {
                         "code": "UNAUTHORIZED",
                         "retryable": False,
-                        "action": "重新交换短期 Token。",
+                        "action": "检查来源 Origin 和 App 授权码，或在开发环境使用固定授权码。",
                     }
                 ],
                 "404": [
@@ -1089,7 +1080,7 @@ async def transcribe_audio(
                     {
                         "code": "UNAUTHORIZED",
                         "retryable": False,
-                        "action": "重新交换短期 Token。",
+                        "action": "检查来源 Origin 和 App 授权码，或在开发环境使用固定授权码。",
                     }
                 ],
                 "404": [
@@ -1221,7 +1212,7 @@ PRIVATE_COMMON_ERROR_CODES = {
         {
             "code": "UNAUTHORIZED",
             "retryable": False,
-            "action": "重新完成设备授权或交换短期 Token。",
+            "action": "内网来源可免授权码；公网来源需携带 App 授权码。",
         }
     ],
     "502": [
@@ -1828,7 +1819,7 @@ async def _call_private(
         },
         CODEX_CONNECTION_ERROR_CODES,
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["会话管理"],
     summary="读取 CodeX Desktop 连接状态",
     description=(
@@ -1859,7 +1850,7 @@ async def get_codex_connection(request: Request) -> object:
         CODEX_RESTART_ERROR_CODES,
         202,
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["会话管理"],
     summary="请求异步重启 CodeX Desktop 连接",
     description=(
@@ -1886,7 +1877,7 @@ async def restart_codex_connection(request: Request) -> object:
     "/v1/codex/workspaces",
     response_model=List[CodexWorkspaceResponse],
     responses=private_route_responses(CODEX_WORKSPACE_EXAMPLE, CODEX_LIST_ERROR_CODES),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["会话管理"],
     summary="读取 CodeX 工作空间",
     description="读取本机 CodeX 已索引工作空间并按最近活跃度返回。HTTP 服务不直接扫描文件，由 Rust 执行路径和索引校验。",
@@ -1908,7 +1899,7 @@ async def list_codex_workspaces(request: Request) -> object:
     "/v1/codex/threads/search",
     response_model=List[CodexThreadResponse],
     responses=private_route_responses(CODEX_THREAD_EXAMPLE, CODEX_SEARCH_ERROR_CODES),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["会话管理"],
     summary="分页搜索 CodeX 会话",
     description="按工作空间、分页和可选关键词搜索真实 CodeX thread；每页 1 到 60 条，不提供未实现的详情或流式接口。",
@@ -1942,7 +1933,7 @@ async def search_codex_threads(
     "/v1/codex/threads/{threadId}/open",
     response_model=OperationResponse,
     responses=private_route_responses({"ok": True}, CODEX_OPEN_ERROR_CODES),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["会话管理"],
     summary="在 CodeX 中打开会话",
     description=(
@@ -1980,7 +1971,7 @@ async def open_codex_thread(
     responses=private_route_responses(
         WORKSPACE_DATA_EXAMPLE, TASK_WORKSPACE_ERROR_CODES
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="读取任务工作区聚合数据",
     description="一次读取项目列表以及选中项目的任务和会话，避免多次请求造成状态撕裂；projectId 可省略。",
@@ -2013,7 +2004,7 @@ async def query_task_workspace(
     responses=private_route_responses(
         WORKSPACE_DATA_EXAMPLE, PROJECT_CREATE_ERROR_CODES
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="创建任务项目",
     description="创建并绑定真实工作空间。Rust 校验目录、重复项并在事务提交后返回最新聚合数据。",
@@ -2042,7 +2033,7 @@ async def create_project(request: Request, payload: ProjectWriteRequest) -> obje
     responses=private_route_responses(
         WORKSPACE_DATA_EXAMPLE, PROJECT_UPDATE_ERROR_CODES
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="更新任务项目",
     description="更新项目名称和后续任务工作空间；已有会话仍保留执行时路径快照。",
@@ -2085,7 +2076,7 @@ async def update_project(
     responses=private_route_responses(
         WORKSPACE_DATA_EXAMPLE, PROJECT_DELETE_ERROR_CODES
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="删除空任务项目",
     description="仅删除没有任务或会话历史的项目；Rust 拒绝级联删除并在事务后返回最新聚合数据。",
@@ -2119,7 +2110,7 @@ async def delete_project(
     responses=private_route_responses(
         TASK_CREATE_DATA_EXAMPLE, TASK_CREATE_ERROR_CODES
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="创建任务",
     description="在指定项目创建 created 状态任务。HTTP 不预创建会话，实际落库和初始状态由 Rust 保证。",
@@ -2148,7 +2139,7 @@ async def create_task(request: Request, payload: TaskCreateRequest) -> object:
     "/v1/tasks/{taskId}/update",
     response_model=WorkspaceDataResponse,
     responses=private_route_responses(WORKSPACE_DATA_EXAMPLE, TASK_UPDATE_ERROR_CODES),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="修改任务",
     description="修改任务名称和描述；仅 created 或 queued 状态允许更新，已执行过的任务由 Rust 状态机拒绝覆盖。",
@@ -2189,7 +2180,7 @@ async def update_task(
     "/v1/tasks/{taskId}/delete",
     response_model=WorkspaceDataResponse,
     responses=private_route_responses(WORKSPACE_DATA_EXAMPLE, TASK_DELETE_ERROR_CODES),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="删除任务",
     description="删除指定任务；除 running 状态外都允许删除，Rust 在事务内校验状态并清理关联本地记录。",
@@ -2221,7 +2212,7 @@ async def delete_task(
     "/v1/tasks/{taskId}/queue",
     response_model=WorkspaceDataResponse,
     responses=private_route_responses(WORKSPACE_DATA_EXAMPLE, TASK_QUEUE_ERROR_CODES),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="任务进入执行队列",
     description=(
@@ -2266,7 +2257,7 @@ async def queue_task(
     responses=private_route_responses(
         WORKSPACE_DATA_EXAMPLE, TASK_COMPLETE_ERROR_CODES
     ),
-    dependencies=[Depends(require_session_token)],
+    dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
     summary="验收并完成任务",
     description="仅允许 Rust 状态机把 waiting_acceptance 任务转换为 completed，并返回提交后的聚合快照。",

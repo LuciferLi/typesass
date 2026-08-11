@@ -75,7 +75,7 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
             await client.get("/v1/codex/workspaces"),
         ]
         for unauthorized in unauthorized_responses:
-            assert_error(unauthorized, 401, "UNAUTHORIZED")
+            assert_error(unauthorized, 401, "ORIGIN_REQUIRED")
         headers = await session_headers(client, "session-http-001")
         fake = FakePrivateRpcClient()
         main.app.state.private_rpc = fake
@@ -222,7 +222,7 @@ async def test_tc_session_http_002_strict_dto_and_openapi() -> None:
     assert "socketPath" not in serialized_schema
     assert schema_response.json()["paths"]["/v1/tasks/{taskId}/queue"]["post"][
         "security"
-    ] == [{"CallerToken": []}]
+    ] == [{"AppAccessToken": []}]
 
 
 @pytest.mark.contract

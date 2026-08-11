@@ -6,12 +6,7 @@ import type {
     CodexConnectionStatusModel
 } from '@/model/codexConnection';
 import { CODEX_DESKTOP_NOT_CONNECTED_ERROR_CODE, CODEX_RESTART_IN_PROGRESS_ERROR_CODE } from '@/model/codexConnection';
-import {
-    getCodexConnectionStatus,
-    hasPublicApiToken,
-    isPublicApiRequestErrorCode,
-    restartCodexConnection
-} from '@/service/tauri/command';
+import { getCodexConnectionStatus, isPublicApiRequestErrorCode, restartCodexConnection } from '@/service/tauri/command';
 
 /** 页面可见时的 Codex 连接轮询间隔，满足侧栏近实时反馈。 */
 const VISIBLE_CONNECTION_POLL_INTERVAL_MS = 2_000;
@@ -203,20 +198,14 @@ export const useCodexConnectionStore = defineStore('codexConnection', {
 
         /**
          * 执行一次 Codex 连接状态 HTTP 请求。
-         * 流程：先复用公共请求层检查当前运行会话是否持有 Token；未授权时停止在本地，不产生 401 轮询；已授权才读取公开连接接口并应用权威快照。
+         * 流程：直接读取公开连接接口并应用权威快照；该状态接口允许 App 内部来源无授权码访问。
          * 参数：allowAutoOpen 控制本次明确断连是否允许自动展示弹窗。
          * 返回：请求完成 Promise。
-         * 边界：无 Token 或异常均不会清空最近一次桌面运行和可重启信息；设备授权成功后下一轮会自动恢复 HTTP 查询。
+         * 边界：异常不会清空最近一次桌面运行和可重启信息，避免把 HTTP 暂时不可用误报为明确断连。
          */
         async performConnectionRefresh(allowAutoOpen: boolean): Promise<void> {
             this.requestInFlight = true;
             try {
-                if (!(await hasPublicApiToken())) {
-                    this.connectionState = 'unknown';
-                    this.connected = false;
-                    this.message = '当前 Web 会话尚未授权，暂时无法获取 Codex 连接状态。';
-                    return;
-                }
                 this.applyConnectionStatus(await getCodexConnectionStatus(), allowAutoOpen);
             } catch (error) {
                 this.connectionState = 'unknown';

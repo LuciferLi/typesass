@@ -9,8 +9,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rand::distributions::{Alphanumeric, DistString};
-use serde::Deserialize;
 use serde_json::json;
 use tauri::{AppHandle, Manager};
 
@@ -41,11 +39,11 @@ static PROCESS_LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 struct SidecarProcessState {
     /// 当前受 App 管理的 sidecar 直接子进程及独立进程组；退出或重启时必须整组清理。
     process: Option<ManagedSidecarProcess>,
-    /// 本次 sidecar 启动生成的 Basic client ID，仅保留在 Rust 进程内用于短 Token 续签。
+    /// 旧 Basic client ID 兼容字段；授权码改造后不再生成或使用。
     client_id: String,
-    /// 本次 sidecar 启动生成的 Basic secret，仅保留在 Rust 进程内用于短 Token 续签。
+    /// 旧 Basic secret 兼容字段；授权码改造后不再生成或使用。
     client_secret: String,
-    /// 最近一分钟设备码批准尝试时间，只保留在内存中用于限制本地暴力枚举。
+    /// 旧设备码批准限流兼容字段；授权码改造后不再生成 pending 设备码。
     approval_attempts: Vec<Instant>,
 }
 
@@ -64,14 +62,6 @@ struct ManagedSidecarProcess {
 pub struct RuntimeSidecar {
     /// 子进程与临时凭据共享同一把锁，避免重启、退出和续签读取到跨代状态。
     state: Mutex<SidecarProcessState>,
-}
-
-/// sidecar 短期 Token 交换响应，仅在 Rust 进程内反序列化。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AccessTokenResponse {
-    /// 业务请求使用的短期 Bearer Token。
-    access_token: String,
 }
 
 /// 构造严格单 envelope 的 sidecar stdin 启动帧。
@@ -231,9 +221,9 @@ fn join_process_log_threads(threads: &mut Vec<thread::JoinHandle<()>>) -> Result
 
 impl RuntimeSidecar {
     /// 启动并接管 FastAPI sidecar。
-    /// 流程：开发模式先清理自身热重载残留，再验证固定端口空闲，生成每次启动独立高熵凭据，注入绝对数据/轮转日志路径，通过 stdin 一次性传入模型注册表，以严格双文件上限持续收集 stdout/stderr，等待 `/health` 后交换短 Token。
-    /// 参数：app 用于定位 app_data_dir，model_catalog_json 只通过子进程 stdin 传递；返回短 Token。
-    /// 异常/边界：端口占用、进程提前退出、健康超时或换 Token 失败均 fail-fast；不会杀死占用端口的外部进程，启动兜底日志总量不超过两个 512 KiB 文件。
+    /// 流程：开发模式先清理自身热重载残留，再验证固定端口空闲，注入绝对数据/轮转日志路径，通过 stdin 一次性传入模型注册表，以严格双文件上限持续收集 stdout/stderr，等待 `/health`。
+    /// 参数：app 用于定位 app_data_dir，model_catalog_json 只通过子进程 stdin 传递；返回空字符串，App 内部 HTTP 请求依赖内网 Origin 免授权码。
+    /// 异常/边界：端口占用、进程提前退出或健康超时均 fail-fast；不会杀死占用端口的外部进程，启动兜底日志总量不超过两个 512 KiB 文件。
     pub fn start(&self, app: &AppHandle, model_catalog_json: &str) -> Result<String, String> {
         let mut process_state = self
             .state
@@ -258,15 +248,6 @@ impl RuntimeSidecar {
         let log_file_path = log_dir.join("aitool-sidecar.log");
         let process_log_file_path = log_dir.join("aitool-sidecar-process.log");
         prepare_process_log(&process_log_file_path)?;
-        let mut generator = rand::thread_rng();
-        let client_id = format!(
-            "codexman-desktop-{}",
-            Alphanumeric.sample_string(&mut generator, 20)
-        );
-        let client_secret = Alphanumeric.sample_string(&mut generator, 64);
-        let signing_key = Alphanumeric.sample_string(&mut generator, 64);
-        let api_keys_json = serde_json::to_string(&json!({ &client_id: &client_secret }))
-            .map_err(|error| format!("构造 sidecar 临时调用凭据失败：{}", error))?;
         let mut private_rpc = app.state::<RuntimePrivateRpc>().bootstrap()?;
         let bootstrap_result = build_model_catalog_bootstrap(model_catalog_json, &private_rpc);
         private_rpc.secret.clear();
@@ -277,9 +258,10 @@ impl RuntimeSidecar {
         command
             .env("AITOOL_SIDECAR_HOST", "127.0.0.1")
             .env("AITOOL_SIDECAR_PORT", SIDECAR_PORT.to_string())
-            .env("AITOOL_API_KEYS_JSON", api_keys_json)
-            .env("AITOOL_DEVICE_APPROVER_CLIENT_IDS", &client_id)
-            .env("AITOOL_TOKEN_SIGNING_KEY", signing_key)
+            .env(
+                "AITOOL_ACCESS_TOKEN_DATABASE_FILE",
+                data_dir.join("access-tokens.sqlite3"),
+            )
             .env("AITOOL_QUOTA_DATABASE_FILE", data_dir.join("quota.sqlite3"))
             .env("AITOOL_LOG_FILE", &log_file_path)
             .stdin(Stdio::piped())
@@ -288,7 +270,7 @@ impl RuntimeSidecar {
         #[cfg(debug_assertions)]
         command
             .env("AITOOL_ENABLE_DEV_BEARER_TOKEN", "1")
-            .env("AITOOL_DEV_BEARER_TOKEN", DEV_BEARER_TOKEN);
+            .env("AITOOL_DEV_ACCESS_TOKEN", DEV_BEARER_TOKEN);
         let mut child = command.spawn().map_err(|error| {
             format!(
                 "启动 FastAPI sidecar 失败（{}）：{}",
@@ -366,26 +348,12 @@ impl RuntimeSidecar {
                 (&log_file_path, &process_log_file_path),
             ));
         }
-        let token = match exchange_access_token(&client_id, &client_secret) {
-            Ok(token) => token,
-            Err(error) => {
-                return Err(cleanup_start_failure(
-                    error,
-                    &mut child,
-                    process_group_id,
-                    &mut process_log_threads,
-                    (&log_file_path, &process_log_file_path),
-                ));
-            }
-        };
         process_state.process = Some(ManagedSidecarProcess {
             child,
             process_group_id,
             process_log_threads,
         });
-        process_state.client_id = client_id;
-        process_state.client_secret = client_secret;
-        Ok(token)
+        Ok(String::new())
     }
 
     /// 停止当前 App 启动的 sidecar 进程组。
@@ -413,52 +381,24 @@ impl RuntimeSidecar {
         Ok(())
     }
 
-    /// 使用当前受管 sidecar 的进程内 Basic 凭据续签短 Token。
-    /// 流程：在 sidecar 状态锁内确认子进程仍存活且凭据完整，再执行一次 Token 交换；参数无；返回新短 Token。
-    /// 异常/边界：不启动新进程、不读取磁盘、不输出凭据；重启或退出会与续签串行，避免使用跨代凭据。
+    /// 兼容旧前端的短 Token 续签入口。
+    /// 流程：授权码改造后不再签发短 Token，仅确认 sidecar 仍运行后返回空字符串。
+    /// 异常/边界：不启动新进程、不读取磁盘、不输出凭据；业务请求应依赖内网 Origin 或 App 授权码。
     pub fn refresh_access_token(&self) -> Result<String, String> {
         let mut process_state = self
             .state
             .lock()
             .map_err(|_| "sidecar 进程锁已损坏".to_string())?;
-        ensure_managed_sidecar_running(&mut process_state, "续签短 Token")?;
-        if process_state.client_id.is_empty() || process_state.client_secret.is_empty() {
-            return Err("sidecar 临时续签凭据不可用".to_string());
-        }
-        exchange_access_token(&process_state.client_id, &process_state.client_secret)
+        ensure_managed_sidecar_running(&mut process_state, "确认授权码模式 sidecar 状态")?;
+        Ok(String::new())
     }
 
-    /// 使用当前受管 sidecar 的进程内批准方凭据批准浏览器设备码。
-    /// 流程：在 sidecar 状态锁内确认进程、限流和临时凭据可用，复制本次临时凭据后释放锁，再向本机批准接口提交规范化 userCode。
-    /// 参数：user_code 为浏览器展示的 9 位人工核对码；返回不含凭据的成功说明。
-    /// 异常/边界：凭据始终留在 Rust 内存且不跨 IPC；重启竞态会由旧凭据请求返回鉴权失败，不阻塞退出；无效、过期或重复批准返回服务端错误码与 requestId。
-    pub fn approve_device_authorization(&self, user_code: &str) -> Result<String, String> {
-        let (client_id, client_secret) = {
-            let mut process_state = self
-                .state
-                .lock()
-                .map_err(|_| "sidecar 进程锁已损坏".to_string())?;
-            ensure_managed_sidecar_running(&mut process_state, "批准设备码")?;
-            if process_state.client_id.is_empty() || process_state.client_secret.is_empty() {
-                return Err("sidecar 临时批准凭据不可用".to_string());
-            }
-            let now = Instant::now();
-            process_state
-                .approval_attempts
-                .retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(60));
-            if process_state.approval_attempts.len() >= 5 {
-                return Err(
-                    "设备授权批准尝试过于频繁，请一分钟后重试（错误码：DEVICE_APPROVAL_RATE_LIMITED）"
-                        .to_string(),
-                );
-            }
-            process_state.approval_attempts.push(now);
-            (
-                process_state.client_id.clone(),
-                process_state.client_secret.clone(),
-            )
-        };
-        approve_device_authorization(&client_id, &client_secret, user_code)
+    /// 兼容旧前端的设备码批准入口。
+    /// 流程：授权码改造后设备码流程已下线，调用时返回固定错误提示。
+    /// 参数：user_code 为旧设备码输入，当前不再使用。
+    /// 异常/边界：不创建 pending、不调用 HTTP 批准接口、不接触任何 Basic 凭据。
+    pub fn approve_device_authorization(&self, _user_code: &str) -> Result<String, String> {
+        Err("设备码授权已下线，请在系统设置中创建或申请 App 授权码。".to_string())
     }
 
     /// 使用新模型注册表重启 sidecar 并换取全新短 Token。
@@ -879,101 +819,6 @@ fn wait_until_healthy(child: &mut Child) -> Result<(), String> {
     ))
 }
 
-/// 使用本次启动临时 Basic 凭据交换短期 Token。
-fn exchange_access_token(client_id: &str, client_secret: &str) -> Result<String, String> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|error| format!("创建 Token 交换客户端失败：{}", error))?
-        .post(format!("{}/v1/auth/token", SIDECAR_BASE_URL))
-        .basic_auth(client_id, Some(client_secret))
-        .send()
-        .map_err(|error| format!("sidecar 短 Token 交换失败：{}", error))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "sidecar 短 Token 交换失败：HTTP {}",
-            response.status()
-        ));
-    }
-    let payload = response
-        .json::<AccessTokenResponse>()
-        .map_err(|error| format!("解析 sidecar 短 Token 响应失败：{}", error))?;
-    if payload.access_token.trim().is_empty() {
-        return Err("sidecar 短 Token 响应为空".to_string());
-    }
-    Ok(payload.access_token)
-}
-
-/// 使用受信批准方凭据调用本机设备授权批准接口。
-/// 流程：校验并大写 userCode，通过 HTTP Basic 提交 JSON；失败时解析统一错误 envelope 和 requestId。
-/// 参数：client_id/client_secret 为本次 App 启动的临时凭据，user_code 为浏览器展示码；返回成功说明。
-/// 异常/边界：仅访问固定回环地址，不返回或记录 Basic 凭据，也不读取响应中的敏感正文。
-fn approve_device_authorization(
-    client_id: &str,
-    client_secret: &str,
-    user_code: &str,
-) -> Result<String, String> {
-    let normalized_user_code = normalize_device_user_code(user_code)?;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|error| format!("创建设备批准客户端失败：{}", error))?
-        .post(format!("{}/v1/auth/device/approve", SIDECAR_BASE_URL))
-        .basic_auth(client_id, Some(client_secret))
-        .json(&json!({"userCode": normalized_user_code}))
-        .send()
-        .map_err(|error| format!("设备授权批准请求失败：{}", error))?;
-    let status = response.status();
-    let request_id = response
-        .headers()
-        .get("X-Request-ID")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    if status.is_success() {
-        let payload = response
-            .json::<serde_json::Value>()
-            .map_err(|_| "设备授权批准响应不是合法 JSON（错误码：INVALID_RESPONSE）".to_string())?;
-        if payload.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-            && payload.get("name").and_then(serde_json::Value::as_str) == Some("device-authorized")
-        {
-            return Ok("设备授权已批准，浏览器可继续领取短期 Token。".to_string());
-        }
-        return Err("设备授权批准响应协议无效（错误码：INVALID_RESPONSE）".to_string());
-    }
-    let payload = response.json::<serde_json::Value>().unwrap_or_default();
-    let code = payload
-        .pointer("/error/code")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("DEVICE_APPROVAL_FAILED");
-    let message = payload
-        .pointer("/error/message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("设备授权批准失败");
-    Err(format!(
-        "{}（错误码：{}，请求 ID：{}，HTTP {}）",
-        message, code, request_id, status
-    ))
-}
-
-/// 规范化并校验人工设备授权码。
-/// 流程：去除首尾空白、转换为大写，再严格校验 4 位十六进制、连字符和 4 位十六进制。
-/// 参数：user_code 为桌面表单输入；返回可提交给 sidecar 的规范值。
-/// 异常/边界：拒绝 Unicode、额外字符和错误分隔符，失败时不发起 HTTP 请求。
-fn normalize_device_user_code(user_code: &str) -> Result<String, String> {
-    let normalized_user_code = user_code.trim().to_ascii_uppercase();
-    if normalized_user_code.len() != 9
-        || normalized_user_code.as_bytes().get(4) != Some(&b'-')
-        || normalized_user_code
-            .chars()
-            .enumerate()
-            .any(|(index, value)| index != 4 && !value.is_ascii_hexdigit())
-    {
-        return Err("设备授权码格式无效，应为 XXXX-XXXX（错误码：VALIDATION_ERROR）".to_string());
-    }
-    Ok(normalized_user_code)
-}
-
 /// 解析开发期或打包后的 externalBin 绝对路径。
 fn resolve_sidecar_binary() -> Result<PathBuf, String> {
     if target_triple() == "unsupported-target" {
@@ -1114,23 +959,6 @@ mod tests {
     fn development_binary_name_contains_target_triple() {
         let name = format!("{}-{}", SIDECAR_BINARY_NAME, target_triple());
         assert!(name.starts_with("codexman-ai-sidecar-"));
-    }
-
-    /// 设备授权码允许首尾空白和小写，但必须规范化为固定大写格式。
-    #[test]
-    fn device_user_code_is_normalized_before_approval() {
-        assert_eq!(
-            normalize_device_user_code(" 2ee7-6baf ").expect("合法设备码应通过"),
-            "2EE7-6BAF"
-        );
-    }
-
-    /// 设备授权码必须拒绝错误长度、分隔符、非十六进制和 Unicode，避免本地枚举绕过。
-    #[test]
-    fn invalid_device_user_codes_are_rejected() {
-        for value in ["", "2EE76BAF", "2EE7_6BAF", "2EE7-6BAG", "设备-授权码"] {
-            assert!(normalize_device_user_code(value).is_err());
-        }
     }
 
     /// 每次 App 启动必须覆盖旧活动日志并删除旧备份，避免跨启动累计历史进程输出。

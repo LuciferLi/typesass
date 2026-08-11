@@ -117,20 +117,18 @@ interface PublicApiAttemptResult<ResponseModel> {
     responseJson: ResponseModel | PublicApiErrorModel | null;
     /** 当前尝试独立生成的请求 ID。 */
     requestId: string;
-    /** 当前尝试实际携带的短期 Token。 */
+    /** 当前尝试实际携带的 App 授权码。 */
     publicApiToken: string;
 }
 
-/** 短期公共 API Token 交换响应。 */
-interface PublicApiAccessTokenModel {
-    /** 短期 Bearer Token。 */
+/** 公共 API 授权码申请响应。 */
+interface PublicApiAccessTokenRequestModel {
+    /** 授权结果状态。 */
+    status: 'approved' | 'rejected';
+    /** 用户确认后返回的明文 App 授权码。 */
     accessToken: string;
-    /** 固定为 Bearer。 */
-    tokenType: 'Bearer';
-    /** 有效期秒数。 */
-    expiresIn: number;
-    /** Token 绑定的调用方 ID。 */
-    clientId: string;
+    /** 授权码过期时间；永久有效时为空。 */
+    expiresAt: string | null;
 }
 
 /** 浏览器设备码授权启动响应。 */
@@ -164,13 +162,13 @@ const PUBLIC_API_RETRYABLE_ERROR_CODES = new Set([
     'QUOTA_STORE_UNAVAILABLE',
     'UPSTREAM_TIMEOUT'
 ]);
-/** 普通浏览器当前页面持有的短期 Token；刷新或关闭页面后立即丢失，禁止进入 Web Storage。 */
+/** 普通浏览器当前页面持有的 App 授权码；外部授权页后续可改为持久保存。 */
 let browserPublicApiToken = '';
 
 /**
- * 保存当前浏览器会话使用的短期公共 API Token。
- * 流程：普通浏览器只写当前页面模块内存；Tauri 只写 Rust 进程内存，桌面 WebView 不保留副本。
- * 参数：token 为管理员签发给当前调用方的短期或可轮换 Token。
+ * 保存当前浏览器会话使用的公共 API 授权码。
+ * 流程：普通浏览器只写当前页面模块内存；Tauri 只写 Rust 进程内存，桌面 WebView 通常不需要保存。
+ * 参数：token 为 App 签发给当前调用方的明文授权码。
  * 返回：无。
  * 边界：空值会清除会话凭据；上游模型密钥绝不能传入本方法。
  */
@@ -184,10 +182,10 @@ export async function setPublicApiToken(token: string): Promise<void> {
 }
 
 /**
- * 读取当前运行会话的公共 API 短期 Token。
+ * 读取当前运行会话的公共 API 授权码。
  * 流程：普通浏览器读取当前页面模块内存；Tauri 只读取 Rust 进程内存，不把敏感值复制进 Web Storage。
  * 参数：无。
- * 返回：当前短期 Token；尚未授权时返回空字符串。
+ * 返回：当前授权码；尚未授权时返回空字符串。
  * 异常：桌面进程内状态读取失败时透传 IPC 错误，不回退伪造凭据。
  */
 export async function getPublicApiToken(): Promise<string> {
@@ -213,9 +211,9 @@ async function clearPublicApiTokenIfCurrent(expectedToken: string): Promise<bool
 
 /**
  * 判断当前运行会话是否具备公共 API 凭据。
- * 流程：复用跨 WebView Token 读取逻辑，只返回是否存在，不向页面暴露 Token 内容。
+ * 流程：复用跨 WebView 授权码读取逻辑，只返回是否存在，不向页面暴露授权码内容。
  * 参数：无。
- * 返回：存在非空短期 Token 时返回 true。
+ * 返回：存在非空授权码时返回 true。
  * 异常：桌面共享状态读取失败时透传，调用方应展示未就绪而不是假成功。
  */
 export async function hasPublicApiToken(): Promise<boolean> {
@@ -342,7 +340,7 @@ async function performPublicApiAttempt<ResponseModel>(
 
 /**
  * 请求独立的 CodexMan 公共 HTTP 服务。
- * 流程：每次尝试使用新请求 ID；Tauri 的 401 最多触发一次原生单飞续签；AI 瞬时错误最多额外重试两次并共享 60 秒。
+ * 流程：每次尝试使用新请求 ID；AI 瞬时错误最多额外重试两次并共享 60 秒。
  * 参数：path 为公共 API 路径；options 显式声明 HTTP 方法、可选 JSON Body 和是否启用转换重试。
  * 返回：类型化业务响应。
  * 异常：响应非法、共享时限耗尽、鉴权失败或非可重试业务错误时抛出含 requestId 的错误。
@@ -353,7 +351,6 @@ async function requestPublicApi<ResponseModel>(path: string, options: PublicApiR
         : (options.timeoutMs ?? PUBLIC_API_TIMEOUT_MS);
     const deadlineMs = Date.now() + requestTimeoutMs;
     let retryCount = 0;
-    let hasRefreshedToken = false;
     while (Date.now() < deadlineMs) {
         const attempt = await performPublicApiAttempt<ResponseModel>(path, options, deadlineMs - Date.now());
         if (attempt.response.ok && attempt.responseJson !== null) return attempt.responseJson as ResponseModel;
@@ -363,16 +360,6 @@ async function requestPublicApi<ResponseModel>(path: string, options: PublicApiR
             );
         }
         const errorDetail = ((attempt.responseJson || {}) as PublicApiErrorModel).error || {};
-        if (attempt.response.status === 401 && attempt.publicApiToken && isTauriRuntime() && !hasRefreshedToken) {
-            hasRefreshedToken = true;
-            const refreshedToken = (
-                await invokeDesktop<string>('refresh_public_api_token_if_matches', {
-                    expectedToken: attempt.publicApiToken
-                })
-            ).trim();
-            if (!refreshedToken) throw new Error('桌面公共 API Token 续签结果为空。');
-            continue;
-        }
         if (attempt.response.status === 401 && attempt.publicApiToken) {
             await clearPublicApiTokenIfCurrent(attempt.publicApiToken);
         }
@@ -403,13 +390,13 @@ async function requestPublicApi<ResponseModel>(path: string, options: PublicApiR
 
 /**
  * 启动浏览器设备码授权。
- * 流程：调用公开设备授权接口，获得仅当前页面持有的 deviceCode 和交给批准方的 userCode。
+ * 流程：旧设备码流程已下线，保留函数是为了旧页面调用时给出明确提示。
  * 参数：无。
  * 返回：设备码、用户码、有效期和轮询间隔。
  * 异常：服务不可达或响应非法时抛出带 requestId 的错误，前端不接触长期 secret。
  */
 export async function createPublicApiDeviceAuthorization(): Promise<PublicApiDeviceAuthorizationModel> {
-    return requestPublicApi<PublicApiDeviceAuthorizationModel>('/v1/auth/device', { method: 'POST' });
+    throw new Error('设备码授权已下线，请在系统设置中创建或申请 App 授权码。');
 }
 
 /**
@@ -431,21 +418,37 @@ export async function approvePublicApiDevice(userCode: string): Promise<string> 
 
 /**
  * 轮询浏览器设备码授权结果。
- * 流程：提交当前页面的 deviceCode；未批准或轮询过快时按服务间隔继续，批准后保存短期 Token。
+ * 流程：旧设备码流程已下线，保留函数是为了旧页面调用时给出明确提示。
  * 参数：deviceCode 为设备授权启动响应中的高熵轮询码。
  * 返回：短期 Token 有效期秒数。
  * 异常：待批准、过期或服务错误均保留稳定 code/requestId，调用方按 interval 决定是否继续。
  */
 export async function pollPublicApiDeviceToken(deviceCode: string): Promise<number> {
-    const response = await requestPublicApi<PublicApiAccessTokenModel>('/v1/auth/device/token', {
+    void deviceCode;
+    throw new Error('设备码授权已下线，请在系统设置中创建或申请 App 授权码。');
+}
+
+/**
+ * 请求 App 创建一条公共 API 授权码。
+ * 流程：调用无需凭证的授权码申请接口；当前后端在 App 用户确认时直接创建并返回明文授权码。
+ * 参数：name 为授权码展示名称，expiresAt 为可选过期时间。
+ * 返回：授权结果、明文授权码和过期时间。
+ * 异常：服务不可达、用户拒绝或响应非法时抛出带 requestId 的错误。
+ */
+export async function requestPublicApiAccessToken(
+    name: string,
+    expiresAt: string | null = null
+): Promise<PublicApiAccessTokenRequestModel> {
+    const response = await requestPublicApi<PublicApiAccessTokenRequestModel>('/v1/access-tokens/request', {
         method: 'POST',
-        payload: { deviceCode }
+        payload: { name, expiresAt },
+        timeoutMs: PUBLIC_API_TIMEOUT_MS
     });
-    if (!response.accessToken || response.tokenType !== 'Bearer' || response.expiresIn <= 0) {
-        throw new Error('短期 Token 响应无效。');
+    if (response.status !== 'approved' || !response.accessToken) {
+        throw new Error('授权码申请未通过。');
     }
     await setPublicApiToken(response.accessToken);
-    return response.expiresIn;
+    return response;
 }
 
 /**
