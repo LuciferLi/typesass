@@ -125,6 +125,17 @@ const CODEX_CDP_THREAD_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CDP_THREAD_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
 /// Token 续签和清除 IPC 的稳定桌面错误码；统一入口会附加唯一诊断 ID，且不记录 Token 正文。
 const PUBLIC_API_TOKEN_IPC_ERROR_CODE: &str = "DESKTOP_OPERATION_FAILED";
+const BROWSER_EXTENSION_ZIP_BYTES: &[u8] =
+    include_bytes!("../../public/downloads/typesass-extension.zip");
+const BROWSER_EXTENSION_ZIP_FILE_NAME: &str = "typesass-extension.zip";
+
+/// 浏览器插件 ZIP 下载结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserExtensionDownloadResponse {
+    /// ZIP 文件最终保存到本机的绝对路径。
+    file_path: String,
+}
 
 /// 运行期间保存的全局快捷键映射。
 struct RuntimeShortcuts {
@@ -1349,6 +1360,7 @@ pub fn run() {
             show_result_window,
             hide_result_window,
             get_last_result_window_payload,
+            download_browser_extension_zip,
             set_public_api_token,
             get_public_api_token,
             refresh_public_api_token_if_matches,
@@ -4899,6 +4911,48 @@ fn get_last_result_window_payload(
         .lock()
         .map_err(|_| "读取结果窗口内容失败：状态锁已损坏".to_string())
         .map(|payload| payload.clone())
+}
+
+/// 下载浏览器插件 ZIP 到用户下载目录。
+/// 流程：仅允许 hub 调用，把编译进 App 的固定插件 ZIP 写入下载目录；若同名文件存在则追加序号。
+/// 参数：window 用于校验调用窗口并取得 AppHandle。
+/// 返回：最终保存路径。
+/// 异常/边界：不接收任意源路径或任意文件内容，写入失败返回脱敏桌面错误。
+#[tauri::command]
+fn download_browser_extension_zip(
+    window: tauri::WebviewWindow,
+) -> Result<BrowserExtensionDownloadResponse, String> {
+    let app = window.app_handle().clone();
+    (|| -> Result<BrowserExtensionDownloadResponse, String> {
+        ensure_public_api_token_window(window.label())?;
+        let download_dir = app
+            .path()
+            .download_dir()
+            .map_err(|error| format!("读取下载目录失败：{}", error))?;
+        fs::create_dir_all(&download_dir)
+            .map_err(|error| format!("创建下载目录失败：{}", error))?;
+        let mut target_path = download_dir.join(BROWSER_EXTENSION_ZIP_FILE_NAME);
+        if target_path.exists() {
+            target_path = (1..=99)
+                .map(|index| download_dir.join(format!("typesass-extension-{}.zip", index)))
+                .find(|candidate| !candidate.exists())
+                .ok_or_else(|| "下载目录中已存在过多同名插件 ZIP，请先清理旧文件后重试。".to_string())?;
+        }
+        fs::write(&target_path, BROWSER_EXTENSION_ZIP_BYTES)
+            .map_err(|error| format!("写入浏览器插件 ZIP 失败：{}", error))?;
+        Ok(BrowserExtensionDownloadResponse {
+            file_path: target_path.to_string_lossy().into_owned(),
+        })
+    })()
+    .map_err(|error| {
+        desktop_error::record_desktop_error(
+            &app,
+            "BROWSER_EXTENSION_DOWNLOAD_FAILED",
+            "download_browser_extension_zip",
+            None,
+            &error,
+        )
+    })
 }
 
 /// 保存 App 进程内共享的公共 HTTP 短期 Token。

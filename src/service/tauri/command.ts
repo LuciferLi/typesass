@@ -131,6 +131,12 @@ interface PublicApiAccessTokenRequestModel {
     expiresAt: string | null;
 }
 
+/** 浏览器插件 ZIP 下载响应。 */
+export interface BrowserExtensionDownloadModel {
+    /** ZIP 文件最终保存到本机的绝对路径。 */
+    filePath: string;
+}
+
 /** 浏览器设备码授权启动响应。 */
 export interface PublicApiDeviceAuthorizationModel {
     /** 仅当前浏览器轮询使用的高熵设备码。 */
@@ -179,6 +185,17 @@ export async function setPublicApiToken(token: string): Promise<void> {
         return;
     }
     browserPublicApiToken = normalizedToken;
+}
+
+/**
+ * 下载浏览器插件 ZIP 到本机下载目录。
+ * 流程：桌面端使用受保护的 Tauri 命令写入固定插件包；普通 Web 返回明确不可用错误。
+ * 参数：无。
+ * 返回：最终保存路径。
+ * 异常：普通 Web 或桌面命令失败时抛出用户可读错误。
+ */
+export async function downloadBrowserExtensionZip(): Promise<BrowserExtensionDownloadModel> {
+    return invokeDesktop<BrowserExtensionDownloadModel>('download_browser_extension_zip');
 }
 
 /**

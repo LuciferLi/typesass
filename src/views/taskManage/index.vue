@@ -359,6 +359,7 @@
         SESSION_TASK_TITLE_MAX_CHARS,
         type SessionTaskModel
     } from '@/model/sessionManage';
+    import { downloadBrowserExtensionZip, isTauriRuntime } from '@/service/tauri/command';
     import { useCodexConnectionStore } from '@/stores/codexConnection';
     import { useSessionManageStore } from '@/stores/sessionManage';
 
@@ -719,19 +720,30 @@
 
     /**
      * 下载浏览器插件 ZIP 包。
-     * 流程：通过静态资源地址创建一次隐藏链接并触发浏览器下载。
+     * 流程：桌面端通过 Tauri 固定命令保存到下载目录；普通 Web 预览回退为静态链接下载。
      * 参数：无。
-     * 返回：无返回值。
-     * 边界：下载文件由构建前的插件打包产物提供，页面不在运行时拼接 ZIP。
+     * 返回：下载完成 Promise。
+     * 边界：桌面端不依赖 WebView download 行为，失败时给出明确提示。
      */
-    function handleDownloadBrowserExtension(): void {
-        const link = document.createElement('a');
-        link.href = '/downloads/typesass-extension.zip';
-        link.download = 'typesass-extension.zip';
-        link.rel = 'noopener';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
+    async function handleDownloadBrowserExtension(): Promise<void> {
+        try {
+            if (isTauriRuntime()) {
+                const result = await downloadBrowserExtensionZip();
+                toast.success('插件 ZIP 已保存', {
+                    description: result.filePath
+                });
+                return;
+            }
+            const link = document.createElement('a');
+            link.href = '/downloads/typesass-extension.zip';
+            link.download = 'typesass-extension.zip';
+            link.rel = 'noopener';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        } catch (error) {
+            showTaskOperationError('下载插件失败', error, '浏览器插件 ZIP 下载失败。');
+        }
     }
 
     onMounted(() => {
