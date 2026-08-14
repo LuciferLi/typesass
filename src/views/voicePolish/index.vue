@@ -335,22 +335,24 @@
         return '语音服务暂不可用';
     });
     const voiceEmptyStateDescription = computed(() => {
-        if (!isMicrophoneReady.value && !isClientRuntime) return '点击语音按钮后，按浏览器提示允许麦克风访问。';
+        if (!isMicrophoneReady.value && !isClientRuntime) {
+            return '网页只负责配置和历史展示，请在 CodexMan App 中授权麦克风并使用全局快捷键。';
+        }
         if (!isMicrophoneReady.value) {
-            return '语音转文字需要先获得麦克风权限用于录音收音。';
+            return '语音转文字由 CodexMan App 录音，需要先给 App 开启麦克风权限。';
         }
         if (!store.asrModelId) return '模型目录缺少已启用的 ASR 模型，请前往模型管理配置。';
         return '公共 HTTP 服务未提供语音识别能力，请联系服务管理员检查部署配置。';
     });
     const voiceEmptyStateActionLabel = computed(() => {
-        if (!isMicrophoneReady.value && !isClientRuntime) return '授权麦克风';
+        if (!isMicrophoneReady.value && !isClientRuntime) return '查看权限说明';
         if (!isMicrophoneReady.value) return '去开启权限';
         if (!store.asrModelId) return '去模型管理';
         return '检查 HTTP 服务';
     });
     const microphoneTooltip = computed(() => {
         if (isMicrophoneReady.value) return '麦克风权限已开启。';
-        return '未开启麦克风权限，语音转文字润色无法收音。';
+        return '未开启 CodexMan App 麦克风权限，语音转文字润色无法收音。';
     });
     const polishAvailabilityTooltip = computed(() => {
         if (isVoicePolishReady.value) return '使用当前文本模型整理并润色语音识别结果。';
@@ -469,22 +471,16 @@
 
     /**
      * 打开麦克风前置条件提示。
-     * 流程：普通 Web 请求浏览器麦克风权限并立即停止临时音轨；客户端委托权限 Store 触发系统授权弹窗。
+     * 流程：普通 Web 只展示产品提示；客户端委托权限 Store 打开系统麦克风设置。
      * 参数：无。
      * 返回：无返回值。
-     * 边界：授权后立即刷新当前页权限状态；授权失败时打开提示弹窗，引导用户到权限管理页继续处理。
+     * 边界：页面本身不调用浏览器麦克风，授权后通过 App 原生诊断刷新状态。
      */
     async function handleOpenMicrophoneRequirement(): Promise<void> {
         if (!isClientRuntime) {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                stream.getTracks().forEach((track) => track.stop());
-                await refreshVoicePermission();
-            } catch {
-                toast.warning('麦克风未授权', {
-                    description: '请在浏览器地址栏的网站权限中允许麦克风访问后重试。'
-                });
-            }
+            toast.info('语音由 CodexMan App 录音', {
+                description: '请打开 CodexMan App，并在 macOS 系统设置中允许 CodexMan 使用麦克风。'
+            });
             return;
         }
         await permissionStore.openPermission('microphone');
@@ -496,7 +492,7 @@
 
     /**
      * 前往权限管理页面。
-     * 流程：先尝试触发真实麦克风授权，再按最新状态决定是否跳转权限管理路由。
+     * 流程：打开 App 麦克风系统设置，再按最新状态决定是否跳转权限管理路由。
      * 参数：无。
      * 返回：无返回值。
      * 边界：授权成功时停留在当前页面继续使用；失败时进入权限管理页展示诊断和系统设置入口。
@@ -520,7 +516,7 @@
     function handlePrimarySetupAction(): void {
         if (!isMicrophoneReady.value) {
             if (!isClientRuntime) {
-                void handleOpenMicrophoneRequirement();
+                void router.push({ name: HubRouteName.Permission });
                 return;
             }
             void handleGoPermissionPage();
@@ -546,12 +542,16 @@
 
     /**
      * 手动开始语音处理。
-     * 流程：使用服务端固定能力执行真实录音、ASR、可选润色和桌面粘贴链路。
+     * 流程：桌面端通过 App 主进程执行录音、ASR、可选润色和粘贴链路。
      * 参数：mode 为本次语音处理模式，asr 只转文字，polish 会继续调用文本模型润色。
      * 返回：无返回值。
-     * 边界：普通 Web 完成录音和 HTTP 处理后在页面展示结果，不执行桌面自动粘贴。
+     * 边界：普通 Web 不录音，只展示需要使用 CodexMan App 的提示。
      */
     async function handleStartVoice(mode: VoicePolishRunModeType): Promise<void> {
+        if (!isClientRuntime) {
+            await store.runVoicePolish('', mode);
+            return;
+        }
         await refreshVoicePermission();
         if (!isMicrophoneReady.value) {
             permissionPromptOpen.value = true;

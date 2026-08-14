@@ -26,10 +26,12 @@ import type {
 import type { ApplicationOptionModel } from '@/model/shortcutBinding';
 import type { PasteResponseModel, SelectedTextResponseModel } from '@/model/textPolish';
 import type {
+    AppVoicePolishResponseModel,
     ProcessTextRequestModel,
     ProcessTextResponseModel,
     TranscribeRequestModel,
-    TranscribeResponseModel
+    TranscribeResponseModel,
+    VoicePolishRunModeType
 } from '@/model/voicePolish';
 
 /** 普通 Web 无法执行桌面系统操作时展示的统一提示。 */
@@ -781,6 +783,20 @@ export async function processText(request: ProcessTextRequestModel): Promise<Pro
         },
         retryTransientErrors: true
     });
+}
+
+/**
+ * 通过 CodexMan App 主进程执行语音输入。
+ * 流程：前端只发起桌面 IPC；录音、ASR、文本整理、历史写入和自动粘贴均由 Rust 侧完成。
+ * 参数：mode 为 asr 或 polish，targetApp 为可选目标应用。
+ * 返回：本次输出和用户提示。
+ * 异常：普通 Web、麦克风权限、模型配置、HTTP 服务或粘贴失败时透传原生错误。
+ */
+export async function runAppVoicePolish(
+    mode: VoicePolishRunModeType,
+    targetApp: string
+): Promise<AppVoicePolishResponseModel> {
+    return invokeDesktop<AppVoicePolishResponseModel>('run_app_voice_polish', { mode, targetApp });
 }
 
 /**

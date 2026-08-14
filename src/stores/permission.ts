@@ -1,7 +1,6 @@
 import { defineStore } from 'pinia';
 
 import type { PermissionItemModel } from '@/model/permission';
-import { requestMicrophoneAccess } from '@/service/speech/audioRecorder';
 import {
     checkPublicApiHealth,
     getRuntimeDiagnostics,
@@ -21,7 +20,7 @@ interface PermissionState {
 }
 
 type PermissionRefreshOptions = {
-    // 是否通过临时 getUserMedia 音频流确认麦克风真实可用。
+    // 兼容旧调用签名；麦克风权限现在只以 App 原生诊断为准。
     probeMicrophoneAccess?: boolean;
 };
 
@@ -35,27 +34,6 @@ type PermissionRefreshOptions = {
 function describePublicApiStatus(connected: boolean, authorized: boolean): string {
     if (!connected) return '未连接';
     return authorized ? '已连接并授权' : '已连接，等待授权';
-}
-
-/**
- * 读取麦克风授权的真实可用状态。
- * 流程：优先信任原生诊断；诊断未授权且调用方要求探测时，申请一次临时音频流并立即关闭。
- * 参数：diagnosticsAuthorized 为 Rust 原生诊断结果；options 控制是否允许触发真实麦克风探测。
- * 返回：当前进程能实际获取麦克风音频流时返回 true。
- * 异常/边界：探测失败会吞掉异常并返回 false，避免权限页刷新被系统拒绝错误打断。
- */
-async function resolveMicrophoneReady(
-    diagnosticsAuthorized: boolean,
-    options: PermissionRefreshOptions
-): Promise<boolean> {
-    if (diagnosticsAuthorized) return true;
-    if (!options.probeMicrophoneAccess) return false;
-    try {
-        await requestMicrophoneAccess();
-        return true;
-    } catch {
-        return false;
-    }
 }
 
 export const usePermissionStore = defineStore('permission', {
@@ -93,19 +71,15 @@ export const usePermissionStore = defineStore('permission', {
     actions: {
         /**
          * 刷新系统权限与 HTTP 服务状态。
-         * 流程：Web 检查浏览器麦克风和公共服务；桌面额外读取辅助功能及快捷键真实诊断。
+         * 流程：Web 只检查公共服务；桌面读取 CodexMan App 的麦克风、辅助功能和快捷键真实诊断。
          * 返回：刷新完成 Promise。
          * 边界：不把 CORS 或健康检查当作业务鉴权；异常写入 message 供页面排障。
          */
         async refreshPermissions(options: PermissionRefreshOptions = {}): Promise<void> {
+            void options;
             this.loading = true;
             try {
                 if (!isTauriRuntime()) {
-                    const browserMicrophoneReady = await navigator.permissions
-                        ?.query({ name: 'microphone' as PermissionName })
-                        .then((permission) => permission.state === 'granted')
-                        .catch(() => false);
-                    const microphoneReady = await resolveMicrophoneReady(browserMicrophoneReady, options);
                     const publicApiConnected = await checkPublicApiHealth();
                     const publicApiAuthorized = publicApiConnected && (await hasPublicApiToken());
                     this.items = [
@@ -119,9 +93,9 @@ export const usePermissionStore = defineStore('permission', {
                         {
                             key: 'microphone',
                             name: '麦克风',
-                            description: '语音转文字和语音转文字润色需要。',
-                            ready: microphoneReady,
-                            message: microphoneReady ? '已授权' : '等待浏览器授权'
+                            description: '语音转文字和语音转文字润色由 CodexMan App 录音。',
+                            ready: false,
+                            message: '请在 CodexMan App 中授权'
                         },
                         {
                             key: 'accessibility',
@@ -141,10 +115,7 @@ export const usePermissionStore = defineStore('permission', {
                     return;
                 }
                 const diagnostics = await getRuntimeDiagnostics();
-                const microphoneReady = await resolveMicrophoneReady(
-                    Boolean(diagnostics?.microphoneAuthorized),
-                    options
-                );
+                const microphoneReady = Boolean(diagnostics?.microphoneAuthorized);
                 const publicApiConnected = await checkPublicApiHealth();
                 const publicApiAuthorized = publicApiConnected && (await hasPublicApiToken());
                 this.items = [
@@ -186,25 +157,16 @@ export const usePermissionStore = defineStore('permission', {
 
         /**
          * 打开指定系统权限设置。
-         * 流程：麦克风先通过 WebView 触发系统授权弹窗，失败后再打开系统设置；辅助功能直接打开系统设置。
+         * 流程：麦克风和辅助功能均打开 macOS 系统设置；授权状态通过 App 原生诊断刷新。
          * 参数：key 为权限稳定键。
          * 返回：打开完成 Promise。
          * 边界：HTTP 服务与快捷键状态不映射系统设置，因此不会触发命令。
          */
         async openPermission(key: PermissionItemModel['key']): Promise<void> {
             if (key === 'microphone') {
-                try {
-                    await requestMicrophoneAccess();
-                    this.message = '麦克风授权请求已完成。';
-                } catch (error) {
-                    this.message =
-                        error instanceof Error
-                            ? `未能直接获取麦克风权限：${error.message}`
-                            : '未能直接获取麦克风权限。';
-                    if (isTauriRuntime()) await openMicrophoneSettings();
-                } finally {
-                    await this.refreshPermissions({ probeMicrophoneAccess: true });
-                }
+                if (isTauriRuntime()) await openMicrophoneSettings();
+                this.message = isTauriRuntime() ? '已打开麦克风权限设置。' : '请在 CodexMan App 中授权麦克风。';
+                await this.refreshPermissions();
             }
             if (key === 'accessibility') {
                 await openAccessibilitySettings();

@@ -75,3 +75,19 @@ export type ProcessTextResponseModel = {
     // 服务端实际采用的不透明模型 ID。
     modelId: string;
 };
+
+// App 原生语音执行响应，用于桌面端快捷键和手动按钮刷新页面状态。
+export type AppVoicePolishResponseModel = {
+    // ASR 原文。
+    sourceText: string;
+    // 最终输出文本。
+    outputText: string;
+    // 运行模式。
+    mode: VoicePolishRunModeType;
+    // 触发时的前台应用。
+    contextApp: string;
+    // 本次录音时长。
+    audioDurationMs: number;
+    // 用户可读完成提示。
+    message: string;
+};

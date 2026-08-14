@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod app_audio;
 mod codex_cdp;
 mod codex_desktop;
 mod desktop_error;
@@ -19,7 +20,9 @@ use std::sync::{mpsc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use base64::Engine;
 use rusqlite::{params, Connection, OpenFlags};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, LogicalPosition, Manager, Position, State};
@@ -69,6 +72,8 @@ const PASTE_FOCUS_RETRY_DELAY_MS: u64 = 75;
 const LOCAL_CONFIG_FILE_NAME: &str = "codexman-config.json";
 /// 系统设置分区 key；必须与前端 `StorageKey.settings` 保持一致。
 const LOCAL_CONFIG_SETTINGS_KEY: &str = "codexman.settings.v1";
+/// 语音润色分区 key；必须与前端 `StorageKey.voicePolish` 保持一致。
+const LOCAL_CONFIG_VOICE_POLISH_KEY: &str = "codexman.voicePolish.v1";
 /// 首发客户端配置格式版本；未知版本必须拒绝，禁止静默兼容历史结构。
 const LOCAL_CONFIG_VERSION: u32 = 1;
 const LOCAL_CONFIG_WATCH_INTERVAL_MS: u64 = 500;
@@ -137,6 +142,12 @@ const CODEX_CDP_THREAD_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CDP_THREAD_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
 /// Token 续签和清除 IPC 的稳定桌面错误码；统一入口会附加唯一诊断 ID，且不记录 Token 正文。
 const PUBLIC_API_TOKEN_IPC_ERROR_CODE: &str = "DESKTOP_OPERATION_FAILED";
+const PUBLIC_API_BASE_URL: &str = "http://127.0.0.1:18080";
+const APP_VOICE_RECORD_MAX_DURATION_MS: u64 = 30_000;
+const APP_VOICE_AUDIO_MAX_BYTES: usize = 25 * 1024 * 1024;
+const APP_VOICE_PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(65);
+const APP_VOICE_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
+const APP_VOICE_TOKEN_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const BROWSER_EXTENSION_ZIP_BYTES: &[u8] =
     include_bytes!("../../public/downloads/typesass-extension.zip");
 const BROWSER_EXTENSION_ZIP_FILE_NAME: &str = "typesass-extension.zip";
@@ -295,6 +306,28 @@ struct RuntimePublicApiToken {
     token: Mutex<String>,
 }
 
+/// 运行期间的 App 原生语音处理门禁。
+#[derive(Default)]
+struct RuntimeAppVoiceRecorder {
+    /// 是否已有一次录音、识别或粘贴流程正在运行。
+    running: Mutex<bool>,
+}
+
+/// App 原生语音处理并发门禁；离开作用域时自动释放运行态。
+struct AppVoiceRunGuard {
+    /// 需要在 Drop 中复位运行状态的 App 句柄。
+    app: tauri::AppHandle,
+}
+
+impl Drop for AppVoiceRunGuard {
+    fn drop(&mut self) {
+        let state = self.app.state::<RuntimeAppVoiceRecorder>();
+        if let Ok(mut running) = state.running.lock() {
+            *running = false;
+        };
+    }
+}
+
 /// 私有模型连通性测试 IPC 响应。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -306,6 +339,100 @@ struct PrivateModelTestResponse {
     error_code: Option<String>,
     /// 可向用户展示且不含密钥或响应正文的结果说明。
     message: String,
+}
+
+/// 语音润色持久化配置；字段必须与前端 `VoicePolishPersistedState` 对齐。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoicePolishPersistedState {
+    /// 当前语音识别模型的不透明服务目录 ID。
+    asr_model_id: String,
+    /// 当前语音整理模型的不透明服务目录 ID。
+    text_model_id: String,
+    /// 本模块词典。
+    dictionary: Vec<VoicePolishDictionaryItem>,
+    /// 本模块历史记录。
+    history: Vec<VoicePolishHistoryItem>,
+    /// 输出风格偏好。
+    style_instruction: String,
+}
+
+/// 语音词典条目，供 App 原生流水线向文本处理接口传递专有名词。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoicePolishDictionaryItem {
+    /// 词条文本。
+    word: String,
+    /// 创建时间 ISO 字符串。
+    created_at: String,
+}
+
+/// 语音历史条目；App 端写入后由客户端 JSON 监听同步到页面。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoicePolishHistoryItem {
+    /// 历史 ID，本地生成用于列表渲染和菜单去重。
+    id: String,
+    /// ASR 原文。
+    source_text: String,
+    /// 最终输出文本。
+    output_text: String,
+    /// 触发时的前台应用。
+    context_app: String,
+    /// 创建时间 ISO 字符串。
+    created_at: String,
+}
+
+/// 公共服务安全模型目录项。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicModelCatalogItem {
+    /// 不透明模型 ID。
+    id: String,
+    /// 用户可读模型名称。
+    display_name: String,
+    /// 模型能力。
+    capability: String,
+    /// 是否可用于业务调用。
+    enabled: bool,
+    /// 是否为当前能力默认模型。
+    is_default: bool,
+}
+
+/// App 原生语音执行结果，返回给前端手动入口用于即时刷新状态。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppVoicePolishResponse {
+    /// ASR 原文。
+    source_text: String,
+    /// 最终输出文本。
+    output_text: String,
+    /// 运行模式，asr 表示仅转写，polish 表示转写后整理。
+    mode: String,
+    /// 触发时的前台应用。
+    context_app: String,
+    /// 本次录音时长。
+    audio_duration_ms: u64,
+    /// 自动粘贴结果；没有目标 App 时为空。
+    paste: Option<PasteResponse>,
+    /// 用户可读完成提示。
+    message: String,
+}
+
+/// 公共 ASR 接口响应。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppVoiceTranscribeResponse {
+    /// 转写后的文本。
+    text: String,
+}
+
+/// 公共文本处理接口响应。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppVoiceProcessResponse {
+    /// 处理后的文本。
+    processed_text: String,
 }
 
 /// 读取本机私有模型安全元数据。
@@ -1231,7 +1358,7 @@ impl Default for ShortcutProfile {
 }
 
 /// 自动粘贴命令的执行结果。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PasteResponse {
     /// 是否已成功发出系统粘贴指令；该字段不代表目标输入框已插入文字。
@@ -1455,6 +1582,7 @@ pub fn run() {
         .manage(RuntimeAccessTokenApproval::default())
         .manage(RuntimeDictationHistory::default())
         .manage(RuntimePasteFocusSnapshot::default())
+        .manage(RuntimeAppVoiceRecorder::default())
         .manage(RuntimeLocalConfigWatcher::default())
         .manage(RuntimePrivateRpc::default())
         .manage(RuntimeSidecar::default())
@@ -1554,6 +1682,7 @@ pub fn run() {
             set_system_output_muted,
             play_native_interaction_sound,
             sync_tray_dictation_history,
+            run_app_voice_polish,
             read_local_config_value,
             write_local_config_value,
             remove_local_config_value,
@@ -1926,6 +2055,464 @@ fn sync_tray_dictation_history(
     refresh_tray_menu(&app, &normalized_items)
 }
 
+/// 通过 CodexMan App 主进程执行一次语音输入。
+/// 流程：仅允许桌面窗口调用，真正录音、识别、润色和粘贴均在 Rust 侧完成，网页不再访问浏览器麦克风。
+/// 参数：window 为调用窗口，mode 为 asr/dictate，target_app 为可选目标应用。
+/// 返回：本次输出、录音时长和可选粘贴结果。
+/// 异常/边界：非桌面窗口、并发运行、权限缺失、服务不可用或模型缺失均返回明确错误。
+#[tauri::command]
+async fn run_app_voice_polish(
+    window: tauri::WebviewWindow,
+    mode: String,
+    target_app: String,
+) -> Result<AppVoicePolishResponse, String> {
+    ensure_app_voice_window(window.label())?;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_app_voice_polish_core(&app, &mode, &target_app)
+    })
+    .await
+    .map_err(|error| format!("执行 App 语音任务失败：{}", error))?
+}
+
+/// 校验 App 原生语音入口窗口。
+/// 流程：Hub 主窗口和悬浮主窗口允许发起；普通网页没有 Tauri IPC，结果窗口和提示窗口默认拒绝。
+/// 参数：window_label 为 Tauri 运行时注入的窗口标签。
+/// 返回：允许时为空。
+/// 异常/边界：未知窗口 fail-closed，避免临时窗口误触发录音。
+fn ensure_app_voice_window(window_label: &str) -> Result<(), String> {
+    match window_label {
+        "hub" | "main" => Ok(()),
+        _ => Err("当前窗口不能发起 App 录音（错误码：APP_VOICE_WINDOW_FORBIDDEN）".to_string()),
+    }
+}
+
+/// 执行 App 原生语音处理核心流程。
+/// 流程：串行门禁、刷新服务模型、主进程录音、ASR、可选文本整理、写入历史、自动粘贴或结果兜底。
+/// 参数：app 为 Tauri 句柄，mode 为 asr/dictate，target_app 为触发时前台应用。
+/// 返回：本次结构化结果。
+/// 异常/边界：全链路只通过稳定错误返回失败，不在失败时写入伪历史或伪粘贴成功。
+fn run_app_voice_polish_core(
+    app: &tauri::AppHandle,
+    mode: &str,
+    target_app: &str,
+) -> Result<AppVoicePolishResponse, String> {
+    let normalized_mode = normalize_app_voice_mode(mode)?;
+    let _guard = begin_app_voice_run(app)?;
+    let normalized_target_app = normalize_target_app_name(target_app);
+    emit_hub_notice(app, "正在录音，请稍后。", "running");
+
+    let mut persisted = read_voice_polish_persisted_state(app)?;
+    let catalog = request_public_api_json::<Vec<PublicModelCatalogItem>>(app, "/v1/models", None)?;
+    let asr_selection = resolve_app_voice_model_selection(
+        app,
+        &catalog,
+        "asr",
+        &persisted.asr_model_id,
+        "语音转文字",
+    )?;
+    let text_selection = if normalized_mode == "polish" {
+        Some(resolve_app_voice_model_selection(
+            app,
+            &catalog,
+            "text",
+            &persisted.text_model_id,
+            "语音转文字润色",
+        )?)
+    } else {
+        None
+    };
+    persisted.asr_model_id = asr_selection.model_id.clone();
+    if let Some(selection) = text_selection.as_ref() {
+        persisted.text_model_id = selection.model_id.clone();
+    }
+
+    let audio = app_audio::record_microphone_wav(APP_VOICE_RECORD_MAX_DURATION_MS)?;
+    if audio.bytes.len() > APP_VOICE_AUDIO_MAX_BYTES {
+        return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
+    }
+
+    emit_hub_notice(app, "正在识别语音。", "running");
+    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio.bytes);
+    let transcribed = request_public_api_json::<AppVoiceTranscribeResponse>(
+        app,
+        "/v1/audio/transcriptions",
+        Some(json!({
+            "modelId": asr_selection.model_id,
+            "audioBase64": audio_base64,
+            "contentType": audio.content_type,
+            "language": "auto"
+        })),
+    )?;
+    let source_text = transcribed.text.trim().to_string();
+    if source_text.is_empty() {
+        return Err("没有识别到有效语音内容，请靠近麦克风后重试。".to_string());
+    }
+
+    let output_text = if let Some(selection) = text_selection {
+        emit_hub_notice(app, "正在润色文本。", "running");
+        let dictionary = persisted
+            .dictionary
+            .iter()
+            .map(|item| item.word.trim().to_string())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let processed = request_public_api_json::<AppVoiceProcessResponse>(
+            app,
+            "/v1/text/process",
+            Some(json!({
+                "modelId": selection.model_id,
+                "mode": "dictate",
+                "text": source_text,
+                "audioDurationMs": audio.duration_ms,
+                "dictionary": dictionary,
+                "contextApp": normalized_target_app,
+                "styleInstruction": persisted.style_instruction
+            })),
+        )?;
+        processed.processed_text.trim().to_string()
+    } else {
+        source_text.clone()
+    };
+    if output_text.is_empty() {
+        return Err("语音处理结果为空，请调整模型配置后重试。".to_string());
+    }
+
+    let history_item = VoicePolishHistoryItem {
+        id: format!(
+            "voice-{}",
+            system_time_to_millis(SystemTime::now()).unwrap_or(0)
+        ),
+        source_text: source_text.clone(),
+        output_text: output_text.clone(),
+        context_app: normalized_target_app.clone(),
+        created_at: local_config_updated_at(),
+    };
+    persisted.history.insert(0, history_item);
+    persisted.history.truncate(80);
+    write_voice_polish_persisted_state(app, &persisted)?;
+    sync_native_dictation_history(app, &persisted.history);
+
+    let paste = if normalized_target_app.is_empty() {
+        None
+    } else {
+        let paste_state = app.state::<RuntimePasteFocusSnapshot>();
+        let paste_result =
+            paste_text_core(app, &paste_state, &output_text, &normalized_target_app)?;
+        if !paste_result.command_sent {
+            let result_state = app.state::<RuntimeResult>();
+            show_result_window_core(
+                app,
+                &result_state,
+                &output_text,
+                &paste_result.message,
+                paste_result.requires_accessibility,
+            )?;
+        }
+        Some(paste_result)
+    };
+    let completed_message = if normalized_mode == "asr" {
+        "语音转文字已完成。"
+    } else {
+        "语音润色已完成。"
+    };
+    emit_hub_notice(app, completed_message, "success");
+
+    Ok(AppVoicePolishResponse {
+        source_text,
+        output_text,
+        mode: normalized_mode,
+        context_app: normalized_target_app,
+        audio_duration_ms: audio.duration_ms,
+        paste,
+        message: completed_message.to_string(),
+    })
+}
+
+/// 归一化 App 原生语音模式。
+/// 流程：asr 保留纯转写，dictate 映射为语音润色；polish 属于文本润色快捷键，不进入录音链路。
+/// 参数：mode 为快捷键或前端传入值。
+/// 返回：asr 或 polish。
+/// 异常/边界：未知模式直接拒绝，避免把文字润色快捷键误当录音。
+fn normalize_app_voice_mode(mode: &str) -> Result<String, String> {
+    match mode.trim() {
+        "asr" => Ok("asr".to_string()),
+        "" | "dictate" => Ok("polish".to_string()),
+        "polish" => Err("文本润色快捷键不需要录音，请使用选中文本润色流程。".to_string()),
+        _ => Err("未知语音输入模式。".to_string()),
+    }
+}
+
+/// 开始一次 App 原生语音处理并获取并发门禁。
+/// 流程：检查运行态，空闲时置为运行中并返回 Drop guard。
+/// 参数：app 为 Tauri 句柄，用于读取运行状态。
+/// 返回：自动释放的运行门禁。
+/// 异常/边界：已有任务运行时拒绝新任务，避免同时抢占麦克风和粘贴目标。
+fn begin_app_voice_run(app: &tauri::AppHandle) -> Result<AppVoiceRunGuard, String> {
+    let state = app.state::<RuntimeAppVoiceRecorder>();
+    let mut running = state
+        .running
+        .lock()
+        .map_err(|_| "读取语音任务状态失败：状态锁已损坏".to_string())?;
+    if *running {
+        return Err("已有一次语音输入正在处理中，请稍后再试。".to_string());
+    }
+    *running = true;
+    drop(running);
+    Ok(AppVoiceRunGuard { app: app.clone() })
+}
+
+/// 模型选择结果。
+struct AppVoiceModelSelection {
+    /// 可发送给公共服务的不透明模型 ID。
+    model_id: String,
+}
+
+/// 从服务模型目录解析指定能力的可用模型。
+/// 流程：优先保留已保存选择，其次选择默认模型，最后使用首个启用模型。
+/// 参数：catalog 为公共目录，capability 为能力，selected_id 为保存值，usage_label 为错误提示前缀。
+/// 返回：可用模型 ID。
+/// 异常/边界：没有启用模型时停止语音链路，不猜测模型名。
+fn resolve_app_voice_model_selection(
+    app: &tauri::AppHandle,
+    catalog: &[PublicModelCatalogItem],
+    capability: &str,
+    selected_id: &str,
+    usage_label: &str,
+) -> Result<AppVoiceModelSelection, String> {
+    let candidates = catalog
+        .iter()
+        .filter(|model| model.capability == capability && model.enabled)
+        .collect::<Vec<_>>();
+    if let Some(selected) = candidates.iter().find(|model| model.id == selected_id) {
+        return Ok(AppVoiceModelSelection {
+            model_id: selected.id.clone(),
+        });
+    }
+    let fallback = candidates
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| candidates.first())
+        .ok_or_else(|| {
+            format!(
+                "{}没有可用模型，请在模型管理中添加并启用对应能力。",
+                usage_label
+            )
+        })?;
+    if !selected_id.trim().is_empty() {
+        emit_hub_notice(
+            app,
+            &format!(
+                "{}原选择已失效，已回退到“{}”。",
+                usage_label, fallback.display_name
+            ),
+            "idle",
+        );
+    }
+    Ok(AppVoiceModelSelection {
+        model_id: fallback.id.clone(),
+    })
+}
+
+/// 读取语音润色持久化配置。
+/// 流程：从客户端 JSON 配置文件读取分区并按当前结构解析。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：配置缺失时返回默认值。
+/// 异常/边界：配置损坏显式失败，避免用默认值覆盖用户现场。
+fn read_voice_polish_persisted_state(
+    app: &tauri::AppHandle,
+) -> Result<VoicePolishPersistedState, String> {
+    let document = read_local_config_document(app)?;
+    let Some(value) = document.items.get(LOCAL_CONFIG_VOICE_POLISH_KEY) else {
+        return Ok(VoicePolishPersistedState::default());
+    };
+    serde_json::from_value::<VoicePolishPersistedState>(value.clone())
+        .map_err(|error| format!("解析语音润色配置失败：{}", error))
+}
+
+/// 写入语音润色持久化配置并广播配置变化。
+/// 流程：只更新语音分区，保留其它模块配置，随后发送 local-config-changed 给所有 WebView。
+/// 参数：app 为 Tauri 句柄，state 为新配置。
+/// 返回：写入完成结果。
+/// 异常/边界：写入失败时不广播，避免页面读取半完成状态。
+fn write_voice_polish_persisted_state(
+    app: &tauri::AppHandle,
+    state: &VoicePolishPersistedState,
+) -> Result<(), String> {
+    let mut document = read_local_config_document(app)?;
+    document.version = LOCAL_CONFIG_VERSION;
+    document.updated_at = local_config_updated_at();
+    document.items.insert(
+        LOCAL_CONFIG_VOICE_POLISH_KEY.to_string(),
+        serde_json::to_value(state)
+            .map_err(|error| format!("序列化语音润色配置失败：{}", error))?,
+    );
+    write_local_config_document(app, &document)?;
+    emit_local_config_changed(app, &document);
+    Ok(())
+}
+
+/// 同步 App 原生写入后的口述历史到托盘菜单。
+/// 流程：把最近历史转成托盘菜单安全摘要，刷新内存状态和菜单。
+/// 参数：app 为 Tauri 句柄，history 为语音历史。
+/// 返回：无。
+/// 异常/边界：托盘不可用或锁损坏只记录提示，不影响语音主链路。
+fn sync_native_dictation_history(app: &tauri::AppHandle, history: &[VoicePolishHistoryItem]) {
+    let items = history
+        .iter()
+        .take(8)
+        .filter_map(|item| {
+            normalize_tray_history_item(TrayHistoryItem {
+                id: item.id.clone(),
+                title: make_tray_history_title(&item.output_text, 32),
+                text: item.output_text.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Ok(mut stored_items) = app.state::<RuntimeDictationHistory>().items.lock() {
+        *stored_items = items.clone();
+    }
+    if let Err(error) = refresh_tray_menu(app, &items) {
+        eprintln!("刷新口述托盘历史失败：{}", trim_error_message(&error));
+    }
+}
+
+/// 调用本机公共 HTTP 服务并解析 JSON。
+/// 流程：等待 sidecar Token 就绪，发送 Bearer JSON 请求；401 时尝试续签一次。
+/// 参数：app 为 Tauri 句柄，path 为接口路径，payload 为空表示 GET，否则 POST JSON。
+/// 返回：反序列化后的响应模型。
+/// 异常/边界：服务未启动、超时、响应格式错误或业务错误均带可读诊断。
+fn request_public_api_json<T>(
+    app: &tauri::AppHandle,
+    path: &str,
+    payload: Option<Value>,
+) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    let token = wait_for_public_api_token(app)?;
+    match perform_public_api_json_request(app, path, payload.clone(), &token) {
+        Ok(value) => Ok(value),
+        Err(error) if error.contains("错误码：401") => {
+            let refreshed_token = app
+                .state::<RuntimeSidecar>()
+                .refresh_access_token()
+                .and_then(|token| {
+                    store_public_api_token(&app.state::<RuntimePublicApiToken>(), token.clone())?;
+                    Ok(token)
+                })?;
+            perform_public_api_json_request(app, path, payload, &refreshed_token)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// 执行一次公共 HTTP JSON 请求。
+/// 流程：按 payload 判断 GET/POST，使用固定本机地址和短期 Bearer Token。
+/// 参数：app 为诊断上下文，path 为接口路径，payload 为可选 JSON，token 为当前会话 Token。
+/// 返回：反序列化响应。
+/// 异常/边界：非 2xx 响应会尝试解析统一错误 envelope。
+fn perform_public_api_json_request<T>(
+    app: &tauri::AppHandle,
+    path: &str,
+    payload: Option<Value>,
+    token: &str,
+) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    let client = reqwest::blocking::Client::builder()
+        .timeout(APP_VOICE_PUBLIC_API_TIMEOUT)
+        .build()
+        .map_err(|error| format!("创建本机 HTTP 客户端失败：{}", error))?;
+    let url = format!("{}{}", PUBLIC_API_BASE_URL, path);
+    let request = if let Some(value) = payload {
+        client.post(url).json(&value)
+    } else {
+        client.get(url)
+    }
+    .header("Accept", "application/json")
+    .bearer_auth(token);
+    let response = request
+        .send()
+        .map_err(|error| format!("CodexMan HTTP 服务暂时不可用：{}", error))?;
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|error| format!("读取 CodexMan HTTP 响应失败：{}", error))?;
+    if status.is_success() {
+        return serde_json::from_str::<T>(&response_text)
+            .map_err(|error| format!("CodexMan HTTP 响应格式无效：{}", error));
+    }
+    Err(parse_public_api_error_message(
+        app,
+        status.as_u16(),
+        &response_text,
+    ))
+}
+
+/// 解析公共 API 错误响应。
+/// 流程：优先读取统一 envelope 中的 code/message/requestId，失败时返回 HTTP 状态。
+/// 参数：app 只作为未来诊断上下文保留，status 为 HTTP 状态码，response_text 为原始响应。
+/// 返回：可展示错误文案。
+/// 异常/边界：不会把响应体完整透出到界面，避免泄露上游细节。
+fn parse_public_api_error_message(
+    app: &tauri::AppHandle,
+    status: u16,
+    response_text: &str,
+) -> String {
+    let _ = app;
+    let parsed = serde_json::from_str::<Value>(response_text).ok();
+    let error = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|value| value.as_object());
+    let code = error
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| if status == 401 { "401" } else { "HTTP_ERROR" });
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("CodexMan HTTP 服务请求失败。");
+    let request_id = error
+        .and_then(|value| value.get("requestId"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if request_id.is_empty() {
+        format!("{}（错误码：{}）", trim_error_message(message), code)
+    } else {
+        format!(
+            "{}（错误码：{}，请求 ID：{}）",
+            trim_error_message(message),
+            code,
+            request_id
+        )
+    }
+}
+
+/// 等待 sidecar 写入公共 HTTP 短期 Token。
+/// 流程：在启动窗口内轮询内存 Token，避免 App 首屏先显示后 sidecar 仍在冷启动导致语音立即失败。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：非空 Token。
+/// 异常/边界：超时后提示本机服务仍在启动或不可用。
+fn wait_for_public_api_token(app: &tauri::AppHandle) -> Result<String, String> {
+    let deadline = Instant::now() + APP_VOICE_TOKEN_WAIT_TIMEOUT;
+    while Instant::now() < deadline {
+        let token = app
+            .state::<RuntimePublicApiToken>()
+            .token
+            .lock()
+            .map_err(|_| "读取本机 HTTP 会话失败：状态锁已损坏".to_string())?
+            .clone();
+        if !token.trim().is_empty() {
+            return Ok(token);
+        }
+        thread::sleep(APP_VOICE_TOKEN_WAIT_INTERVAL);
+    }
+    Err("CodexMan 本机服务仍在启动，请稍后再试。".to_string())
+}
+
 /// 清理托盘历史条目，避免空文本或超长标题影响原生菜单。
 fn normalize_tray_history_item(item: TrayHistoryItem) -> Option<TrayHistoryItem> {
     let text = item.text.trim().to_string();
@@ -2070,6 +2657,11 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
     if mode.trim().is_empty() {
         return;
     }
+    if mode == "polish" {
+        present_hub_view(&app, "textPolish");
+        emit_hub_event(app, "hub-start-mode", "polish".to_string());
+        return;
+    }
     let frontmost_app = get_frontmost_app().unwrap_or_default();
     let context = resolve_voice_trigger_context(&frontmost_app);
     let main_is_visible = is_window_visible(&app, "main");
@@ -2091,25 +2683,19 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
     }
     let mode = mode.to_string();
     let target_app = context.target_app;
-    let keep_hub_visible = context.keep_hub_visible;
     thread::spawn(move || {
-        if !main_is_visible {
-            thread::sleep(Duration::from_millis(180));
-        }
-        if let Some(window) = app.get_webview_window("main") {
-            let mode_json =
-                serde_json::to_string(&mode).unwrap_or_else(|_| "\"dictate\"".to_string());
-            let target_app_json =
-                serde_json::to_string(&target_app).unwrap_or_else(|_| "\"\"".to_string());
-            let keep_hub_visible_json = keep_hub_visible.to_string();
-            let script = format!(
-                r#"if (window.__AIToolHandleShortcutMode) {{
-                    window.__AIToolHandleShortcutMode({mode_json}, {target_app_json}, {keep_hub_visible_json});
-                }} else {{
-                    window.__AIToolPendingShortcutMode = {{ mode: {mode_json}, targetApp: {target_app_json}, keepHubVisible: {keep_hub_visible_json} }};
-                }}"#
+        if let Err(error) = run_app_voice_polish_core(&app, &mode, &target_app) {
+            let message = desktop_error::record_desktop_error(
+                &app,
+                "APP_VOICE_PIPELINE_FAILED",
+                "app_voice_shortcut",
+                None,
+                &error,
             );
-            let _ = window.eval(&script);
+            emit_hub_notice(&app, &message, "error");
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.hide();
+            }
         }
     });
 }
@@ -5351,6 +5937,21 @@ fn show_result_window(
     reason: String,
     requires_accessibility: bool,
 ) -> Result<(), String> {
+    show_result_window_core(&app, &result_state, &text, &reason, requires_accessibility)
+}
+
+/// 显示转写结果窗口，用于自动粘贴失败或没有输入焦点时手动复制。
+/// 流程：保存最近结果、定位结果窗口、置顶展示并向窗口发送渲染事件。
+/// 参数：app 为 Tauri 句柄，result_state 为最近结果缓存，text/reason 为展示内容，requires_accessibility 表示是否提示授权。
+/// 返回：展示完成结果。
+/// 异常/边界：空文本和窗口不可用时显式失败，不吞掉关键兜底错误。
+fn show_result_window_core(
+    app: &tauri::AppHandle,
+    result_state: &RuntimeResult,
+    text: &str,
+    reason: &str,
+    requires_accessibility: bool,
+) -> Result<(), String> {
     let normalized_text = text.trim();
     if normalized_text.is_empty() {
         return Err("没有可展示的转写结果".to_string());
@@ -6440,12 +7041,26 @@ async fn paste_text(
     text: String,
     target_app: String,
 ) -> Result<PasteResponse, String> {
+    paste_text_core(&app, &focus_snapshot_state, &text, &target_app)
+}
+
+/// 把文字写入系统剪贴板，并模拟 Cmd+V 粘贴到当前前台输入框。
+/// 流程：隐藏临时窗口、校验粘贴目标、备份剪贴板、发送系统粘贴并恢复原剪贴板。
+/// 参数：app 为 Tauri 句柄，focus_snapshot_state 为录音开始时的焦点快照，text 为待粘贴文本，target_app 为目标 App。
+/// 返回：粘贴门禁、剪贴板恢复和系统指令发送结果。
+/// 异常/边界：空文本、权限不足、目标变化或剪贴板备份失败都不会伪报插入成功。
+fn paste_text_core(
+    app: &tauri::AppHandle,
+    focus_snapshot_state: &RuntimePasteFocusSnapshot,
+    text: &str,
+    target_app: &str,
+) -> Result<PasteResponse, String> {
     let normalized_text = text.trim();
     if normalized_text.is_empty() {
         return Err("转写结果为空，无法自动粘贴".to_string());
     }
 
-    hide_transient_voice_windows(&app);
+    hide_transient_voice_windows(app);
     thread::sleep(Duration::from_millis(PASTE_WINDOW_SETTLE_DELAY_MS));
     let frontmost_before_paste = get_frontmost_app().unwrap_or_default();
     let paste_target = resolve_paste_target(&target_app, &frontmost_before_paste);

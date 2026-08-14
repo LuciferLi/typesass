@@ -9,7 +9,7 @@
                 variant="secondary"
                 type="button"
                 title="触发语音润色"
-                @click="voiceStore.runVoicePolish(targetApp)">
+                @click="voiceStore.runVoicePolish()">
                 <microphone
                     theme="outline"
                     size="16" />
@@ -25,7 +25,7 @@
                 variant="outline"
                 type="button"
                 title="确认"
-                @click="voiceStore.runVoicePolish(targetApp)">
+                @click="voiceStore.runVoicePolish()">
                 <check-small
                     theme="outline"
                     size="16" />
@@ -39,7 +39,6 @@
 
     import { Button as UiButton } from '@/components/ui/button';
     import { Card as UiCard } from '@/components/ui/card';
-    import { useTextPolishStore } from '@/stores/textPolish';
     import { useVoicePolishStore } from '@/stores/voicePolish';
 
     defineOptions({
@@ -47,25 +46,4 @@
     });
 
     const voiceStore = useVoicePolishStore();
-    const textStore = useTextPolishStore();
-    const targetApp = ref('');
-
-    onMounted(() => {
-        const nativeWindow = window as Window & {
-            __AIToolHandleShortcutMode?: (mode: string, app: string) => void;
-            __AIToolPendingShortcutMode?: { mode: string; targetApp: string };
-        };
-        nativeWindow.__AIToolHandleShortcutMode = (mode: string, app: string) => {
-            targetApp.value = app;
-            if (mode === 'polish') void textStore.polishSelectedText();
-            if (mode === 'asr') void voiceStore.runVoicePolish(app, 'asr');
-            if (mode === 'dictate') void voiceStore.runVoicePolish(app);
-        };
-        if (nativeWindow.__AIToolPendingShortcutMode) {
-            nativeWindow.__AIToolHandleShortcutMode(
-                nativeWindow.__AIToolPendingShortcutMode.mode,
-                nativeWindow.__AIToolPendingShortcutMode.targetApp
-            );
-        }
-    });
 </script>
