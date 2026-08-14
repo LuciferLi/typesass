@@ -365,6 +365,6 @@
     }
 
     onMounted(() => {
-        void store.refreshPermissions();
+        void store.refreshPermissions({ probeMicrophoneAccess: true });
     });
 </script>

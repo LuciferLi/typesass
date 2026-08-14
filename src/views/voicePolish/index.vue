@@ -415,13 +415,13 @@
 
     /**
      * 刷新语音润色所需权限状态。
-     * 流程：进入页面时刷新一次权限；如果麦克风权限仍未满足，则启动 10 秒轮询，授权后停止轮询。
+     * 流程：进入页面时刷新一次权限，并通过临时音频流确认麦克风真实可用；如果仍未满足，则启动 10 秒轮询，授权后停止轮询。
      * 参数：无。
      * 返回：无返回值。
      * 边界：轮询只刷新权限 Store，不读取或修改 ASR、文本模型状态。
      */
     async function refreshVoicePermission(): Promise<void> {
-        await permissionStore.refreshPermissions();
+        await permissionStore.refreshPermissions({ probeMicrophoneAccess: true });
         if (isMicrophoneReady.value) {
             stopPermissionRefreshTimer();
             return;

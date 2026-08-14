@@ -20,6 +20,11 @@ interface PermissionState {
     message: string;
 }
 
+type PermissionRefreshOptions = {
+    // 是否通过临时 getUserMedia 音频流确认麦克风真实可用。
+    probeMicrophoneAccess?: boolean;
+};
+
 /**
  * 生成公共 HTTP 服务的可判断状态说明。
  * 流程：先判断网络连通，再判断当前运行会话是否持有 Token，避免把健康检查伪报为业务已就绪。
@@ -30,6 +35,27 @@ interface PermissionState {
 function describePublicApiStatus(connected: boolean, authorized: boolean): string {
     if (!connected) return '未连接';
     return authorized ? '已连接并授权' : '已连接，等待授权';
+}
+
+/**
+ * 读取麦克风授权的真实可用状态。
+ * 流程：优先信任原生诊断；诊断未授权且调用方要求探测时，申请一次临时音频流并立即关闭。
+ * 参数：diagnosticsAuthorized 为 Rust 原生诊断结果；options 控制是否允许触发真实麦克风探测。
+ * 返回：当前进程能实际获取麦克风音频流时返回 true。
+ * 异常/边界：探测失败会吞掉异常并返回 false，避免权限页刷新被系统拒绝错误打断。
+ */
+async function resolveMicrophoneReady(
+    diagnosticsAuthorized: boolean,
+    options: PermissionRefreshOptions
+): Promise<boolean> {
+    if (diagnosticsAuthorized) return true;
+    if (!options.probeMicrophoneAccess) return false;
+    try {
+        await requestMicrophoneAccess();
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 export const usePermissionStore = defineStore('permission', {
@@ -71,14 +97,15 @@ export const usePermissionStore = defineStore('permission', {
          * 返回：刷新完成 Promise。
          * 边界：不把 CORS 或健康检查当作业务鉴权；异常写入 message 供页面排障。
          */
-        async refreshPermissions(): Promise<void> {
+        async refreshPermissions(options: PermissionRefreshOptions = {}): Promise<void> {
             this.loading = true;
             try {
                 if (!isTauriRuntime()) {
-                    const microphoneReady = await navigator.permissions
+                    const browserMicrophoneReady = await navigator.permissions
                         ?.query({ name: 'microphone' as PermissionName })
                         .then((permission) => permission.state === 'granted')
                         .catch(() => false);
+                    const microphoneReady = await resolveMicrophoneReady(browserMicrophoneReady, options);
                     const publicApiConnected = await checkPublicApiHealth();
                     const publicApiAuthorized = publicApiConnected && (await hasPublicApiToken());
                     this.items = [
@@ -114,7 +141,10 @@ export const usePermissionStore = defineStore('permission', {
                     return;
                 }
                 const diagnostics = await getRuntimeDiagnostics();
-                const microphoneReady = Boolean(diagnostics?.microphoneAuthorized);
+                const microphoneReady = await resolveMicrophoneReady(
+                    Boolean(diagnostics?.microphoneAuthorized),
+                    options
+                );
                 const publicApiConnected = await checkPublicApiHealth();
                 const publicApiAuthorized = publicApiConnected && (await hasPublicApiToken());
                 this.items = [
@@ -173,7 +203,7 @@ export const usePermissionStore = defineStore('permission', {
                             : '未能直接获取麦克风权限。';
                     if (isTauriRuntime()) await openMicrophoneSettings();
                 } finally {
-                    await this.refreshPermissions();
+                    await this.refreshPermissions({ probeMicrophoneAccess: true });
                 }
             }
             if (key === 'accessibility') {

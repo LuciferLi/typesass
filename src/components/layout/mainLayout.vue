@@ -496,14 +496,14 @@
 
     /**
      * 在权限敏感页面刷新当前系统权限状态。
-     * 流程：仅当当前路由需要权限诊断时调用权限 Store；用于页面切换和窗口重新聚焦。
+     * 流程：仅当当前路由需要权限诊断时调用权限 Store，并允许一次真实麦克风可用性探测。
      * 参数：无。
      * 返回：无返回值。
      * 边界：刷新失败由 Store 写入 message，不阻塞路由或窗口焦点恢复。
      */
     function refreshPermissionsForActiveRoute(): void {
         if (!isPermissionSensitiveRoute(route.name)) return;
-        void permissionStore.refreshPermissions();
+        void permissionStore.refreshPermissions({ probeMicrophoneAccess: true });
     }
 
     /**
@@ -626,7 +626,7 @@
         settingsStore.applyThemeMode(settingsStore.settings.themeMode);
         startClientBridgeHealthPolling();
         codexConnectionStore.startPolling();
-        await permissionStore.refreshPermissions();
+        await permissionStore.refreshPermissions({ probeMicrophoneAccess: true });
         window.addEventListener('focus', refreshPermissionsForActiveRoute);
         stopRoutePermissionWatcher = watch(
             () => route.name,
