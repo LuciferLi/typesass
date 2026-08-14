@@ -7,7 +7,8 @@ import {
     hasPublicApiToken,
     isTauriRuntime,
     openAccessibilitySettings,
-    openMicrophoneSettings
+    openMicrophoneSettings,
+    requestMicrophoneAccess
 } from '@/service/tauri/command';
 
 interface PermissionState {
@@ -157,15 +158,23 @@ export const usePermissionStore = defineStore('permission', {
 
         /**
          * 打开指定系统权限设置。
-         * 流程：麦克风和辅助功能均打开 macOS 系统设置；授权状态通过 App 原生诊断刷新。
+         * 流程：麦克风先主动请求系统授权弹窗，拒绝或已被系统拒绝时再打开 macOS 设置；辅助功能直接打开设置。
          * 参数：key 为权限稳定键。
          * 返回：打开完成 Promise。
          * 边界：HTTP 服务与快捷键状态不映射系统设置，因此不会触发命令。
          */
         async openPermission(key: PermissionItemModel['key']): Promise<void> {
             if (key === 'microphone') {
-                if (isTauriRuntime()) await openMicrophoneSettings();
-                this.message = isTauriRuntime() ? '已打开麦克风权限设置。' : '请在 CodexMan App 中授权麦克风。';
+                if (!isTauriRuntime()) {
+                    this.message = '请在 CodexMan App 中授权麦克风。';
+                    await this.refreshPermissions();
+                    return;
+                }
+                const granted = await requestMicrophoneAccess();
+                this.message = granted
+                    ? '麦克风权限已开启。'
+                    : '未获得麦克风权限，已打开系统设置，请在列表中允许 CodexMan。';
+                if (!granted) await openMicrophoneSettings();
                 await this.refreshPermissions();
             }
             if (key === 'accessibility') {

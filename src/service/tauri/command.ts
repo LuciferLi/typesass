@@ -698,6 +698,17 @@ export async function listInstalledApplications(): Promise<ApplicationOptionMode
 }
 
 /**
+ * 主动请求 CodexMan App 麦克风权限。
+ * 流程：通过 AVFoundation requestAccess 触发 macOS 系统授权弹窗，让 CodexMan 出现在麦克风隐私列表。
+ * 参数：无。
+ * 返回：用户允许时 true；已拒绝、受限制或用户本次拒绝时 false。
+ * 异常：普通 Web 或系统调用失败时透传 IPC 错误。
+ */
+export async function requestMicrophoneAccess(): Promise<boolean> {
+    return invokeDesktop<boolean>('request_microphone_access');
+}
+
+/**
  * 打开 macOS 麦克风权限设置。
  * 流程：通过受限桌面 IPC 打开系统对应设置页。
  * 参数：无。

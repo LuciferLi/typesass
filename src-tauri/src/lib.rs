@@ -38,7 +38,11 @@ use task_store::{
 use web_server::RuntimeWebServer;
 
 #[cfg(target_os = "macos")]
+use block2::StackBlock;
+#[cfg(target_os = "macos")]
 use objc2::rc::{autoreleasepool, Retained};
+#[cfg(target_os = "macos")]
+use objc2::runtime::Bool;
 #[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
 #[cfg(target_os = "macos")]
@@ -1673,6 +1677,7 @@ pub fn run() {
             suspend_shortcuts_for_recording,
             list_installed_applications,
             get_runtime_diagnostics,
+            request_microphone_access,
             open_accessibility_settings,
             open_microphone_settings,
             set_login_launch,
@@ -2101,6 +2106,7 @@ fn run_app_voice_polish_core(
     let _guard = begin_app_voice_run(app)?;
     let normalized_target_app = normalize_target_app_name(target_app);
     emit_hub_notice(app, "正在录音，请稍后。", "running");
+    ensure_microphone_access_for_voice()?;
 
     let mut persisted = read_voice_polish_persisted_state(app)?;
     let catalog = request_public_api_json::<Vec<PublicModelCatalogItem>>(app, "/v1/models", None)?;
@@ -2260,6 +2266,17 @@ fn begin_app_voice_run(app: &tauri::AppHandle) -> Result<AppVoiceRunGuard, Strin
     *running = true;
     drop(running);
     Ok(AppVoiceRunGuard { app: app.clone() })
+}
+
+/// 确保语音任务开始前已经获得麦克风权限。
+/// 流程：先读取授权状态；未授权时主动请求一次系统授权；仍未授权则阻断录音并提示用户到系统设置处理。
+/// 返回：可继续录音时为空。
+/// 异常/边界：用户拒绝、家长控制/MDM 限制或请求超时都不会继续录制静音音频。
+fn ensure_microphone_access_for_voice() -> Result<(), String> {
+    if is_microphone_authorized() || request_microphone_access_platform()? {
+        return Ok(());
+    }
+    Err("CodexMan 没有麦克风权限，请在 macOS 系统设置中允许 CodexMan 使用麦克风。".to_string())
 }
 
 /// 模型选择结果。
@@ -5596,6 +5613,19 @@ fn open_accessibility_settings(window: tauri::WebviewWindow) -> Result<(), Strin
     open_accessibility_preferences()
 }
 
+/// 主动请求 macOS 麦克风权限，用于让 CodexMan 出现在系统麦克风授权列表。
+/// 流程：校验 hub/main 窗口后调用 AVFoundation requestAccess；未决定时弹出系统授权框，已拒绝时返回稳定拒绝状态。
+/// 参数：window 为调用窗口。
+/// 返回：授权后返回 true；用户拒绝、受限制或系统不支持时返回 false。
+/// 异常/边界：不会伪造授权成功；回调超时或媒体类型不可用时返回明确错误。
+#[tauri::command]
+async fn request_microphone_access(window: tauri::WebviewWindow) -> Result<bool, String> {
+    ensure_app_voice_window(window.label())?;
+    tauri::async_runtime::spawn_blocking(request_microphone_access_platform)
+        .await
+        .map_err(|error| format!("请求麦克风授权失败：{}", error))?
+}
+
 /// 打开 macOS 麦克风权限设置，用于授予语音采集权限。
 /// 流程：校验 hub 后调用平台设置入口；参数为调用窗口；成功返回空值。
 /// 异常/边界：非 hub 默认拒绝，非 macOS 平台由既有平台实现返回对应结果。
@@ -7664,6 +7694,44 @@ fn is_microphone_authorized() -> bool {
 #[cfg(not(target_os = "macos"))]
 fn is_microphone_authorized() -> bool {
     false
+}
+
+/// 主动请求 macOS 麦克风授权。
+/// 流程：先读取当前 AVFoundation 授权状态；未决定时调用 requestAccess 并等待回调，已授权直接返回 true。
+/// 返回：授权成功时 true；拒绝、受限制或用户选择不允许时 false。
+/// 边界：回调最多等待 60 秒，避免系统弹窗异常时阻塞后台线程。
+#[cfg(target_os = "macos")]
+fn request_microphone_access_platform() -> Result<bool, String> {
+    autoreleasepool(|_| {
+        let Some(media_type) = (unsafe { AVMediaTypeAudio }) else {
+            return Err("当前系统没有可用的音频媒体类型。".to_string());
+        };
+        let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) };
+        match status {
+            AVAuthorizationStatus::Authorized => return Ok(true),
+            AVAuthorizationStatus::Restricted | AVAuthorizationStatus::Denied => return Ok(false),
+            AVAuthorizationStatus::NotDetermined => {}
+            _ => return Ok(false),
+        }
+
+        let (sender, receiver) = mpsc::channel::<bool>();
+        let handler = StackBlock::new(move |granted: Bool| {
+            let _ = sender.send(granted.as_bool());
+        });
+        unsafe {
+            AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type, &handler);
+        }
+        receiver
+            .recv_timeout(Duration::from_secs(60))
+            .map_err(|_| "等待麦克风授权结果超时，请重新打开 CodexMan 后再试。".to_string())
+    })
+}
+
+/// 非 macOS 平台暂不支持主动请求麦克风授权。
+/// 返回：固定错误，调用方应展示当前平台不支持。
+#[cfg(not(target_os = "macos"))]
+fn request_microphone_access_platform() -> Result<bool, String> {
+    Err("当前版本只支持在 macOS 请求麦克风授权".to_string())
 }
 
 /// 打开 macOS 辅助功能设置页。
