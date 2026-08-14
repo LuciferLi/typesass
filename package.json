@@ -11,18 +11,23 @@
   "bugs": {
     "url": "https://github.com/LuciferLi/codexman/issues"
   },
-  "homepage": "https://codexman.tolern.com/",
+  "homepage": "https://typesass.tolern.com/",
   "scripts": {
-    "dev": "node scripts/freeDevPort.mjs 1420 && tauri dev",
-    "dev:frontend": "node scripts/freeDevPort.mjs 1420 && vite --host 127.0.0.1",
+    "build:browser-extension": "node scripts/buildBrowserExtensionZip.mjs",
+    "predev": "npm run build:browser-extension",
+    "dev": "npm run build:sidecar && node scripts/freeDevPort.mjs 1420 && tauri dev",
+    "dev:frontend": "node scripts/freeDevPort.mjs 1420 && vite --host 0.0.0.0",
     "tslint": "pnpm run typecheck",
     "lint": "eslint --ext .ts,.js,.vue --ignore-path .gitignore src/ && pnpm run typecheck",
     "lint:fix": "eslint --ext .ts,.js,.vue --fix --ignore-path .gitignore src/ && pnpm run typecheck",
     "typecheck": "tsc --noEmit",
+    "prebuild": "npm run build:browser-extension",
     "build": "tsc && vite build",
     "preview:web": "node scripts/devServer.mjs",
     "build:sidecar": "node scripts/buildSidecar.mjs",
-    "tauri:build": "tauri build"
+    "pretauri:build": "npm run build:browser-extension",
+    "tauri:build": "tauri build",
+    "release:mac": "node scripts/releaseMac.mjs"
   },
   "dependencies": {
     "@icon-park/svg": "^1.4.2",

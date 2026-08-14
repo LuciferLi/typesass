@@ -125,3 +125,5 @@ output/*
 .coverage
 src-tauri/binaries/codexman-ai-sidecar-*
 server/.venv-build/
+public/downloads/typesass-extension/
+website/downloads/*.dmg
