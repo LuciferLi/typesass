@@ -13,6 +13,21 @@ export const SESSION_TASK_TITLE_MAX_CHARS = 200;
 /** 任务提示词字符上限；必须与 Rust `TASK_PROMPT_MAX_CHARS` 协议保持一致。 */
 export const SESSION_TASK_PROMPT_MAX_CHARS = 50_000;
 
+/** 项目基础提示词字符上限；必须与 Rust `PROJECT_BASE_PROMPT_MAX_CHARS` 协议保持一致。 */
+export const SESSION_PROJECT_BASE_PROMPT_MAX_CHARS = 20_000;
+
+/** 任务图片附件，独立于 prompt 文本发送给 CodeX。 */
+export interface SessionTaskAttachmentModel {
+    /** 附件稳定 ID。 */
+    id: string;
+    /** 附件文件名。 */
+    name: string;
+    /** 附件图片类型。 */
+    mimeType: 'image/png' | 'image/jpeg' | 'image/webp';
+    /** 图片 data URL，用于前端预览和本机执行上传。 */
+    dataUrl: string;
+}
+
 /** HTTP 服务返回的任务项目元数据。 */
 export interface SessionProjectModel {
     /** Rust 权威任务库返回的稳定主键。 */
@@ -21,6 +36,8 @@ export interface SessionProjectModel {
     name: string;
     /** 绑定的真实工作空间绝对路径。 */
     workspacePath: string;
+    /** 项目基础提示词，任务执行时自动追加到任务内容前。 */
+    basePrompt: string;
     /** Rust 权威任务库统计的任务数量。 */
     taskCount: number;
     /** Rust 权威任务库统计的会话数量。 */
@@ -41,6 +58,8 @@ export interface SessionTaskModel {
     title: string;
     /** 交给 CodeX 的真实提示词。 */
     prompt: string;
+    /** 交给 CodeX 的图片附件，不拼入 prompt 文本。 */
+    attachments: SessionTaskAttachmentModel[];
     /** Rust 权威任务状态机确认的当前状态。 */
     status: SessionTaskStatusType;
     /** 当前本地会话 ID，尚未执行时为空。 */
@@ -106,6 +125,8 @@ export interface CreateSessionProjectRequestModel {
     name: string;
     /** 绑定的真实工作空间绝对路径。 */
     workspacePath: string;
+    /** 项目基础提示词，为空时不参与任务发送。 */
+    basePrompt: string;
 }
 
 /** 编辑任务项目的 HTTP 请求。 */
@@ -116,6 +137,8 @@ export interface UpdateSessionProjectRequestModel {
     name: string;
     /** 后续任务使用的真实工作空间绝对路径。 */
     workspacePath: string;
+    /** 后续任务执行时自动携带的项目基础提示词。 */
+    basePrompt: string;
 }
 
 /** 创建真实任务卡片的 HTTP 请求。 */
@@ -126,6 +149,8 @@ export interface CreateSessionTaskRequestModel {
     title: string;
     /** 交给 CodeX 的完整提示词。 */
     prompt: string;
+    /** 交给 CodeX 的图片附件。 */
+    attachments?: SessionTaskAttachmentModel[];
 }
 
 /** 更新真实任务卡片的 HTTP 请求。 */
@@ -136,6 +161,8 @@ export interface UpdateSessionTaskRequestModel {
     title: string;
     /** 交给 CodeX 的完整提示词。 */
     prompt: string;
+    /** 交给 CodeX 的图片附件；更新时整体替换。 */
+    attachments?: SessionTaskAttachmentModel[];
 }
 
 // 会话管理持久化配置，用于客户端 JSON 保存用户最后一次选择的真实 CodeX 工作空间。

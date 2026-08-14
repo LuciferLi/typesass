@@ -8,19 +8,17 @@
                         v-model="selectedProjectId"
                         :disabled="!store.projects.length || store.loading">
                         <ui-select-trigger class="w-full">
-                            <ui-select-value placeholder="先创建项目并绑定工作空间" />
+                            <ui-select-value placeholder="全部" />
                         </ui-select-trigger>
                         <ui-select-content>
+                            <ui-select-item :value="ALL_PROJECT_SELECT_VALUE">
+                                <span class="truncate text-[13px]">全部</span>
+                            </ui-select-item>
                             <ui-select-item
                                 v-for="project in store.projects"
-                                :key="JSON.stringify([project.id, project.name, project.workspacePath])"
+                                :key="project.id"
                                 :value="project.id">
-                                <div class="grid min-w-0 gap-1">
-                                    <span class="truncate text-[13px]">{{ project.name }}</span>
-                                    <span class="truncate text-[11px] text-muted-foreground">{{
-                                        project.workspacePath
-                                    }}</span>
-                                </div>
+                                <span class="truncate text-[13px]">{{ project.name }}</span>
                             </ui-select-item>
                         </ui-select-content>
                     </ui-select-root>
@@ -66,12 +64,12 @@
                         variant="outline"
                         type="button"
                         :disabled="store.saving || !store.selectedProject"
-                        title="删除当前空项目"
+                        title="删除当前项目"
                         @click="deleteProjectDialogOpen = true">
                         <delete
                             theme="outline"
                             size="15" />
-                        <span class="sr-only">删除当前空项目</span>
+                        <span class="sr-only">删除当前项目</span>
                     </ui-button>
                     <ui-button
                         type="button"
@@ -100,7 +98,7 @@
                     description="正在从 CodexMan App 本地任务库读取项目、任务和会话记录。"
                     class="h-full" />
                 <ui-page-state
-                    v-else-if="!store.workspaceDataReady || !store.selectedProject"
+                    v-else-if="!store.workspaceDataReady || !store.projects.length"
                     :icon="taskStateIcon"
                     :title="taskStateTitle"
                     :description="taskStateDescription"
@@ -121,6 +119,7 @@
                 <task-manage-task-board
                     v-else
                     :tasks="store.tasks"
+                    :projects="store.projects"
                     :saving="store.saving"
                     @create="handleOpenTaskDialog"
                     @detail="handleOpenTaskDetailSheet"
@@ -152,10 +151,35 @@
                             placeholder="例如：AI Tool 会话管理" />
                     </label>
                     <label class="grid gap-2">
-                        <span class="text-[13px] text-foreground">工作空间路径</span>
-                        <ui-input
+                        <span class="text-[13px] text-foreground">项目工作空间</span>
+                        <ui-select-root
                             v-model="projectForm.workspacePath"
-                            placeholder="/Users/lucifer/Documents/source/t/monorepo" />
+                            :disabled="store.saving || !store.codexWorkspaces.length">
+                            <ui-select-trigger class="w-full">
+                                <ui-select-value placeholder="选择 CodeX 工作空间" />
+                            </ui-select-trigger>
+                            <ui-select-content>
+                                <ui-select-item
+                                    v-for="workspace in store.codexWorkspaces"
+                                    :key="workspace.cwd"
+                                    :value="workspace.cwd">
+                                    <div class="grid min-w-0 gap-1">
+                                        <span class="truncate text-[13px]">{{ workspace.title || workspace.cwd }}</span>
+                                        <span class="truncate text-[11px] text-muted-foreground">{{
+                                            workspace.cwd
+                                        }}</span>
+                                    </div>
+                                </ui-select-item>
+                            </ui-select-content>
+                        </ui-select-root>
+                    </label>
+                    <label class="grid gap-2">
+                        <span class="text-[13px] text-foreground">项目基础提示词</span>
+                        <ui-textarea
+                            v-model="projectForm.basePrompt"
+                            class="min-h-[120px]"
+                            :maxlength="SESSION_PROJECT_BASE_PROMPT_MAX_CHARS"
+                            placeholder="以后这个项目里的任务执行时，会自动把这段提示词放在任务内容前。" />
                     </label>
                 </div>
                 <ui-dialog-footer>
@@ -168,7 +192,7 @@
                     </ui-button>
                     <ui-button
                         type="button"
-                        :disabled="store.saving"
+                        :disabled="store.saving || !projectForm.workspacePath"
                         @click="handleSaveProject">
                         {{ store.saving ? '保存中' : editingProjectId ? '保存' : '创建' }}
                     </ui-button>
@@ -179,9 +203,9 @@
         <ui-dialog v-model:open="deleteProjectDialogOpen">
             <ui-dialog-content>
                 <ui-dialog-header>
-                    <ui-dialog-title>删除空项目</ui-dialog-title>
+                    <ui-dialog-title>删除项目</ui-dialog-title>
                     <ui-dialog-description>
-                        仅没有任何任务或会话记录的项目可以删除。包含业务记录时客户端会拒绝操作，不会级联清理。
+                        删除只会把项目标记为已删除，已有任务和会话历史不会被级联清理。
                     </ui-dialog-description>
                 </ui-dialog-header>
                 <p class="text-sm text-muted-foreground">{{ store.selectedProject?.name }}</p>
@@ -355,6 +379,7 @@
     import { Textarea as UiTextarea } from '@/components/ui/textarea';
     import type { CodexConnectionStateType } from '@/model/codexConnection';
     import {
+        SESSION_PROJECT_BASE_PROMPT_MAX_CHARS,
         SESSION_TASK_PROMPT_MAX_CHARS,
         SESSION_TASK_TITLE_MAX_CHARS,
         type SessionTaskModel
@@ -369,6 +394,7 @@
 
     const store = useSessionManageStore();
     const codexConnectionStore = useCodexConnectionStore();
+    const ALL_PROJECT_SELECT_VALUE = 'allProjects';
     const projectDialogOpen = ref(false);
     const deleteProjectDialogOpen = ref(false);
     const editingProjectId = ref('');
@@ -381,7 +407,8 @@
     const browserExtensionDialogOpen = ref(false);
     const projectForm = reactive({
         name: '',
-        workspacePath: ''
+        workspacePath: '',
+        basePrompt: ''
     });
     const taskForm = reactive({
         title: '',
@@ -389,9 +416,10 @@
     });
     let stopTaskUpdates: (() => void) | null = null;
     const selectedProjectId = computed({
-        get: () => store.selectedProjectId,
+        get: () => store.selectedProjectId || ALL_PROJECT_SELECT_VALUE,
         set: (projectId: string) => {
-            void store.selectProject(projectId).catch(() => {
+            const normalizedProjectId = projectId === ALL_PROJECT_SELECT_VALUE ? '' : projectId;
+            void store.selectProject(normalizedProjectId).catch(() => {
                 // Store 已恢复原项目选择并展示 HTTP 错误，Select 无需再生成额外状态。
             });
         }
@@ -400,7 +428,7 @@
     const taskStateTitle = computed(() => {
         if (!store.workspaceDataReady) return '请先打开 CodexMan App';
         if (!store.projects.length) return '先创建项目并绑定工作空间';
-        return '请选择项目';
+        return '暂无任务';
     });
     const taskStateDescription = computed(() => {
         if (!store.workspaceDataReady) {
@@ -409,7 +437,7 @@
         if (!store.projects.length) {
             return '任务必须归属到一个项目，项目会绑定本机 CodeX 工作空间。创建项目后，这里才会展示任务看板。';
         }
-        return '检测到多个项目，但本地还没有保存上次选择。请选择一个项目后，再创建和管理任务。';
+        return '当前筛选下还没有任务。';
     });
 
     /**
@@ -473,7 +501,7 @@
 
     /**
      * 打开新建项目弹窗。
-     * 流程：优先把当前选中工作空间回填到项目表单，减少重复输入。
+     * 流程：刷新 CodeX 工作空间后，优先把当前选中工作空间回填到项目表单，减少重复输入。
      * 参数：无。
      * 返回：无返回值。
      * 边界：没有选中工作空间时保持表单原值，由用户手动输入。
@@ -482,12 +510,16 @@
         editingProjectId.value = '';
         projectForm.name = '';
         projectForm.workspacePath = store.selectedWorkspaceCwd;
+        projectForm.basePrompt = '';
+        void store.refreshCodexWorkspaces().catch((error: unknown) => {
+            showTaskOperationError('读取工作空间失败', error, '读取 CodeX 工作空间失败。');
+        });
         projectDialogOpen.value = true;
     }
 
     /**
      * 打开当前项目编辑弹窗。
-     * 流程：读取当前 HTTP 聚合数据中的项目 ID、名称和工作空间填充同一表单。
+     * 流程：读取当前 HTTP 聚合数据中的项目 ID、名称、工作空间和基础提示词填充同一表单。
      * 参数：无。
      * 返回：无返回值。
      * 边界：没有选中项目时保持关闭，不生成临时项目。
@@ -498,6 +530,10 @@
         editingProjectId.value = project.id;
         projectForm.name = project.name;
         projectForm.workspacePath = project.workspacePath;
+        projectForm.basePrompt = project.basePrompt;
+        void store.refreshCodexWorkspaces().catch((error: unknown) => {
+            showTaskOperationError('读取工作空间失败', error, '读取 CodeX 工作空间失败。');
+        });
         projectDialogOpen.value = true;
     }
 
@@ -570,18 +606,21 @@
                 await store.editProject({
                     id: editingProjectId.value,
                     name: projectForm.name,
-                    workspacePath: projectForm.workspacePath
+                    workspacePath: projectForm.workspacePath,
+                    basePrompt: projectForm.basePrompt
                 });
             } else {
                 await store.addProject({
                     name: projectForm.name,
-                    workspacePath: projectForm.workspacePath
+                    workspacePath: projectForm.workspacePath,
+                    basePrompt: projectForm.basePrompt
                 });
             }
             projectDialogOpen.value = false;
             editingProjectId.value = '';
             projectForm.name = '';
             projectForm.workspacePath = '';
+            projectForm.basePrompt = '';
             toast.success(isEditingProject ? '项目已更新' : '项目已创建');
         } catch (error) {
             showTaskOperationError(isEditingProject ? '编辑项目失败' : '创建项目失败', error, '项目保存失败。');
@@ -589,11 +628,11 @@
     }
 
     /**
-     * 删除当前空项目。
+     * 删除当前项目。
      * 流程：把当前项目 ID 交给 Store 调用 HTTP，等待 Rust Immediate 事务确认后关闭确认框。
      * 参数：无。
      * 返回：删除完成 Promise。
-     * 边界：没有选中项目直接返回；有关联任务或会话时保留弹窗和全部数据。
+     * 边界：没有选中项目直接返回；删除只隐藏项目，不级联清理任务和会话历史。
      */
     async function handleDeleteProject(): Promise<void> {
         const projectId = store.selectedProject?.id;
@@ -601,9 +640,9 @@
         try {
             await store.removeProject(projectId);
             deleteProjectDialogOpen.value = false;
-            toast.success('空项目已删除');
+            toast.success('项目已删除');
         } catch (error) {
-            showTaskOperationError('删除项目失败', error, '空项目删除失败。');
+            showTaskOperationError('删除项目失败', error, '项目删除失败。');
         }
     }
 

@@ -9,6 +9,7 @@
                 @select="handleSelectWorkspace" />
             <session-manage-session-list
                 :codex-threads="store.codexThreads"
+                :sessions="store.sessions"
                 :has-workspace="Boolean(store.selectedWorkspaceCwd)"
                 :has-more="store.hasMoreCodexThreads"
                 :loading="store.loading"
@@ -34,6 +35,7 @@
     });
 
     const store = useSessionManageStore();
+    let disposeTaskUpdates: (() => void) | null = null;
 
     /**
      * 弹出会话管理操作失败提示。
@@ -127,6 +129,20 @@
     }
 
     onMounted(() => {
-        void store.initSessionManage();
+        void store
+            .initTaskManage()
+            .then(() => store.refreshCodexThreads(undefined, true))
+            .then(() => store.listenTaskUpdates())
+            .then((dispose) => {
+                disposeTaskUpdates = dispose;
+            })
+            .catch((error: unknown) => {
+                showSessionOperationError('初始化会话失败', error, '读取会话和任务状态失败。');
+            });
+    });
+
+    onUnmounted(() => {
+        disposeTaskUpdates?.();
+        disposeTaskUpdates = null;
     });
 </script>

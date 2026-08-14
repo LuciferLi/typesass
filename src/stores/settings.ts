@@ -2,6 +2,11 @@ import { defineStore } from 'pinia';
 
 import { StorageKey } from '@/config/storageKey';
 import type { AppThemeMode, SettingsModel } from '@/model/settings';
+import {
+    SETTINGS_TASK_CONCURRENCY_DEFAULT,
+    SETTINGS_TASK_CONCURRENCY_MAX,
+    SETTINGS_TASK_CONCURRENCY_MIN
+} from '@/model/settings';
 import { readClientJson, writeClientJson } from '@/service/storage/clientJsonStorage';
 import { getLoginLaunch, isTauriRuntime, setLoginLaunch } from '@/service/tauri/command';
 
@@ -25,7 +30,8 @@ export const useSettingsStore = defineStore('settings', {
             settings: {
                 launchAtLogin: false,
                 themeMode: 'dark',
-                smartVoiceEnhancement: true
+                smartVoiceEnhancement: true,
+                taskConcurrencyLimit: SETTINGS_TASK_CONCURRENCY_DEFAULT
             },
             initializing: false,
             saving: false,
@@ -50,7 +56,7 @@ export const useSettingsStore = defineStore('settings', {
          * 流程：按字段合并有效值，再同步页面主题 class。
          * 参数：settings 为配置文件中的设置分区。
          * 返回：无返回值。
-         * 边界：外部手动写入非法主题时保留当前主题，避免 UI 状态抖动。
+         * 边界：外部手动写入非法主题或非法并发数时保留当前值，避免 UI 状态抖动。
          */
         applyPersistedSettings(settings: unknown): void {
             if (!settings || typeof settings !== 'object') return;
@@ -61,7 +67,11 @@ export const useSettingsStore = defineStore('settings', {
                     nextSettings.themeMode === 'dark' || nextSettings.themeMode === 'light'
                         ? nextSettings.themeMode
                         : this.settings.themeMode,
-                smartVoiceEnhancement: nextSettings.smartVoiceEnhancement ?? this.settings.smartVoiceEnhancement
+                smartVoiceEnhancement: nextSettings.smartVoiceEnhancement ?? this.settings.smartVoiceEnhancement,
+                taskConcurrencyLimit: normalizeTaskConcurrencyLimit(
+                    nextSettings.taskConcurrencyLimit,
+                    this.settings.taskConcurrencyLimit
+                )
             };
             if (typeof document !== 'undefined') {
                 document.documentElement.classList.toggle('dark', this.settings.themeMode === 'dark');
@@ -112,6 +122,24 @@ export const useSettingsStore = defineStore('settings', {
         },
 
         /**
+         * 保存任务执行并发上限。
+         * 流程：把输入值收敛到 1-10 的整数，再写入客户端配置文件；后端调度器下一轮读取配置时即时生效。
+         * 参数：limit 为用户输入的并发上限。
+         * 返回：无返回值。
+         * 边界：浏览器预览只更新当前内存状态；桌面端写入失败会由调用方通过控制台或页面状态感知。
+         */
+        updateTaskConcurrencyLimit(limit: number): void {
+            this.settings.taskConcurrencyLimit = normalizeTaskConcurrencyLimit(
+                limit,
+                SETTINGS_TASK_CONCURRENCY_DEFAULT
+            );
+            if (isTauriRuntime()) {
+                void writeClientJson(StorageKey.settings, this.settings);
+            }
+            this.message = '';
+        },
+
+        /**
          * 初始化原生系统设置。
          * 流程：读取真实开机启动状态并同步当前客户端 JSON。
          * 返回：初始化完成 Promise。
@@ -152,3 +180,14 @@ export const useSettingsStore = defineStore('settings', {
         }
     }
 });
+
+/**
+ * 规范化任务并发上限。
+ * 流程：只接受有限数字，先取整再收敛到设置页允许范围；参数为外部输入值和兜底值。
+ * 返回：可写入设置并被 Rust 调度器识别的整数。
+ * 边界：非法值返回兜底值，避免损坏配置把并发变成 0 或无限大。
+ */
+function normalizeTaskConcurrencyLimit(value: unknown, fallback: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+    return Math.min(SETTINGS_TASK_CONCURRENCY_MAX, Math.max(SETTINGS_TASK_CONCURRENCY_MIN, Math.floor(value)));
+}

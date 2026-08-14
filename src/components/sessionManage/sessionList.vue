@@ -39,53 +39,78 @@
                             collapsible>
                             <ui-accordion-item
                                 :value="group.parent.id"
-                                class="rounded-lg border border-border bg-card/70 px-3">
-                                <div class="flex min-w-0 items-start gap-2">
-                                    <ui-accordion-trigger class="min-w-0 flex-1 py-3 hover:no-underline">
-                                        <span class="flex min-w-0 items-start gap-3">
-                                            <span
-                                                class="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-muted/45 text-muted-foreground">
-                                                <terminal
-                                                    theme="outline"
-                                                    size="15" />
+                                class="overflow-hidden rounded-lg border border-border bg-card/70">
+                                <div class="flex min-w-0 items-start gap-3 p-3">
+                                    <div class="min-w-0 flex-1">
+                                        <ui-accordion-trigger
+                                            class="w-full min-w-0 cursor-pointer rounded-md p-0 hover:bg-muted/25 hover:no-underline">
+                                            <span class="flex min-w-0 flex-1 items-start gap-3">
+                                                <ui-item-media variant="icon">
+                                                    <loading
+                                                        v-if="isThreadRunning(group.parent.id)"
+                                                        class="animate-spin"
+                                                        theme="outline"
+                                                        size="15" />
+                                                    <terminal
+                                                        v-else
+                                                        theme="outline"
+                                                        size="15" />
+                                                </ui-item-media>
+                                                <ui-item-content>
+                                                    <ui-item-title>
+                                                        {{ group.parent.title || '未命名会话' }}
+                                                    </ui-item-title>
+                                                    <ui-item-description class="truncate">
+                                                        {{ group.parent.id }}
+                                                    </ui-item-description>
+                                                    <ui-item-footer>
+                                                        <span>{{ formatTime(group.parent.updatedAt) }}</span>
+                                                        <span
+                                                            class="shrink-0 rounded border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[11px] font-normal leading-none text-primary">
+                                                            {{ group.children.length }} 个子会话
+                                                            <span class="ml-1 group-data-[state=open]:hidden">
+                                                                展开
+                                                            </span>
+                                                            <span class="ml-1 hidden group-data-[state=open]:inline">
+                                                                收起
+                                                            </span>
+                                                        </span>
+                                                    </ui-item-footer>
+                                                </ui-item-content>
                                             </span>
-                                            <span class="grid min-w-0 gap-1 text-left">
-                                                <span class="truncate text-[13px] font-medium text-foreground">{{
-                                                    group.parent.title || '未命名会话'
-                                                }}</span>
-                                                <span class="truncate text-[12px] font-normal text-muted-foreground">{{
-                                                    group.parent.id
-                                                }}</span>
-                                                <span class="text-[12px] font-normal text-muted-foreground">{{
-                                                    formatTime(group.parent.updatedAt)
-                                                }}</span>
-                                            </span>
-                                        </span>
-                                    </ui-accordion-trigger>
-                                    <ui-button
-                                        class="mt-2"
-                                        variant="ghost"
-                                        size="icon-sm"
-                                        type="button"
-                                        @click.stop="emit('open', group.parent.id)">
-                                        <focus
-                                            theme="outline"
-                                            size="15" />
-                                        <span class="sr-only">定位 CodeX 会话</span>
-                                    </ui-button>
+                                        </ui-accordion-trigger>
+                                    </div>
+                                    <ui-item-actions>
+                                        <ui-button
+                                            variant="ghost"
+                                            size="icon-sm"
+                                            type="button"
+                                            @click.stop="emit('open', group.parent.id)">
+                                            <focus
+                                                theme="outline"
+                                                size="15" />
+                                            <span class="sr-only">定位 CodeX 会话</span>
+                                        </ui-button>
+                                    </ui-item-actions>
                                 </div>
-                                <ui-accordion-content class="border-t border-border/70">
-                                    <div class="grid gap-2 pt-3">
+                                <ui-accordion-content class="border-t border-border/70 px-4 data-[state=closed]:hidden">
+                                    <div class="ml-11 grid gap-2 border-l border-primary/35 py-3 pl-4">
                                         <ui-item
                                             v-for="child in group.children"
                                             :key="child.id"
                                             variant="muted"
                                             size="sm"
-                                            class="border border-dashed border-border/80 bg-muted/25">
+                                            class="border border-border/70 border-l-primary/60 bg-background/45 shadow-sm">
                                             <ui-item-media
                                                 variant="icon"
-                                                class="border-dashed">
+                                                class="border-primary/30 bg-primary/10 text-primary">
+                                                <loading
+                                                    v-if="isThreadRunning(child.id)"
+                                                    class="animate-spin"
+                                                    theme="outline"
+                                                    size="15" />
                                                 <branch-one
+                                                    v-else
                                                     theme="outline"
                                                     size="15" />
                                             </ui-item-media>
@@ -101,9 +126,6 @@
                                                 </ui-item-title>
                                                 <ui-item-description class="truncate">
                                                     {{ child.id }}
-                                                </ui-item-description>
-                                                <ui-item-description class="truncate">
-                                                    {{ threadMetaText(child) }}
                                                 </ui-item-description>
                                                 <ui-item-footer>{{ formatTime(child.updatedAt) }}</ui-item-footer>
                                             </ui-item-content>
@@ -131,8 +153,13 @@
                             <ui-item-media
                                 variant="icon"
                                 :class="group.parent.parentThreadId ? 'border-dashed' : ''">
+                                <loading
+                                    v-if="isThreadRunning(group.parent.id)"
+                                    class="animate-spin"
+                                    theme="outline"
+                                    size="15" />
                                 <branch-one
-                                    v-if="group.parent.parentThreadId"
+                                    v-else-if="group.parent.parentThreadId"
                                     theme="outline"
                                     size="15" />
                                 <terminal
@@ -232,7 +259,7 @@
         ItemTitle as UiItemTitle
     } from '@/components/ui/item';
     import { ScrollArea as UiScrollArea } from '@/components/ui/scroll-area';
-    import type { CodexThreadSummaryModel } from '@/model/sessionManage';
+    import type { CodexThreadSummaryModel, SessionRecordModel } from '@/model/sessionManage';
 
     defineOptions({
         name: 'SessionManageSessionList'
@@ -241,6 +268,8 @@
     const props = defineProps<{
         // 当前工作空间下 CodeX 原生会话列表。
         codexThreads: CodexThreadSummaryModel[];
+        // 当前任务系统中已经绑定 CodeX thread 的真实会话记录。
+        sessions: SessionRecordModel[];
         // 是否已选中 CodeX 工作空间。
         hasWorkspace: boolean;
         // 是否还有更多 CodeX 会话可加载。
@@ -276,6 +305,20 @@
 
     // 会话搜索仍按后端分页返回平铺数据，前端仅在当前页内把父子任务合并成折叠卡片。
     const threadGroups = computed<CodexThreadGroupModel[]>(() => buildThreadGroups(props.codexThreads));
+
+    /**
+     * 构建执行中 CodeX thread ID 索引。
+     * 流程：从任务聚合的会话记录中筛选 running 状态，并按 externalThreadId 建立集合供列表渲染查询。
+     * 参数：无显式参数，依赖 props.sessions。
+     * 返回：执行中的 CodeX thread ID 集合。
+     * 边界：未绑定 externalThreadId 的会话不参与展示，避免把本地会话 ID 误认为 CodeX thread ID。
+     */
+    const runningThreadIdSet = computed<Set<string>>(() => {
+        return props.sessions.reduce<Set<string>>((threadIdSet, session) => {
+            if (session.status === 'running' && session.externalThreadId) threadIdSet.add(session.externalThreadId);
+            return threadIdSet;
+        }, new Set<string>());
+    });
 
     // 需要监听父级关键词变化：切换工作空间时 Store 会清空搜索词，输入框必须同步清空但不触发请求。
     watch(
@@ -338,6 +381,17 @@
         const agentText = [thread.agentNickname, thread.agentRole].filter(Boolean).join(' / ');
         const parentText = `父会话 ${thread.parentThreadId}`;
         return agentText ? `${agentText} · ${parentText}` : parentText;
+    }
+
+    /**
+     * 判断当前 CodeX 会话是否正在执行。
+     * 流程：用当前列表 threadId 到任务聚合 running 会话索引中查询，命中时展示 loading 图标。
+     * 参数：threadId 为 CodeX 会话列表中的真实 thread ID。
+     * 返回：处于执行中时为 true。
+     * 边界：只展示后端已确认的 running，不根据更新时间或标题猜测状态。
+     */
+    function isThreadRunning(threadId: string): boolean {
+        return runningThreadIdSet.value.has(threadId);
     }
 
     /**

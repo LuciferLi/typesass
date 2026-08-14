@@ -13,6 +13,16 @@
     const delegatedProps = reactiveOmit(props, 'class');
 
     const forwarded = useForwardPropsEmits(delegatedProps, emits);
+
+    /**
+     * 阻止点击遮罩层关闭滚动弹窗。
+     * 流程：Reka Dialog 触发外部点击事件时取消默认关闭行为，让长表单只能通过明确按钮关闭。
+     * 参数：event 为 DialogContent 的外部指针事件。
+     * 返回：无返回值；边界为滚动内容或表单内容较长时避免误触遮罩丢失填写内容。
+     */
+    function preventOutsidePointerClose(event: Event): void {
+        event.preventDefault();
+    }
 </script>
 
 <template>
@@ -27,15 +37,7 @@
                     )
                 "
                 v-bind="forwarded"
-                @pointer-down-outside="
-                    (event) => {
-                        const originalEvent = event.detail.originalEvent;
-                        const target = originalEvent.target as HTMLElement;
-                        if (originalEvent.offsetX > target.clientWidth || originalEvent.offsetY > target.clientHeight) {
-                            event.preventDefault();
-                        }
-                    }
-                ">
+                @pointer-down-outside="preventOutsidePointerClose">
                 <slot />
 
                 <DialogClose class="absolute top-4 right-4 p-0.5 transition-colors rounded-md hover:bg-secondary">

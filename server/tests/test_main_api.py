@@ -36,6 +36,24 @@ ORDINARY_ID = "ordinary-client"
 ORDINARY_SECRET = "fake-ordinary-client-secret-000000000001"
 
 
+class FakeAccessTokenApprovalRpcClient:
+    """记录授权申请私有 RPC 调用并返回固定审批结果。"""
+
+    def __init__(self, approved: bool) -> None:
+        """初始化审批结果和调用列表。"""
+
+        self.approved = approved
+        self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def call(
+        self, method: str, request_id: str, params: dict[str, object]
+    ) -> object:
+        """记录授权申请 RPC 参数并返回 App 审批结论。"""
+
+        self.calls.append((method, request_id, params))
+        return {"approved": self.approved, "message": None}
+
+
 def success_payload(
     text: str = "mock result", model: str = "mock-model"
 ) -> dict[str, object]:
@@ -87,6 +105,7 @@ async def session_headers(
 ) -> dict[str, str]:
     """通过真实授权码申请接口取得业务接口 Bearer Header。"""
 
+    main.app.state.private_rpc = FakeAccessTokenApprovalRpcClient(True)
     response = await client.post(
         "/v1/access-tokens/request", json={"name": "pytest", "expiresAt": None}
     )
@@ -221,8 +240,11 @@ async def test_tc_api_002a_access_token_create_list_revoke_and_origin_rules() ->
     """TC-API-002A 授权码创建、列表、撤销、内网免授权和公网鉴权形成接口闭环。"""
 
     async with api_client() as client:
+        approval_rpc = FakeAccessTokenApprovalRpcClient(True)
+        main.app.state.private_rpc = approval_rpc
         requested = await client.post(
             "/v1/access-tokens/request",
+            headers={"X-Request-ID": "token-request-002a"},
             json={"name": "Chrome 插件", "expiresAt": None},
         )
         access_token = requested.json()["accessToken"]
@@ -231,6 +253,18 @@ async def test_tc_api_002a_access_token_create_list_revoke_and_origin_rules() ->
             "Authorization": "Bearer {0}".format(access_token),
         }
         listed = await client.get("/v1/access-tokens", headers=auth_headers)
+        verified = await client.get("/v1/access-tokens/verify", headers=auth_headers)
+        extension_verified = await client.get(
+            "/v1/access-tokens/verify",
+            headers={
+                "X-CodexMan-Client-Origin": "chrome-extension://codexman",
+                "Authorization": "Bearer {0}".format(access_token),
+            },
+        )
+        extension_missing_token = await client.get(
+            "/v1/access-tokens/verify",
+            headers={"X-CodexMan-Client-Origin": "chrome-extension://codexman"},
+        )
         internal = await client.get("/v1/models", headers={"Origin": "http://127.0.0.1:4006"})
         public_success = await client.get("/v1/models", headers=auth_headers)
         revoked = await client.post(
@@ -238,21 +272,74 @@ async def test_tc_api_002a_access_token_create_list_revoke_and_origin_rules() ->
             headers=auth_headers,
         )
         after_revoke = await client.get("/v1/models", headers=auth_headers)
+        verify_after_revoke = await client.get(
+            "/v1/access-tokens/verify", headers=auth_headers
+        )
         missing_origin = await client.get(
             "/v1/models", headers={"Authorization": "Bearer {0}".format(access_token)}
         )
     assert requested.status_code == 200
     assert requested.json()["status"] == "approved"
+    assert approval_rpc.calls == [
+        (
+            "requestAccessTokenApproval",
+            "token-request-002a",
+            {"requestId": "token-request-002a", "name": "Chrome 插件", "expiresAt": None},
+        )
+    ]
     assert access_token.startswith("typesass_")
     assert listed.status_code == 200
     assert listed.json()[0]["name"] == "Chrome 插件"
     assert listed.json()[0]["token"] == access_token
+    assert verified.status_code == 200
+    assert verified.json()["ok"] is True
+    assert verified.json()["clientId"] == listed.json()[0]["id"]
+    assert extension_verified.status_code == 200
+    assert extension_verified.json()["ok"] is True
+    assert_error(extension_missing_token, 401, "UNAUTHORIZED")
     assert internal.status_code == 200
     assert public_success.status_code == 200
     assert revoked.status_code == 200
     assert revoked.json()["status"] == "revoked"
     assert_error(after_revoke, 401, "UNAUTHORIZED")
+    assert_error(verify_after_revoke, 401, "UNAUTHORIZED")
     assert_error(missing_origin, 401, "ORIGIN_REQUIRED")
+
+
+@pytest.mark.asyncio
+async def test_tc_api_002b_access_token_request_rejected_does_not_create_token() -> None:
+    """TC-API-002B App 拒绝授权申请时不创建授权码，业务接口仍需有效 Bearer。"""
+
+    async with api_client() as client:
+        created = await client.post(
+            "/v1/access-tokens",
+            headers={"Origin": "http://127.0.0.1:4006"},
+            json={"name": "人工授权码", "expiresAt": None},
+        )
+        auth_headers = {
+            "Origin": "https://public.example",
+            "Authorization": "Bearer {0}".format(created.json()["token"]),
+        }
+        before_reject = await client.get("/v1/access-tokens", headers=auth_headers)
+        approval_rpc = FakeAccessTokenApprovalRpcClient(False)
+        main.app.state.private_rpc = approval_rpc
+        rejected = await client.post(
+            "/v1/access-tokens/request",
+            headers={"X-Request-ID": "token-request-rejected"},
+            json={"name": "Chrome 插件", "expiresAt": None},
+        )
+        after_reject = await client.get("/v1/access-tokens", headers=auth_headers)
+    assert rejected.status_code == 200
+    assert rejected.json() == {"status": "rejected", "accessToken": None, "expiresAt": None}
+    assert approval_rpc.calls == [
+        (
+            "requestAccessTokenApproval",
+            "token-request-rejected",
+            {"requestId": "token-request-rejected", "name": "Chrome 插件", "expiresAt": None},
+        )
+    ]
+    assert "人工授权码" in [item["name"] for item in after_reject.json()]
+    assert len(after_reject.json()) == len(before_reject.json())
 
 
 @pytest.mark.asyncio
@@ -707,6 +794,7 @@ async def test_tc_api_008a_access_token_expiry_revoke_and_invalid_id() -> None:
     """TC-API-008A 授权码过期、撤销幂等和未知 ID 返回稳定接口结果。"""
 
     async with api_client() as client:
+        main.app.state.private_rpc = FakeAccessTokenApprovalRpcClient(True)
         expired = await client.post(
             "/v1/access-tokens/request",
             json={"name": "过期授权码", "expiresAt": "2020-01-01T00:00:00Z"},
@@ -879,6 +967,7 @@ async def test_tc_api_010_openapi_contract() -> None:
     assert set(schema["paths"]) == {
         "/health",
         "/v1/access-tokens",
+        "/v1/access-tokens/verify",
         "/v1/access-tokens/request",
         "/v1/access-tokens/{tokenId}/revoke",
         "/v1/models",
@@ -911,6 +1000,9 @@ async def test_tc_api_010_openapi_contract() -> None:
     access_token_operation = schema["paths"]["/v1/access-tokens"]["post"]
     assert access_token_operation["security"] == [{"AppAccessToken": []}]
     assert schema["paths"]["/v1/access-tokens"]["get"]["security"] == [
+        {"AppAccessToken": []}
+    ]
+    assert schema["paths"]["/v1/access-tokens/verify"]["get"]["security"] == [
         {"AppAccessToken": []}
     ]
     assert schema["paths"]["/v1/access-tokens/{tokenId}/revoke"]["post"][

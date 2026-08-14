@@ -115,6 +115,9 @@
       "binaries/codexman-process-tap",
       "binaries/codexman-ai-sidecar"
     ],
+    "resources": [
+      "../dist"
+    ],
     "macOS": {
       "signingIdentity": "Developer ID Application: Tamba Trading Co., Ltd. (9VKQ2P8P6N)",
       "hardenedRuntime": true

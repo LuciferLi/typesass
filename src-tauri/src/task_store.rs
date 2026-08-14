@@ -3,31 +3,37 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
-/// 首发任务管理业务库结构标识；当前版本不包含任何历史数据迁移分支。
+/// 首发任务管理业务库结构标识；当前版本允许受控补充软删除字段。
 const INITIAL_SCHEMA_VERSION: i64 = 1;
 
-/// 首发 schema 元数据名称；已登记库必须精确匹配，当前不提供历史兼容迁移。
+/// 首发 schema 元数据名称；已登记库必须精确匹配，只允许登记过的首发结构迁移到当前结构。
 const INITIAL_SCHEMA_NAME: &str = "初始化会话与任务管理表";
 /// 首发 schema 内容校验值；已登记库必须精确匹配，禁止把未知结构当作当前版本继续运行。
-const INITIAL_SCHEMA_CHECKSUM: &str = "001-session-task-schema";
+const INITIAL_SCHEMA_CHECKSUM: &str = "003-session-task-project-base-prompt";
+/// 上一版首发 schema 内容校验值；仅用于把项目记录升级为支持基础提示词。
+const LEGACY_SCHEMA_CHECKSUM_PROJECT_SOFT_DELETE: &str = "002-session-task-project-soft-delete";
+/// 上一版首发 schema 内容校验值；仅用于把项目物理删除协议升级为软删除协议。
+const LEGACY_SCHEMA_CHECKSUM_SESSION_TASK: &str = "001-session-task-schema";
 
 /// 任务标题最大 Unicode 字符数，兼顾看板识别与 IPC/SQLite 有界存储。
 pub const TASK_TITLE_MAX_CHARS: usize = 200;
 /// 任务提示词最大 Unicode 字符数，避免单条任务无限占用前端、IPC、数据库与 Codex 请求内存。
 pub const TASK_PROMPT_MAX_CHARS: usize = 50_000;
+/// 单个任务最多携带的图片附件数量，避免 HTTP/RPC/SQLite 聚合响应被截图无限放大。
+const TASK_ATTACHMENT_LIMIT: usize = 4;
+/// 单个图片附件 data URL 最大字符数，当前插件会压缩截图，Rust 仍执行最终边界校验。
+const TASK_ATTACHMENT_DATA_URL_MAX_CHARS: usize = 200_000;
 /// 可靠终态结果 JSON 最大 UTF-8 字节数，防止外部响应放大本地数据库和 IPC 返回。
 const TASK_RESULT_JSON_MAX_BYTES: usize = 32 * 1024;
 /// 项目名称最大 Unicode 字符数，确保项目列表的单条记录具备可证明的序列化上限。
 const PROJECT_NAME_MAX_CHARS: usize = 100;
+/// 项目基础提示词最大 Unicode 字符数，确保项目列表和任务发送内容具备有界容量。
+pub const PROJECT_BASE_PROMPT_MAX_CHARS: usize = 20_000;
 /// 首发最多允许创建的项目数，避免项目列表在没有分页字段的首版协议中无界增长。
 const WORKSPACE_PROJECT_LIMIT: i64 = 200;
-/// 首发每个项目最多允许的任务总数。
-/// 该值按最坏 50,000 字符 JSON 转义 prompt、32 KiB 结果、路径和其它有界字段计算，十六条全部返回仍低于 7 MiB 聚合预算。
-const WORKSPACE_TASK_LIMIT: i64 = 16;
-/// 首发每个项目最多允许的会话总数；查询返回全部会话，不允许以截断隐藏历史执行记录。
-const WORKSPACE_SESSION_LIMIT: i64 = 16;
 /// 工作区业务 JSON 的内部预算，给私有 RPC 8 MiB envelope、错误结构和长度前缀保留至少 1 MiB 余量。
 pub(crate) const WORKSPACE_RESPONSE_BUDGET_BYTES: usize = 7 * 1024 * 1024;
 
@@ -99,6 +105,9 @@ pub struct CreateProjectRequest {
     pub name: String,
     /// 项目绑定的工作空间绝对路径，后续任务默认在该目录创建会话。
     pub workspace_path: String,
+    /// 项目基础提示词，后续任务执行时自动追加在任务正文前。
+    #[serde(default)]
+    pub base_prompt: String,
 }
 
 /// 编辑项目请求，用于更新展示名称和后续任务使用的 CodeX 工作空间。
@@ -111,6 +120,9 @@ pub struct UpdateProjectRequest {
     pub name: String,
     /// 项目新工作空间绝对路径；已有会话仍保留各自执行时的路径快照。
     pub workspace_path: String,
+    /// 项目基础提示词；为空时后续任务只发送任务自身内容。
+    #[serde(default)]
+    pub base_prompt: String,
 }
 
 /// 创建任务请求，用于在指定项目下登记一个待处理任务。
@@ -123,6 +135,9 @@ pub struct CreateTaskRequest {
     pub title: String,
     /// 任务首条提示词，执行时发送给 CodeX。
     pub prompt: String,
+    /// 任务图片附件，执行时以文件附件形式发送给 CodeX，不拼入提示词。
+    #[serde(default)]
+    pub attachments: Vec<TaskAttachmentRecord>,
 }
 
 /// 更新任务请求，用于修改尚未执行完成任务的名称和描述。
@@ -135,6 +150,23 @@ pub struct UpdateTaskRequest {
     pub title: String,
     /// 任务新提示词，后续执行时发送给 CodeX。
     pub prompt: String,
+    /// 任务图片附件；更新任务时整体替换附件列表。
+    #[serde(default)]
+    pub attachments: Vec<TaskAttachmentRecord>,
+}
+
+/// 任务图片附件记录，用于 HTTP/RPC、任务看板和 Codex 执行上传。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAttachmentRecord {
+    /// 附件稳定 ID，用于前端渲染和排障。
+    pub id: String,
+    /// 附件文件名，执行前会再次收敛为安全文件名。
+    pub name: String,
+    /// 附件媒体类型；当前仅支持图片。
+    pub mime_type: String,
+    /// 图片 data URL；仅用于本机任务转发，不写入日志。
+    pub data_url: String,
 }
 
 /// 项目列表项模型，用于前端项目选择与工作空间展示。
@@ -147,6 +179,8 @@ pub struct ProjectRecord {
     pub name: String,
     /// 绑定的工作空间绝对路径。
     pub workspace_path: String,
+    /// 项目基础提示词，后续任务执行时自动携带。
+    pub base_prompt: String,
     /// 项目下任务总数。
     pub task_count: i64,
     /// 项目下会话总数。
@@ -169,6 +203,8 @@ pub struct TaskRecord {
     pub title: String,
     /// 任务提示词。
     pub prompt: String,
+    /// 任务图片附件，独立于 prompt 文本。
+    pub attachments: Vec<TaskAttachmentRecord>,
     /// 当前任务状态协议值。
     pub status: String,
     /// 当前绑定的会话 ID；未执行前为空。
@@ -259,8 +295,10 @@ pub struct QueuedTaskRecord {
     pub project_id: String,
     /// 任务标题。
     pub title: String,
-    /// 任务提示词。
+    /// 任务提示词；读取队列上下文时已按项目配置拼接基础提示词。
     pub prompt: String,
+    /// 任务图片附件，执行时上传给 CodeX。
+    pub attachments: Vec<TaskAttachmentRecord>,
     /// 任务所属工作空间。
     pub workspace_path: String,
 }
@@ -333,21 +371,29 @@ pub fn load_workspace_data(
 /// 异常/边界：数据库、路径、prompt 正文或未知错误均返回 false，调用方必须只返回统一脱敏诊断文案。
 pub fn is_public_task_contract_error(error: &str) -> bool {
     [
+        "TASK_ATTACHMENT_COUNT_TOO_LONG",
+        "TASK_ATTACHMENT_DATA_TOO_LONG",
+        "TASK_ATTACHMENT_DATA_URL_INVALID",
+        "TASK_ATTACHMENT_MIME_UNSUPPORTED",
+        "TASK_ATTACHMENT_NAME_REQUIRED",
+        "TASK_ATTACHMENT_NAME_TOO_LONG",
         "TASK_TITLE_REQUIRED",
         "TASK_TITLE_TOO_LONG",
         "TASK_PROMPT_REQUIRED",
         "TASK_PROMPT_TOO_LONG",
+        "TASK_PROJECT_NAME_REQUIRED",
+        "TASK_PROJECT_NAME_EXISTS",
         "TASK_PROJECT_NAME_TOO_LONG",
+        "TASK_PROJECT_WORKSPACE_REQUIRED",
+        "TASK_PROJECT_WORKSPACE_ABSOLUTE_REQUIRED",
+        "TASK_PROJECT_WORKSPACE_UNAVAILABLE",
+        "TASK_PROJECT_WORKSPACE_DIR_REQUIRED",
         "TASK_PROJECT_LIMIT_REACHED",
-        "TASK_PROJECT_TASK_LIMIT_REACHED",
-        "TASK_PROJECT_SESSION_LIMIT_REACHED",
         "TASK_PROJECT_NOT_FOUND",
         "TASK_NOT_FOUND",
         "TASK_UPDATE_STATUS_FORBIDDEN",
         "TASK_DELETE_STATUS_FORBIDDEN",
         "TASK_PROJECT_CAPACITY_INVALID",
-        "TASK_PROJECT_TASK_CAPACITY_INVALID",
-        "TASK_PROJECT_SESSION_CAPACITY_INVALID",
         "TASK_WORKSPACE_SERIALIZATION_FAILED",
         "TASK_WORKSPACE_RESPONSE_TOO_LARGE",
         "CODEX_DESKTOP_NOT_CONNECTED",
@@ -391,36 +437,43 @@ pub fn load_task_update_snapshot(
 /// 流程：校验项目名称和工作空间，写入 project 表，再返回当前项目数据。
 /// 参数：app 用于定位数据库，request 为前端表单。
 /// 返回：以新项目为当前项目的聚合数据。
-/// 边界：项目名称和 canonical 工作目录都必须唯一，任一冲突均不落库。
+/// 边界：项目名称必须唯一；工作目录只校验存在性，允许多个任务项目绑定同一仓库或父级工作区。
 pub fn create_project(
     app: &AppHandle,
     request: CreateProjectRequest,
 ) -> Result<WorkspaceDataResponse, String> {
     let name = request.name.trim();
+    let base_prompt = request.base_prompt.trim();
     let workspace_path = canonical_workspace_path(request.workspace_path.trim())?;
     if name.is_empty() {
-        return Err("项目名称不能为空".to_string());
+        return Err("项目名称不能为空（错误码：TASK_PROJECT_NAME_REQUIRED）".to_string());
     }
     validate_project_name(name)?;
+    validate_project_base_prompt(base_prompt)?;
     let mut connection = open_database(app)?;
     initialize_database_schema(&connection)?;
-    let project_id = create_project_record(&mut connection, name, &workspace_path)?;
+    let project_id = create_project_record(&mut connection, name, &workspace_path, base_prompt)?;
     load_workspace_data_with_connection(&connection, Some(&project_id))
 }
 
-/// 在一个 Immediate 事务内校验唯一性并创建项目记录。
-/// 流程：串行化写事务，检查项目名称与 canonical 工作目录冲突，随后插入新项目并提交；参数为数据库连接、名称和规范路径；返回新项目 ID。
+/// 在一个 Immediate 事务内校验项目名称唯一性并创建项目记录。
+/// 流程：串行化写事务，检查项目名称冲突，随后插入新项目并提交；参数为数据库连接、名称和规范路径；返回新项目 ID。
 /// 异常/边界：任一冲突或插入失败都会整体回滚；不依赖前端预检查，避免并发创建重复项目。
 fn create_project_record(
     connection: &mut Connection,
     name: &str,
     workspace_path: &Path,
+    base_prompt: &str,
 ) -> Result<String, String> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
     let project_count: i64 = transaction
-        .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM project WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
         .map_err(database_error)?;
     if project_count >= WORKSPACE_PROJECT_LIMIT {
         return Err(format!(
@@ -428,12 +481,17 @@ fn create_project_record(
             WORKSPACE_PROJECT_LIMIT
         ));
     }
-    ensure_project_identity_unique(&transaction, name, workspace_path, "")?;
+    ensure_project_name_unique(&transaction, name, "")?;
     let project_id = next_id("proj");
     transaction
         .execute(
-            "INSERT INTO project (id, name, workspace_path) VALUES (?1, ?2, ?3)",
-            params![project_id, name, workspace_path.to_string_lossy()],
+            "INSERT INTO project (id, name, workspace_path, base_prompt) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                project_id,
+                name,
+                workspace_path.to_string_lossy(),
+                base_prompt
+            ],
         )
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)?;
@@ -441,7 +499,7 @@ fn create_project_record(
 }
 
 /// 编辑项目并返回刷新后的聚合数据。
-/// 流程：校验名称和 canonical 工作目录，在 Immediate 事务内按 ID 更新项目；参数为 AppHandle 与编辑请求；返回当前项目数据。
+/// 流程：校验名称和 canonical 工作目录存在性，在 Immediate 事务内按 ID 更新项目；参数为 AppHandle 与编辑请求；返回当前项目数据。
 /// 异常/边界：项目不存在或并发删除时拒绝更新；已有 session 的工作目录快照不会被追溯修改。
 pub fn update_project(
     app: &AppHandle,
@@ -449,6 +507,7 @@ pub fn update_project(
 ) -> Result<WorkspaceDataResponse, String> {
     let project_id = request.id.trim();
     let name = request.name.trim();
+    let base_prompt = request.base_prompt.trim();
     if project_id.is_empty() {
         return Err("项目 ID 不能为空".to_string());
     }
@@ -456,17 +515,18 @@ pub fn update_project(
         return Err("项目名称不能为空".to_string());
     }
     validate_project_name(name)?;
+    validate_project_base_prompt(base_prompt)?;
     let workspace_path = canonical_workspace_path(request.workspace_path.trim())?;
     let mut connection = open_database(app)?;
     initialize_database_schema(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    ensure_project_identity_unique(&transaction, name, &workspace_path, project_id)?;
+    ensure_project_name_unique(&transaction, name, project_id)?;
     let changed = transaction
         .execute(
-            "UPDATE project SET name = ?1, workspace_path = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
-            params![name, workspace_path.to_string_lossy(), project_id],
+            "UPDATE project SET name = ?1, workspace_path = ?2, base_prompt = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND deleted_at IS NULL",
+            params![name, workspace_path.to_string_lossy(), base_prompt, project_id],
         )
         .map_err(database_error)?;
     if changed != 1 {
@@ -476,34 +536,23 @@ pub fn update_project(
     load_workspace_data_with_connection(&connection, Some(project_id))
 }
 
-/// 校验项目名称和 canonical 工作目录在首版项目表中唯一。
-/// 流程：分别查询名称与路径冲突，编辑时通过 excluded_project_id 排除当前项目；参数为连接、名称、规范路径和可空排除 ID；返回无。
+/// 校验项目名称在首版项目表中唯一。
+/// 流程：查询名称冲突，编辑时通过 excluded_project_id 排除当前项目；参数为连接、名称和可空排除 ID；返回无。
 /// 异常/边界：调用方必须处于 Immediate 写事务内，确保检查至提交之间没有其它写入插队；冲突时不写任何数据。
-fn ensure_project_identity_unique(
+fn ensure_project_name_unique(
     connection: &Connection,
     name: &str,
-    workspace_path: &Path,
     excluded_project_id: &str,
 ) -> Result<(), String> {
     let duplicate_name: bool = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM project WHERE name = ?1 AND (?2 = '' OR id <> ?2))",
+            "SELECT EXISTS(SELECT 1 FROM project WHERE name = ?1 AND deleted_at IS NULL AND (?2 = '' OR id <> ?2))",
             params![name, excluded_project_id],
             |row| row.get(0),
         )
         .map_err(database_error)?;
     if duplicate_name {
-        return Err("项目名称已存在".to_string());
-    }
-    let duplicate_workspace: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM project WHERE workspace_path = ?1 AND (?2 = '' OR id <> ?2))",
-            params![workspace_path.to_string_lossy(), excluded_project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if duplicate_workspace {
-        return Err("工作目录已绑定其它项目".to_string());
+        return Err("项目名称已存在（错误码：TASK_PROJECT_NAME_EXISTS）".to_string());
     }
     Ok(())
 }
@@ -521,9 +570,39 @@ fn validate_project_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 删除没有任何关联任务或会话的项目并返回剩余聚合数据。
-/// 流程：Immediate 事务内锁定写入顺序，检查完整关联记录后删除项目；参数为 AppHandle 与项目 ID；返回默认剩余项目数据。
-/// 异常/边界：任务、会话任一存在都拒绝删除，避免级联丢失执行记录；首版不提供软删除。
+/// 校验项目基础提示词的容量边界。
+/// 流程：允许空提示词，非空时按 Unicode 字符数检查上限；参数为已 trim 的基础提示词。
+/// 返回：校验通过时无返回值。
+/// 异常/边界：只校验项目字段自身容量，最终发送内容仍由任务 prompt 上限和 Codex 提交上限共同保护。
+fn validate_project_base_prompt(base_prompt: &str) -> Result<(), String> {
+    if base_prompt.chars().count() > PROJECT_BASE_PROMPT_MAX_CHARS {
+        return Err(format!(
+            "项目基础提示词不能超过 {} 个字符（错误码：TASK_PROJECT_BASE_PROMPT_TOO_LONG）",
+            PROJECT_BASE_PROMPT_MAX_CHARS
+        ));
+    }
+    Ok(())
+}
+
+/// 生成任务最终发送给 CodeX 的提示词。
+/// 流程：项目基础提示词为空时返回任务正文；非空时用固定分隔标题拼接基础提示词和任务正文。
+/// 参数：base_prompt 为项目配置的基础提示词，task_prompt 为任务自身内容。
+/// 返回：用于执行和崩溃恢复匹配的完整提示词。
+/// 异常/边界：调用方已在项目和任务写入时分别完成容量校验，本函数不再截断正文，避免恢复匹配与真实发送内容不一致。
+fn build_task_execution_prompt(base_prompt: &str, task_prompt: &str) -> String {
+    if base_prompt.trim().is_empty() {
+        return task_prompt.to_string();
+    }
+    format!(
+        "项目基础提示词：\n{}\n\n任务内容：\n{}",
+        base_prompt.trim(),
+        task_prompt
+    )
+}
+
+/// 软删除任务项目并返回剩余聚合数据。
+/// 流程：Immediate 事务内只标记项目删除时间；参数为 AppHandle 与项目 ID；返回默认剩余未删除项目数据。
+/// 异常/边界：任务、会话历史不参与删除校验且不会级联变更；重复删除或未知项目返回稳定不存在错误。
 pub fn delete_project(app: &AppHandle, project_id: &str) -> Result<WorkspaceDataResponse, String> {
     let project_id = project_id.trim();
     if project_id.is_empty() {
@@ -535,35 +614,18 @@ pub fn delete_project(app: &AppHandle, project_id: &str) -> Result<WorkspaceData
     load_workspace_data_with_connection(&connection, None)
 }
 
-/// 在一个 Immediate 事务内校验并删除空项目。
-/// 流程：依次检查任务、会话关联数，再删除目标项目并提交；参数为数据库连接与项目 ID；返回无。
-/// 异常/边界：任何关联都阻止物理删除；错误返回时事务自动回滚，不保留未实现的归档状态。
+/// 在一个 Immediate 事务内软删除项目。
+/// 流程：只更新项目 deleted_at 与 updated_at，不检查任务或会话关联；参数为数据库连接与项目 ID；返回无。
+/// 异常/边界：任何历史任务、会话均保留原 project_id；错误返回时事务自动回滚。
 fn delete_project_record(connection: &mut Connection, project_id: &str) -> Result<(), String> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    let related_task_count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM task WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if related_task_count > 0 {
-        return Err("项目已有任务，不能删除；请保留历史执行记录".to_string());
-    }
-    let related_session_count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM session WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if related_session_count > 0 {
-        return Err("项目已有会话，不能删除；请保留历史执行记录".to_string());
-    }
     let changed = transaction
-        .execute("DELETE FROM project WHERE id = ?1", params![project_id])
+        .execute(
+            "UPDATE project SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND deleted_at IS NULL",
+            params![project_id],
+        )
         .map_err(database_error)?;
     if changed != 1 {
         return Err("项目不存在或已被删除".to_string());
@@ -583,13 +645,15 @@ pub fn create_task(
     let project_id = request.project_id.trim();
     let title = request.title.trim();
     let prompt = request.prompt.trim();
+    let attachments = validate_task_attachments(request.attachments)?;
     if project_id.is_empty() {
         return Err("请选择项目".to_string());
     }
     validate_task_content(title, prompt)?;
     let mut connection = open_database(app)?;
     initialize_database_schema(&connection)?;
-    let created_task_id = create_task_record(&mut connection, project_id, title, prompt)?;
+    let created_task_id =
+        create_task_record(&mut connection, project_id, title, prompt, &attachments)?;
     let workspace = load_workspace_data_with_connection(&connection, Some(project_id))?;
     Ok(CreateTaskResponse {
         created_task_id,
@@ -611,13 +675,14 @@ pub fn update_task(
     let task_id = request.id.trim();
     let title = request.title.trim();
     let prompt = request.prompt.trim();
+    let attachments = validate_task_attachments(request.attachments)?;
     if task_id.is_empty() {
         return Err("任务 ID 不能为空（错误码：TASK_NOT_FOUND）".to_string());
     }
     validate_task_content(title, prompt)?;
     let mut connection = open_database(app)?;
     initialize_database_schema(&connection)?;
-    let project_id = update_task_record(&mut connection, task_id, title, prompt)?;
+    let project_id = update_task_record(&mut connection, task_id, title, prompt, &attachments)?;
     load_workspace_data_with_connection(&connection, Some(&project_id))
 }
 
@@ -662,6 +727,78 @@ fn validate_task_content(title: &str, prompt: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验任务图片附件并返回已收敛的附件列表。
+/// 流程：限制数量、文件名、媒体类型和 data URL 长度/前缀，避免附件进入 prompt 或撑爆本机转发链路。
+/// 异常/边界：只做结构和大小校验，不在 HTTP/RPC 日志中回显图片内容。
+fn validate_task_attachments(
+    attachments: Vec<TaskAttachmentRecord>,
+) -> Result<Vec<TaskAttachmentRecord>, String> {
+    if attachments.len() > TASK_ATTACHMENT_LIMIT {
+        return Err(format!(
+            "任务附件不能超过 {} 个（错误码：TASK_ATTACHMENT_COUNT_TOO_LONG）",
+            TASK_ATTACHMENT_LIMIT
+        ));
+    }
+    let mut normalized = Vec::with_capacity(attachments.len());
+    for (index, attachment) in attachments.into_iter().enumerate() {
+        let id = attachment.id.trim();
+        let name = attachment.name.trim();
+        let mime_type = attachment.mime_type.trim();
+        let data_url = attachment.data_url.trim();
+        if name.is_empty() {
+            return Err(
+                "任务附件名称不能为空（错误码：TASK_ATTACHMENT_NAME_REQUIRED）".to_string(),
+            );
+        }
+        if name.chars().count() > 120 {
+            return Err(
+                "任务附件名称不能超过 120 个字符（错误码：TASK_ATTACHMENT_NAME_TOO_LONG）"
+                    .to_string(),
+            );
+        }
+        if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+            return Err(
+                "任务附件只支持 PNG、JPEG 或 WebP 图片（错误码：TASK_ATTACHMENT_MIME_UNSUPPORTED）"
+                    .to_string(),
+            );
+        }
+        let expected_prefix = format!("data:{};base64,", mime_type);
+        if !data_url.starts_with(&expected_prefix) {
+            return Err(
+                "任务附件 data URL 格式无效（错误码：TASK_ATTACHMENT_DATA_URL_INVALID）"
+                    .to_string(),
+            );
+        }
+        if data_url.chars().count() > TASK_ATTACHMENT_DATA_URL_MAX_CHARS {
+            return Err(format!(
+                "单个任务附件不能超过 {} 个字符（错误码：TASK_ATTACHMENT_DATA_TOO_LONG）",
+                TASK_ATTACHMENT_DATA_URL_MAX_CHARS
+            ));
+        }
+        normalized.push(TaskAttachmentRecord {
+            id: if id.is_empty() {
+                format!("attachment-{}", index + 1)
+            } else {
+                id.to_string()
+            },
+            name: name.to_string(),
+            mime_type: mime_type.to_string(),
+            data_url: data_url.to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
+/// 序列化任务附件事件载荷。
+/// 流程：使用稳定 JSON 对象包裹附件列表，解析方只读取 attachments 字段。
+/// 异常/边界：序列化失败返回稳定业务错误，不把附件正文拼入错误。
+fn serialize_task_attachments_payload(
+    attachments: &[TaskAttachmentRecord],
+) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({ "attachments": attachments }))
+        .map_err(|_| "任务附件序列化失败（错误码：TASK_ATTACHMENT_DATA_URL_INVALID）".to_string())
+}
+
 /// 在一个 Immediate 事务内创建任务和唯一创建事件。
 /// 流程：锁定写事务、确认项目存在、插入 created 任务并追加 created 事件，最后一次性提交；参数为连接及任务业务字段；返回新任务 ID。
 /// 异常/边界：任务或事件任一步失败均整体回滚，不会留下无事件任务；任务创建后不会自动排队。
@@ -670,24 +807,12 @@ fn create_task_record(
     project_id: &str,
     title: &str,
     prompt: &str,
+    attachments: &[TaskAttachmentRecord],
 ) -> Result<String, String> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
     ensure_project_exists(&transaction, project_id)?;
-    let task_count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM task WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if task_count >= WORKSPACE_TASK_LIMIT {
-        return Err(format!(
-            "每个项目最多创建 {} 个任务（错误码：TASK_PROJECT_TASK_LIMIT_REACHED）",
-            WORKSPACE_TASK_LIMIT
-        ));
-    }
     let task_id = next_id("task");
     transaction
         .execute(
@@ -708,7 +833,7 @@ fn create_task_record(
         "",
         TaskStatus::Created.as_str(),
         "任务已创建",
-        "{}",
+        &serialize_task_attachments_payload(attachments)?,
     )?;
     transaction.commit().map_err(database_error)?;
     Ok(task_id)
@@ -722,6 +847,7 @@ fn update_task_record(
     task_id: &str,
     title: &str,
     prompt: &str,
+    attachments: &[TaskAttachmentRecord],
 ) -> Result<String, String> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -756,7 +882,7 @@ fn update_task_record(
         &status,
         &status,
         "任务名称和描述已更新",
-        "{}",
+        &serialize_task_attachments_payload(attachments)?,
     )?;
     transaction.commit().map_err(database_error)?;
     Ok(project_id)
@@ -889,7 +1015,6 @@ fn queue_task_with_connection(
     if !matches!(current_status.as_str(), "created" | "failed") {
         return Err("当前状态不能进入排队中".to_string());
     }
-    ensure_project_session_capacity(&transaction, &task.project_id)?;
     update_task_status(
         &transaction,
         task_id,
@@ -955,7 +1080,6 @@ pub fn mark_task_running(app: &AppHandle, task: &QueuedTaskRecord) -> Result<Str
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    ensure_project_session_capacity(&transaction, &task.project_id)?;
     let session_id = next_id("sess");
     let changed = transaction
         .execute(
@@ -990,29 +1114,6 @@ pub fn mark_task_running(app: &AppHandle, task: &QueuedTaskRecord) -> Result<Str
     )?;
     transaction.commit().map_err(database_error)?;
     Ok(session_id)
-}
-
-/// 在创建新会话前校验项目的首发会话总量。
-/// 流程：在调用方 Immediate 事务中统计目标项目全部 session；参数为事务连接和项目 ID；未达到上限返回空值。
-/// 异常/边界：达到十六条时在任何 task/session 状态写入前返回 TASK_PROJECT_SESSION_LIMIT_REACHED，避免重试产生不可见历史。
-fn ensure_project_session_capacity(
-    connection: &Connection,
-    project_id: &str,
-) -> Result<(), String> {
-    let session_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM session WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if session_count >= WORKSPACE_SESSION_LIMIT {
-        return Err(format!(
-            "每个项目最多保留 {} 个会话（错误码：TASK_PROJECT_SESSION_LIMIT_REACHED）",
-            WORKSPACE_SESSION_LIMIT
-        ));
-    }
-    Ok(())
 }
 
 /// 持久化 app-server 创建的 thread/turn 标识，但保持任务 running。
@@ -1113,7 +1214,7 @@ pub fn bind_task_thread(
 
 /// 根据 app-server 的可靠 turn 终态完成或失败任务。
 /// 流程：只接受 completed/failed/interrupted，以 thread/turn/session/task 全量 CAS 更新两表和事件；参数含安全结果或错误；返回无。
-/// 异常/边界：inProgress 等非终态会拒绝；completed 才进入 waiting_acceptance，失败与中断进入 failed。
+/// 异常/边界：inProgress 等非终态会拒绝；completed 进入 waiting_acceptance；interrupted 仅在已有最终回复时进入 waiting_acceptance，否则仍失败。
 pub fn finish_task_execution(
     app: &AppHandle,
     running: &RunningTaskRecord,
@@ -1121,11 +1222,34 @@ pub fn finish_task_execution(
     result_json: &str,
     error: &str,
 ) -> Result<(), String> {
+    let mut connection = open_database(app)?;
+    initialize_database_schema(&connection)?;
+    finish_task_execution_with_connection(&mut connection, running, turn_status, result_json, error)
+}
+
+/// 在现有数据库连接上提交 Codex turn 终态，供运行态对账和单测共用同一 CAS 边界。
+/// 流程：先校验状态与结果 JSON，再根据终态和 finalText 判断本地任务是否可验收，最后原子更新 session/task 并追加事件。
+/// 参数：connection 为已初始化连接，running 为绑定快照，turn_status/result_json/error 来自只读对账。
+/// 异常/边界：failed 永远失败；interrupted 没有可展示回复时失败且清空结果，避免把空中断伪装成完成。
+fn finish_task_execution_with_connection(
+    connection: &mut Connection,
+    running: &RunningTaskRecord,
+    turn_status: &str,
+    result_json: &str,
+    error: &str,
+) -> Result<(), String> {
+    validate_task_result_json(result_json)?;
+    let has_usable_result = task_result_has_final_text(result_json)?;
     let (task_status, session_status, message) = match turn_status {
         "completed" => (
             TaskStatus::WaitingAcceptance.as_str(),
             SessionStatus::WaitingAcceptance.as_str(),
             "Codex turn 已可靠完成，等待人工验收",
+        ),
+        "interrupted" if has_usable_result => (
+            TaskStatus::WaitingAcceptance.as_str(),
+            SessionStatus::WaitingAcceptance.as_str(),
+            "Codex turn 已返回可验收内容，等待人工验收",
         ),
         "failed" | "interrupted" => (
             TaskStatus::Failed.as_str(),
@@ -1134,14 +1258,11 @@ pub fn finish_task_execution(
         ),
         _ => return Err(format!("Codex turn 状态 {} 不是可靠终态", turn_status)),
     };
-    let mut connection = open_database(app)?;
-    initialize_database_schema(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    validate_task_result_json(result_json)?;
     let safe_error = limit_text(error, 1_000);
-    let safe_result = if turn_status == "completed" {
+    let safe_result = if task_status == TaskStatus::WaitingAcceptance.as_str() {
         result_json
     } else {
         "{}"
@@ -1171,6 +1292,19 @@ pub fn finish_task_execution(
         &serde_json::json!({"threadId": running.thread_id, "turnId": running.turn_id, "turnStatus": turn_status}).to_string(),
     )?;
     transaction.commit().map_err(database_error)
+}
+
+/// 判断任务结果中是否已有可展示的助手最终回复。
+/// 流程：解析内部 result JSON，只认非空 finalText 字符串为可验收内容；参数为待落库结果；返回是否可展示。
+/// 异常/边界：畸形 JSON 由调用方统一校验，这里仍 fail closed；纯空白回复不视为成功。
+fn task_result_has_final_text(result_json: &str) -> Result<bool, String> {
+    let value = serde_json::from_str::<Value>(result_json)
+        .map_err(|_| "任务结果不是有效 JSON（错误码：TASK_RESULT_INVALID）".to_string())?;
+    Ok(value
+        .get("finalText")
+        .and_then(Value::as_str)
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false))
 }
 
 /// 校验写入 task/session 的可靠终态结果 JSON。
@@ -1256,7 +1390,7 @@ fn load_pending_submission_with_connection(
 ) -> Result<Option<PendingSubmissionRecord>, String> {
     let record = connection
         .query_row(
-            "SELECT t.id, t.project_id, s.id, s.workspace_path, t.prompt, s.external_url, s.external_client_message_id FROM task t JOIN session s ON s.id = t.current_session_id WHERE t.id = ?1 AND s.id = ?2 AND t.status = 'running' AND s.status = 'running' AND s.external_status = 'cdpSubmitStarted' AND s.external_thread_id = ''",
+            "SELECT t.id, t.project_id, s.id, s.workspace_path, t.prompt, p.base_prompt, s.external_url, s.external_client_message_id FROM task t JOIN session s ON s.id = t.current_session_id JOIN project p ON p.id = t.project_id WHERE t.id = ?1 AND s.id = ?2 AND t.status = 'running' AND s.status = 'running' AND s.external_status = 'cdpSubmitStarted' AND s.external_thread_id = ''",
             params![task_id, session_id],
             |row| {
                 Ok((
@@ -1267,13 +1401,22 @@ fn load_pending_submission_with_connection(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             },
         )
         .optional()
         .map_err(database_error)?;
-    let Some((task_id, project_id, session_id, workspace_path, prompt, state_json, client_id)) =
-        record
+    let Some((
+        task_id,
+        project_id,
+        session_id,
+        workspace_path,
+        prompt,
+        base_prompt,
+        state_json,
+        client_id,
+    )) = record
     else {
         return Ok(None);
     };
@@ -1297,7 +1440,7 @@ fn load_pending_submission_with_connection(
         project_id,
         session_id,
         workspace_path,
-        prompt,
+        prompt: build_task_execution_prompt(&base_prompt, &prompt),
         submitted_at_ms: state.submitted_at_ms,
         client_user_message_id: client_id,
         known_thread_ids: state.known_thread_ids,
@@ -1460,10 +1603,11 @@ fn list_queued_tasks_with_connection(
 ) -> Result<Vec<QueuedTaskRecord>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT t.id, t.project_id, t.title, t.prompt, p.workspace_path
+            "SELECT t.id, t.project_id, t.title, t.prompt, p.workspace_path, p.base_prompt
                FROM task t
                JOIN project p ON p.id = t.project_id
               WHERE t.status = 'queued'
+                AND p.deleted_at IS NULL
            ORDER BY (SELECT MAX(e.rowid) FROM task_event e WHERE e.task_id = t.id AND e.to_status = 'queued') ASC,
                     t.created_at ASC,
                     t.id ASC",
@@ -1471,11 +1615,17 @@ fn list_queued_tasks_with_connection(
         .map_err(database_error)?;
     let rows = statement
         .query_map([], |row| {
+            let task_id: String = row.get(0)?;
             Ok(QueuedTaskRecord {
-                id: row.get(0)?,
+                id: task_id.clone(),
                 project_id: row.get(1)?,
                 title: row.get(2)?,
-                prompt: row.get(3)?,
+                prompt: build_task_execution_prompt(
+                    row.get::<_, String>(5)?.as_str(),
+                    row.get::<_, String>(3)?.as_str(),
+                ),
+                attachments: latest_task_attachments(connection, &task_id)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                 workspace_path: row.get(4)?,
             })
         })
@@ -1565,7 +1715,7 @@ fn initialize_database_schema(connection: &Connection) -> Result<(), String> {
 /// 应用首版任务管理表结构。
 /// 流程：在单一事务内一次性创建项目、任务、会话、任务事件及必要索引，再登记唯一 schema 元数据并提交。
 /// 参数：connection 为已确认零用户对象的数据库连接；返回无。
-/// 异常/边界：首版使用物理删除，不创建未实现的 archived_at；任一 SQLite 错误整体回滚，调用方不得在非空库上调用或伪装初始化成功。
+/// 异常/边界：项目使用 deleted_at 软删除，不级联任务或会话；任一 SQLite 错误整体回滚，调用方不得在非空库上调用或伪装初始化成功。
 fn apply_initial_schema(connection: &Connection) -> Result<(), String> {
     let transaction = connection.unchecked_transaction().map_err(database_error)?;
     transaction
@@ -1582,8 +1732,10 @@ fn apply_initial_schema(connection: &Connection) -> Result<(), String> {
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
               workspace_path TEXT NOT NULL,
+              base_prompt TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              deleted_at TEXT
             );
 
             CREATE TABLE session (
@@ -1659,7 +1811,7 @@ fn apply_initial_schema(connection: &Connection) -> Result<(), String> {
 }
 
 /// 校验非空业务库是否精确等于当前首发 schema。
-/// 流程：先确认 schema_metadata 表存在并读取全部登记，再拒绝高版本或非唯一/不匹配记录，最后与同版本内存库的完整用户表和索引定义逐项比较。
+/// 流程：先确认 schema_metadata 表存在并读取全部登记，允许旧首发结构迁移项目软删除和基础提示词字段，再与当前内存库的完整用户表和索引定义逐项比较。
 /// 参数：connection 为待校验业务库；返回无。
 /// 异常/边界：触发器、额外表/索引、缺失对象、异常 SQL 定义或元数据列损坏均拒绝；错误只返回稳定诊断码，不泄漏本地 schema 正文。
 fn validate_current_schema(connection: &Connection) -> Result<(), String> {
@@ -1695,7 +1847,20 @@ fn validate_current_schema(connection: &Connection) -> Result<(), String> {
             "任务管理数据库版本高于当前应用（错误码：TASK_SCHEMA_VERSION_UNSUPPORTED）".to_string(),
         );
     }
-    if metadata.len() != 1
+    if metadata.len() == 1
+        && metadata[0].0 == INITIAL_SCHEMA_VERSION
+        && metadata[0].1 == INITIAL_SCHEMA_NAME
+        && metadata[0].2 == LEGACY_SCHEMA_CHECKSUM_SESSION_TASK
+    {
+        migrate_legacy_project_soft_delete(connection)?;
+        migrate_legacy_project_base_prompt(connection, LEGACY_SCHEMA_CHECKSUM_PROJECT_SOFT_DELETE)?;
+    } else if metadata.len() == 1
+        && metadata[0].0 == INITIAL_SCHEMA_VERSION
+        && metadata[0].1 == INITIAL_SCHEMA_NAME
+        && metadata[0].2 == LEGACY_SCHEMA_CHECKSUM_PROJECT_SOFT_DELETE
+    {
+        migrate_legacy_project_base_prompt(connection, LEGACY_SCHEMA_CHECKSUM_PROJECT_SOFT_DELETE)?;
+    } else if metadata.len() != 1
         || metadata[0].0 != INITIAL_SCHEMA_VERSION
         || metadata[0].1 != INITIAL_SCHEMA_NAME
         || metadata[0].2 != INITIAL_SCHEMA_CHECKSUM
@@ -1705,15 +1870,89 @@ fn validate_current_schema(connection: &Connection) -> Result<(), String> {
                 .to_string(),
         );
     }
+    let actual_objects = read_schema_objects(connection)?;
     let expected_connection = Connection::open_in_memory().map_err(database_error)?;
     apply_initial_schema(&expected_connection)?;
-    if actual_objects != read_schema_objects(&expected_connection)? {
+    let expected_objects = read_schema_objects(&expected_connection)?;
+    if actual_objects != expected_objects
+        && !schema_objects_are_logically_equivalent(
+            connection,
+            &expected_connection,
+            &actual_objects,
+            &expected_objects,
+        )?
+    {
         return Err(
             "任务管理数据库结构与当前首发 schema 不一致（错误码：TASK_SCHEMA_STRUCTURE_INVALID）"
                 .to_string(),
         );
     }
     Ok(())
+}
+
+/// 把旧项目记录迁移为支持基础提示词的结构。
+/// 流程：在 Immediate 事务中追加 project.base_prompt 默认空字符串，并把指定旧 checksum 更新到当前 checksum。
+/// 参数：connection 为已打开业务库，from_checksum 为当前元数据中允许迁移的旧校验值。
+/// 返回：迁移成功无返回值。
+/// 异常/边界：只允许登记过的旧 schema 迁移；字段已存在、元数据异常或 ALTER 失败均整体回滚。
+fn migrate_legacy_project_base_prompt(
+    connection: &Connection,
+    from_checksum: &str,
+) -> Result<(), String> {
+    let transaction = connection.unchecked_transaction().map_err(database_error)?;
+    transaction
+        .execute(
+            "ALTER TABLE project ADD COLUMN base_prompt TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE schema_metadata SET checksum = ?1 WHERE version = ?2 AND name = ?3 AND checksum = ?4",
+            params![
+                INITIAL_SCHEMA_CHECKSUM,
+                INITIAL_SCHEMA_VERSION,
+                INITIAL_SCHEMA_NAME,
+                from_checksum
+            ],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(
+            "任务管理数据库基础提示词迁移元数据异常（错误码：TASK_SCHEMA_METADATA_INVALID）"
+                .to_string(),
+        );
+    }
+    transaction.commit().map_err(database_error)
+}
+
+/// 把首发物理删除项目协议迁移为软删除协议。
+/// 流程：在 Immediate 事务中追加 project.deleted_at，并更新 schema checksum；参数为已打开业务库连接。
+/// 返回：迁移成功无返回值。
+/// 异常/边界：只允许从登记过的 001 schema 迁移；字段已存在、元数据异常或 ALTER 失败均整体回滚。
+fn migrate_legacy_project_soft_delete(connection: &Connection) -> Result<(), String> {
+    let transaction = connection.unchecked_transaction().map_err(database_error)?;
+    transaction
+        .execute("ALTER TABLE project ADD COLUMN deleted_at TEXT", [])
+        .map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE schema_metadata SET checksum = ?1 WHERE version = ?2 AND name = ?3 AND checksum = ?4",
+            params![
+                LEGACY_SCHEMA_CHECKSUM_PROJECT_SOFT_DELETE,
+                INITIAL_SCHEMA_VERSION,
+                INITIAL_SCHEMA_NAME,
+                LEGACY_SCHEMA_CHECKSUM_SESSION_TASK
+            ],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(
+            "任务管理数据库首发 schema 迁移元数据不匹配（错误码：TASK_SCHEMA_METADATA_INVALID）"
+                .to_string(),
+        );
+    }
+    transaction.commit().map_err(database_error)
 }
 
 /// 读取参与首发结构校验的全部用户 schema 对象。
@@ -1734,8 +1973,121 @@ fn read_schema_objects(connection: &Connection) -> Result<Vec<(String, String, S
     Ok(objects)
 }
 
-/// 读取指定项目的有界聚合数据。
-/// 流程：先读取有限项目列表；显式 ID 必须命中，省略 ID 才选择首个项目；随后读取有限任务和会话并校验 7 MiB 内部预算。
+/// 判断两个 schema 快照是否字段和对象层面等价。
+/// 流程：先比较全部对象的类型和名称，再对 table 使用 PRAGMA 字段信息比较，对非 table 继续比较 SQL 原文。
+/// 参数：actual_connection/expected_connection 为待比对库，actual_objects/expected_objects 为各自 sqlite_schema 快照。
+/// 返回：逻辑等价为 true，否则 false。
+/// 异常/边界：只放宽 CREATE TABLE 文本差异；额外对象、缺失对象、异常索引、异常字段仍返回不等价。
+fn schema_objects_are_logically_equivalent(
+    actual_connection: &Connection,
+    expected_connection: &Connection,
+    actual_objects: &[(String, String, String)],
+    expected_objects: &[(String, String, String)],
+) -> Result<bool, String> {
+    let actual_keys = actual_objects
+        .iter()
+        .map(|(object_type, name, _)| (object_type.clone(), name.clone()))
+        .collect::<Vec<_>>();
+    let expected_keys = expected_objects
+        .iter()
+        .map(|(object_type, name, _)| (object_type.clone(), name.clone()))
+        .collect::<Vec<_>>();
+    if actual_keys != expected_keys {
+        return Ok(false);
+    }
+    for ((object_type, name, actual_sql), (_, _, expected_sql)) in
+        actual_objects.iter().zip(expected_objects.iter())
+    {
+        if object_type == "table" {
+            if !table_columns_are_logically_equivalent(
+                &read_table_columns(actual_connection, name)?,
+                &read_table_columns(expected_connection, name)?,
+            ) {
+                return Ok(false);
+            }
+        } else if actual_sql != expected_sql {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// 判断表字段定义是否逻辑一致。
+/// 流程：先按字段名排序，再比较字段名、类型、非空、默认值和主键属性；参数为实际库与期望库的 PRAGMA table_info 结果。
+/// 返回：字段集合和字段属性完全一致时返回 true。
+/// 异常/边界：允许 SQLite `ALTER TABLE ADD COLUMN` 导致的物理列顺序差异；缺字段、多字段、默认值或约束差异仍判定为不等价。
+fn table_columns_are_logically_equivalent(
+    actual_columns: &[(String, String, i64, Option<String>, i64)],
+    expected_columns: &[(String, String, i64, Option<String>, i64)],
+) -> bool {
+    if actual_columns.len() != expected_columns.len() {
+        return false;
+    }
+    let mut actual_sorted = actual_columns.to_vec();
+    let mut expected_sorted = expected_columns.to_vec();
+    actual_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+    expected_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+    actual_sorted == expected_sorted
+}
+
+/// 判断两个 schema 快照的原始 SQL 是否完全一致。
+/// 流程：先比较对象数量、类型、名称和 SQL 正文；参数为实际库与期望库的 sqlite_schema 快照。
+/// 返回：所有对象原始定义一致时返回 true。
+/// 异常/边界：仅用于测试证明迁移库与新库存在物理定义差异，生产逻辑应使用字段级等价判断。
+#[cfg(test)]
+fn schema_objects_are_textually_identical(
+    actual_objects: &[(String, String, String)],
+    expected_objects: &[(String, String, String)],
+) -> bool {
+    actual_objects == expected_objects
+}
+
+/// 判断两个 schema 快照在对象名称和字段属性层面是否等价。
+/// 流程：用于测试直接调用生产等价判断；参数为实际连接、期望连接和已读取的 schema 快照；返回逻辑等价判断。
+/// 异常/边界：透传生产校验错误，避免测试使用另一套宽松标准。
+#[cfg(test)]
+fn schema_objects_are_logically_equivalent_for_test(
+    actual_connection: &Connection,
+    expected_connection: &Connection,
+    actual_objects: &[(String, String, String)],
+    expected_objects: &[(String, String, String)],
+) -> Result<bool, String> {
+    schema_objects_are_logically_equivalent(
+        actual_connection,
+        expected_connection,
+        actual_objects,
+        expected_objects,
+    )
+}
+
+/// 读取表字段结构用于 schema 逻辑等价校验。
+/// 流程：通过 PRAGMA table_info 读取字段名、类型、必填、默认值和主键位置；参数为连接与可信 schema 表名。
+/// 返回：按 cid 排序的字段结构。
+/// 异常/边界：表名来自 sqlite_schema 快照，仍使用双引号转义，避免特殊名称破坏 PRAGMA 语句。
+fn read_table_columns(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<Vec<(String, String, i64, Option<String>, i64)>, String> {
+    let quoted_table_name = table_name.replace('"', "\"\"");
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info(\"{}\")", quoted_table_name))
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(database_error)?;
+    collect_rows(rows)
+}
+
+/// 读取任务工作区的有界聚合数据。
+/// 流程：先读取有限项目列表；显式 ID 必须命中，省略 ID 时返回全部未删除项目下的任务与会话；最后校验 7 MiB 内部预算。
 /// 参数：connection 为已初始化数据库，project_id 为调用方显式选择或 None；返回首版工作区聚合。
 /// 异常/边界：未知显式 ID 返回 TASK_PROJECT_NOT_FOUND，不回落其它项目；理论容量计算失配时拒绝返回超限成功响应。
 fn load_workspace_data_with_connection(
@@ -1752,17 +2104,17 @@ fn load_workspace_data_with_connection(
             }
             Some(id.to_string())
         }
-        None => projects.first().map(|project| project.id.clone()),
+        None => None,
     };
     let tasks = if let Some(id) = selected_project_id.as_deref() {
         list_tasks(connection, id)?
     } else {
-        Vec::new()
+        list_all_tasks(connection)?
     };
     let sessions = if let Some(id) = selected_project_id.as_deref() {
         list_sessions(connection, id)?
     } else {
-        Vec::new()
+        list_all_sessions(connection)?
     };
     let response = WorkspaceDataResponse {
         projects,
@@ -1781,12 +2133,16 @@ fn load_workspace_data_with_connection(
     Ok(response)
 }
 
-/// 查询项目列表并聚合任务和会话数量。
-/// 流程：关联任务与会话表聚合真实记录数，并按最近更新时间排序；参数为数据库连接；返回项目列表。
-/// 异常/边界：空库返回空列表；超过二百项目时 fail closed，不静默截断；首版没有归档过滤，所有现存记录都参与计数。
+/// 查询未删除项目列表并聚合任务和会话数量。
+/// 流程：只读取 deleted_at 为空的项目，关联任务与会话表聚合真实记录数，并按最近更新时间排序；参数为数据库连接；返回项目列表。
+/// 异常/边界：空库返回空列表；超过二百个未删除项目时 fail closed，不静默截断；软删除项目不参与当前工作台展示。
 fn list_projects(connection: &Connection) -> Result<Vec<ProjectRecord>, String> {
     let project_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM project WHERE deleted_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
         .map_err(database_error)?;
     if project_count > WORKSPACE_PROJECT_LIMIT {
         return Err(format!(
@@ -1800,6 +2156,7 @@ fn list_projects(connection: &Connection) -> Result<Vec<ProjectRecord>, String> 
             SELECT p.id,
                    p.name,
                    p.workspace_path,
+                   p.base_prompt,
                    COUNT(DISTINCT t.id) AS task_count,
                    COUNT(DISTINCT s.id) AS session_count,
                    p.created_at,
@@ -1807,6 +2164,7 @@ fn list_projects(connection: &Connection) -> Result<Vec<ProjectRecord>, String> 
               FROM project p
          LEFT JOIN task t ON t.project_id = p.id
          LEFT JOIN session s ON s.project_id = p.id
+             WHERE p.deleted_at IS NULL
           GROUP BY p.id
           ORDER BY p.updated_at DESC, p.created_at DESC
             ",
@@ -1818,19 +2176,20 @@ fn list_projects(connection: &Connection) -> Result<Vec<ProjectRecord>, String> 
                 id: row.get(0)?,
                 name: row.get(1)?,
                 workspace_path: row.get(2)?,
-                task_count: row.get(3)?,
-                session_count: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
+                base_prompt: row.get(3)?,
+                task_count: row.get(4)?,
+                session_count: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })
         .map_err(database_error)?;
     collect_rows(rows)
 }
 
-/// 读取单个项目并重新计算任务、会话数量。
+/// 读取单个未删除项目并重新计算任务、会话数量。
 /// 流程：按项目主键执行与项目列表一致的聚合；参数为数据库连接和项目 ID；返回可空项目。
-/// 异常/边界：只读取一个项目且不受列表上限影响；项目不存在返回 None，数据库异常显式返回。
+/// 异常/边界：只读取一个项目且不受列表上限影响；项目不存在或已软删除返回 None，数据库异常显式返回。
 fn load_project_with_connection(
     connection: &Connection,
     project_id: &str,
@@ -1841,6 +2200,7 @@ fn load_project_with_connection(
             SELECT p.id,
                    p.name,
                    p.workspace_path,
+                   p.base_prompt,
                    COUNT(DISTINCT t.id),
                    COUNT(DISTINCT s.id),
                    p.created_at,
@@ -1849,6 +2209,7 @@ fn load_project_with_connection(
          LEFT JOIN task t ON t.project_id = p.id
          LEFT JOIN session s ON s.project_id = p.id
              WHERE p.id = ?1
+               AND p.deleted_at IS NULL
           GROUP BY p.id
              LIMIT 1
             ",
@@ -1858,10 +2219,11 @@ fn load_project_with_connection(
                     id: row.get(0)?,
                     name: row.get(1)?,
                     workspace_path: row.get(2)?,
-                    task_count: row.get(3)?,
-                    session_count: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
+                    base_prompt: row.get(3)?,
+                    task_count: row.get(4)?,
+                    session_count: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             },
         )
@@ -1870,22 +2232,9 @@ fn load_project_with_connection(
 }
 
 /// 查询项目下任务列表。
-/// 流程：先校验项目任务总量，再按项目 ID 查询全部任务并关联当前会话 threadId，最后按更新时间倒序；参数为连接和项目 ID；返回完整看板任务列表。
-/// 异常/边界：项目无任务时返回空列表；超过十六条时 fail closed，不静默截断；查询失败不跳过损坏行。
+/// 流程：按项目 ID 查询全部任务并关联当前会话 threadId，最后按更新时间倒序；参数为连接和项目 ID；返回完整看板任务列表。
+/// 异常/边界：项目无任务时返回空列表；任务条数不按旧首发上限截断，最终由聚合响应 JSON 预算兜底；查询失败不跳过损坏行。
 fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<TaskRecord>, String> {
-    let task_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM task WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if task_count > WORKSPACE_TASK_LIMIT {
-        return Err(format!(
-            "项目任务数量超过 {} 个首发上限（错误码：TASK_PROJECT_TASK_CAPACITY_INVALID）",
-            WORKSPACE_TASK_LIMIT
-        ));
-    }
     let mut statement = connection
         .prepare(
             "
@@ -1909,11 +2258,65 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<TaskRecor
         .map_err(database_error)?;
     let rows = statement
         .query_map(params![project_id], |row| {
+            let task_id: String = row.get(0)?;
             Ok(TaskRecord {
-                id: row.get(0)?,
+                id: task_id.clone(),
                 project_id: row.get(1)?,
                 title: row.get(2)?,
                 prompt: row.get(3)?,
+                attachments: latest_task_attachments(connection, &task_id)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
+                status: row.get(4)?,
+                current_session_id: row.get(5)?,
+                external_thread_id: row.get(6)?,
+                last_error: row.get(7)?,
+                result_json: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })
+        .map_err(database_error)?;
+    collect_rows(rows)
+}
+
+/// 查询全部未删除项目下的任务列表。
+/// 流程：统计全部活跃任务量，再关联当前会话 threadId 并按更新时间倒序读取。
+/// 参数：connection 为已初始化数据库连接。
+/// 返回：全部项目聚合看板任务列表。
+/// 异常/边界：只统计未删除项目；软删除项目的历史任务不进入当前“全部”视图；聚合过大时由响应预算返回稳定错误。
+fn list_all_tasks(connection: &Connection) -> Result<Vec<TaskRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT t.id,
+                   t.project_id,
+                   t.title,
+                   t.prompt,
+                   t.status,
+                   COALESCE(t.current_session_id, ''),
+                   COALESCE(s.external_thread_id, ''),
+                   t.last_error,
+                   t.result_json,
+                   t.created_at,
+                   t.updated_at
+              FROM task t
+              JOIN project p ON p.id = t.project_id
+         LEFT JOIN session s ON s.id = t.current_session_id
+             WHERE p.deleted_at IS NULL
+          ORDER BY t.updated_at DESC, t.created_at DESC
+            ",
+        )
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            let task_id: String = row.get(0)?;
+            Ok(TaskRecord {
+                id: task_id.clone(),
+                project_id: row.get(1)?,
+                title: row.get(2)?,
+                prompt: row.get(3)?,
+                attachments: latest_task_attachments(connection, &task_id)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                 status: row.get(4)?,
                 current_session_id: row.get(5)?,
                 external_thread_id: row.get(6)?,
@@ -1955,11 +2358,14 @@ fn load_task_with_connection(
             ",
             params![task_id],
             |row| {
+                let task_id: String = row.get(0)?;
                 Ok(TaskRecord {
-                    id: row.get(0)?,
+                    id: task_id.clone(),
                     project_id: row.get(1)?,
                     title: row.get(2)?,
                     prompt: row.get(3)?,
+                    attachments: latest_task_attachments(connection, &task_id)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                     status: row.get(4)?,
                     current_session_id: row.get(5)?,
                     external_thread_id: row.get(6)?,
@@ -1975,22 +2381,9 @@ fn load_task_with_connection(
 }
 
 /// 查询项目下会话列表。
-/// 流程：先校验项目会话总量，再按项目 ID 读取全部真实 Codex 会话并按更新时间倒序；参数为连接和项目 ID；返回完整会话列表。
-/// 异常/边界：没有会话时返回空列表；超过十六条时 fail closed，不静默截断；首版没有软删除或隐藏会话协议。
+/// 流程：按项目 ID 读取全部真实 Codex 会话并按更新时间倒序；参数为连接和项目 ID；返回完整会话列表。
+/// 异常/边界：没有会话时返回空列表；首版没有软删除或隐藏会话协议。
 fn list_sessions(connection: &Connection, project_id: &str) -> Result<Vec<SessionRecord>, String> {
-    let session_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM session WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if session_count > WORKSPACE_SESSION_LIMIT {
-        return Err(format!(
-            "项目会话数量超过 {} 个首发上限（错误码：TASK_PROJECT_SESSION_CAPACITY_INVALID）",
-            WORKSPACE_SESSION_LIMIT
-        ));
-    }
     let mut statement = connection
         .prepare(
             "
@@ -2012,6 +2405,51 @@ fn list_sessions(connection: &Connection, project_id: &str) -> Result<Vec<Sessio
         .map_err(database_error)?;
     let rows = statement
         .query_map(params![project_id], |row| {
+            Ok(SessionRecord {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                task_id: row.get(2)?,
+                provider: row.get(3)?,
+                workspace_path: row.get(4)?,
+                title: row.get(5)?,
+                status: row.get(6)?,
+                external_thread_id: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .map_err(database_error)?;
+    collect_rows(rows)
+}
+
+/// 查询全部未删除项目下的会话列表。
+/// 流程：关联 project 排除已删除项目，再按更新时间倒序返回真实 Codex 会话。
+/// 参数：connection 为已初始化数据库连接。
+/// 返回：全部项目聚合会话列表。
+/// 异常/边界：首版不限制历史会话条数，最终仍由聚合响应总预算兜底。
+fn list_all_sessions(connection: &Connection) -> Result<Vec<SessionRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT s.id,
+                   s.project_id,
+                   COALESCE(s.task_id, ''),
+                   s.provider,
+                   s.workspace_path,
+                   s.title,
+                   s.status,
+                   s.external_thread_id,
+                   s.created_at,
+                   s.updated_at
+              FROM session s
+              JOIN project p ON p.id = s.project_id
+             WHERE p.deleted_at IS NULL
+          ORDER BY s.updated_at DESC, s.created_at DESC
+            ",
+        )
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
             Ok(SessionRecord {
                 id: row.get(0)?,
                 project_id: row.get(1)?,
@@ -2073,9 +2511,47 @@ fn load_session_with_connection(
         .map_err(database_error)
 }
 
+/// 读取任务最新附件列表。
+/// 流程：优先取最近一次 `created` 或 `task_updated` 事件的 payload_json，解析其中 attachments 字段。
+/// 参数：connection 为已初始化连接，task_id 为任务 ID。
+/// 返回：任务当前附件；没有附件事件或旧数据无字段时返回空数组。
+/// 异常/边界：payload 结构损坏或附件越界会显式失败，避免执行阶段上传错误图片。
+fn latest_task_attachments(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Vec<TaskAttachmentRecord>, String> {
+    let payload_json = connection
+        .query_row(
+            "
+            SELECT payload_json
+              FROM task_event
+             WHERE task_id = ?1
+               AND event_type IN ('created', 'task_updated')
+          ORDER BY rowid DESC
+             LIMIT 1
+            ",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    let Some(payload_json) = payload_json else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&payload_json).map_err(|_| "任务附件载荷损坏".to_string())?;
+    let attachments = value
+        .get("attachments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    let records: Vec<TaskAttachmentRecord> =
+        serde_json::from_value(attachments).map_err(|_| "任务附件载荷结构无效".to_string())?;
+    validate_task_attachments(records)
+}
+
 /// 读取任务执行需要的项目和工作空间上下文。
-/// 流程：按任务 ID 关联项目并取得标题、prompt 和 canonical 工作目录；参数为连接和任务 ID；返回排队执行快照。
-/// 异常/边界：任务或项目不存在时返回数据库错误；本方法只读，不领取任务、不改变状态。
+/// 流程：按任务 ID 关联项目并取得标题、项目基础提示词、prompt 和 canonical 工作目录；参数为连接和任务 ID；返回排队执行快照。
+/// 异常/边界：任务或未删除项目不存在时返回数据库错误；本方法只读，不领取任务、不改变状态。
 fn read_queued_task_context(
     connection: &Connection,
     task_id: &str,
@@ -2083,18 +2559,25 @@ fn read_queued_task_context(
     connection
         .query_row(
             "
-            SELECT t.id, t.project_id, t.title, t.prompt, p.workspace_path
-              FROM task t
+            SELECT t.id, t.project_id, t.title, t.prompt, p.workspace_path, p.base_prompt
+             FROM task t
               JOIN project p ON p.id = t.project_id
              WHERE t.id = ?1
+               AND p.deleted_at IS NULL
             ",
             params![task_id],
             |row| {
+                let task_id: String = row.get(0)?;
                 Ok(QueuedTaskRecord {
-                    id: row.get(0)?,
+                    id: task_id.clone(),
                     project_id: row.get(1)?,
                     title: row.get(2)?,
-                    prompt: row.get(3)?,
+                    prompt: build_task_execution_prompt(
+                        row.get::<_, String>(5)?.as_str(),
+                        row.get::<_, String>(3)?.as_str(),
+                    ),
+                    attachments: latest_task_attachments(connection, &task_id)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                     workspace_path: row.get(4)?,
                 })
             },
@@ -2102,13 +2585,13 @@ fn read_queued_task_context(
         .map_err(database_error)
 }
 
-/// 确认项目存在，避免前端传入过期项目 ID 后创建孤儿任务。
-/// 流程：按项目主键执行存在性查询；参数为连接和项目 ID；存在时返回无值成功。
-/// 异常/边界：不存在时返回明确业务错误；首版没有“已归档但仍可引用”的兼容分支。
+/// 确认项目存在且未删除，避免前端传入过期项目 ID 后创建孤儿任务。
+/// 流程：按项目主键和 deleted_at 过滤执行存在性查询；参数为连接和项目 ID；存在时返回无值成功。
+/// 异常/边界：不存在或已删除时返回明确业务错误，不允许继续创建新任务。
 fn ensure_project_exists(connection: &Connection, project_id: &str) -> Result<(), String> {
     let exists = connection
         .query_row(
-            "SELECT 1 FROM project WHERE id = ?1",
+            "SELECT 1 FROM project WHERE id = ?1 AND deleted_at IS NULL",
             params![project_id],
             |_| Ok(()),
         )
@@ -2202,16 +2685,22 @@ fn next_id(prefix: &str) -> String {
 /// 规范化并验证项目工作目录。
 fn canonical_workspace_path(value: &str) -> Result<PathBuf, String> {
     if value.is_empty() {
-        return Err("工作空间不能为空".to_string());
+        return Err("工作空间不能为空（错误码：TASK_PROJECT_WORKSPACE_REQUIRED）".to_string());
     }
     let path = Path::new(value);
     if !path.is_absolute() {
-        return Err("工作空间必须是绝对路径".to_string());
+        return Err(
+            "工作空间必须是绝对路径（错误码：TASK_PROJECT_WORKSPACE_ABSOLUTE_REQUIRED）"
+                .to_string(),
+        );
     }
-    let canonical =
-        fs::canonicalize(path).map_err(|error| format!("工作空间不存在或不可访问：{}", error))?;
+    let canonical = fs::canonicalize(path).map_err(|_| {
+        "工作空间不存在或不可访问（错误码：TASK_PROJECT_WORKSPACE_UNAVAILABLE）".to_string()
+    })?;
     if !canonical.is_dir() {
-        return Err("工作空间必须是已存在的目录".to_string());
+        return Err(
+            "工作空间必须是已存在的目录（错误码：TASK_PROJECT_WORKSPACE_DIR_REQUIRED）".to_string(),
+        );
     }
     Ok(canonical)
 }
@@ -2242,6 +2731,9 @@ fn database_error(error: rusqlite::Error) -> String {
 mod tests {
     use super::*;
 
+    /// 聚合预算测试使用的最坏字段样本数；该值不代表项目任务业务上限。
+    const WORKSPACE_RESPONSE_BUDGET_SAMPLE_COUNT: i64 = 16;
+
     /// 首发初始 schema 必须直接创建可靠 turn、结果和事件字段。
     #[test]
     fn initial_schema_contains_reliable_execution_columns() {
@@ -2264,10 +2756,18 @@ mod tests {
         assert!(session_columns.contains(&"external_client_message_id".to_string()));
         assert!(session_columns.contains(&"result_json".to_string()));
         assert!(task_columns.contains(&"result_json".to_string()));
+        assert!(
+            project_columns.contains(&"deleted_at".to_string()),
+            "项目必须使用 deleted_at 支持软删除"
+        );
+        assert!(
+            project_columns.contains(&"base_prompt".to_string()),
+            "项目必须保存基础提示词"
+        );
         for columns in [&project_columns, &task_columns, &session_columns] {
             assert!(
                 !columns.contains(&"archived_at".to_string()),
-                "首版物理删除协议不应预留未实现的 archived_at"
+                "项目软删除协议不应混用 archived_at"
             );
         }
         for unused in ["color", "metadata_json", "provider_scope", "sort_order"] {
@@ -2306,6 +2806,90 @@ mod tests {
         assert_eq!(metadata.1, INITIAL_SCHEMA_NAME);
         assert_eq!(metadata.2, INITIAL_SCHEMA_CHECKSUM);
         assert_eq!(metadata.3, 1);
+    }
+
+    /// 旧版项目物理删除 schema 必须自动补齐 deleted_at 与 base_prompt 并升级 checksum。
+    /// 流程：构造登记过的 001 schema，再重新执行初始化门禁；返回无。
+    /// 异常/边界：只接受登记过的旧 checksum，迁移后字段层面必须等价于当前 schema。
+    #[test]
+    fn legacy_project_schema_migrates_to_soft_delete_column() {
+        let connection = Connection::open_in_memory().expect("应创建内存数据库");
+        apply_initial_schema(&connection).expect("应创建当前结构");
+        connection
+            .execute("ALTER TABLE project DROP COLUMN deleted_at", [])
+            .expect("测试应模拟旧版项目表");
+        connection
+            .execute("ALTER TABLE project DROP COLUMN base_prompt", [])
+            .expect("测试应模拟未支持基础提示词的旧版项目表");
+        connection
+            .execute(
+                "UPDATE schema_metadata SET checksum = ?1",
+                params![LEGACY_SCHEMA_CHECKSUM_SESSION_TASK],
+            )
+            .expect("测试应模拟旧版 checksum");
+
+        initialize_database_schema(&connection).expect("旧版首发 schema 应迁移到当前结构");
+        let migrated_checksum: String = connection
+            .query_row("SELECT checksum FROM schema_metadata", [], |row| row.get(0))
+            .expect("应读取迁移后 checksum");
+        assert_eq!(migrated_checksum, INITIAL_SCHEMA_CHECKSUM);
+        let has_deleted_at: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('project') WHERE name = 'deleted_at')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查 deleted_at 字段");
+        assert!(has_deleted_at);
+        let has_base_prompt: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('project') WHERE name = 'base_prompt')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查 base_prompt 字段");
+        assert!(has_base_prompt);
+    }
+
+    /// 通过 ALTER TABLE 迁移出的项目表列顺序不同，但字段集合和约束一致时必须被接受。
+    /// 流程：从 001 旧库迁移出真实历史列顺序，再与全新库 schema 比较；返回无。
+    /// 异常/边界：原始 SQL 差异仅来自字段物理顺序，缺字段、多字段或索引差异仍由生产校验拒绝。
+    #[test]
+    fn migrated_project_schema_allows_altered_column_order() {
+        let migrated_connection = Connection::open_in_memory().expect("应创建迁移库");
+        apply_initial_schema(&migrated_connection).expect("应创建当前结构");
+        migrated_connection
+            .execute("ALTER TABLE project DROP COLUMN deleted_at", [])
+            .expect("测试应移除软删除字段");
+        migrated_connection
+            .execute("ALTER TABLE project DROP COLUMN base_prompt", [])
+            .expect("测试应移除基础提示词字段");
+        migrated_connection
+            .execute(
+                "UPDATE schema_metadata SET checksum = ?1",
+                params![LEGACY_SCHEMA_CHECKSUM_SESSION_TASK],
+            )
+            .expect("测试应模拟旧版 checksum");
+        initialize_database_schema(&migrated_connection).expect("历史库应迁移成功");
+
+        let expected_connection = Connection::open_in_memory().expect("应创建期望库");
+        apply_initial_schema(&expected_connection).expect("应创建全新当前结构");
+        let migrated_objects = read_schema_objects(&migrated_connection).expect("应读取迁移结构");
+        let expected_objects = read_schema_objects(&expected_connection).expect("应读取当前结构");
+        assert!(
+            !schema_objects_are_textually_identical(&migrated_objects, &expected_objects),
+            "迁移库的 CREATE TABLE 文本应保留 ALTER TABLE 追加顺序差异"
+        );
+        assert!(
+            schema_objects_are_logically_equivalent_for_test(
+                &migrated_connection,
+                &expected_connection,
+                &migrated_objects,
+                &expected_objects,
+            )
+            .expect("逻辑等价检查应成功"),
+            "迁移库字段属性应等价于全新当前结构"
+        );
     }
 
     /// 首发 schema 门禁必须拒绝未来版本及任意不匹配的元数据。
@@ -2404,6 +2988,33 @@ mod tests {
         );
     }
 
+    /// 队列任务执行上下文必须自动追加项目基础提示词。
+    #[test]
+    fn queued_task_context_includes_project_base_prompt() {
+        let connection = Connection::open_in_memory().expect("应创建内存数据库");
+        initialize_database_schema(&connection).expect("首版结构初始化应成功");
+        connection
+            .execute(
+                "INSERT INTO project (id, name, workspace_path, base_prompt) VALUES ('p', 'P', '/tmp', '基础规则')",
+                [],
+            )
+            .expect("应插入项目");
+        connection
+            .execute(
+                "INSERT INTO task (id, project_id, title, prompt, status) VALUES ('t', 'p', 'T', '执行任务', 'created')",
+                [],
+            )
+            .expect("应插入任务");
+        update_task_status(&connection, "t", "created", "queued", "").expect("任务应进入队列");
+
+        let queued = list_queued_tasks_with_connection(&connection).expect("应读取排队任务");
+
+        assert_eq!(
+            queued.first().map(|task| task.prompt.as_str()),
+            Some("项目基础提示词：\n基础规则\n\n任务内容：\n执行任务")
+        );
+    }
+
     /// 状态更新 CAS 只能命中预期 from 状态，重复更新必须报错且不追加伪事件。
     #[test]
     fn task_status_compare_and_swap_rejects_duplicate_transition() {
@@ -2444,9 +3055,9 @@ mod tests {
                 [],
             )
             .expect("应插入项目");
-        let created_id = create_task_record(&mut connection, "p", "已创建", "原描述")
+        let created_id = create_task_record(&mut connection, "p", "已创建", "原描述", &[])
             .expect("已创建任务应创建成功");
-        let queued_id = create_task_record(&mut connection, "p", "等待中", "原描述")
+        let queued_id = create_task_record(&mut connection, "p", "等待中", "原描述", &[])
             .expect("等待中任务应创建成功");
         connection
             .execute(
@@ -2454,7 +3065,7 @@ mod tests {
                 params![queued_id],
             )
             .expect("应置为等待中");
-        let completed_id = create_task_record(&mut connection, "p", "已完成", "原描述")
+        let completed_id = create_task_record(&mut connection, "p", "已完成", "原描述", &[])
             .expect("已完成任务应创建成功");
         connection
             .execute(
@@ -2463,11 +3074,11 @@ mod tests {
             )
             .expect("应置为已完成");
 
-        update_task_record(&mut connection, &created_id, "新已创建", "新描述")
+        update_task_record(&mut connection, &created_id, "新已创建", "新描述", &[])
             .expect("已创建任务应允许修改");
-        update_task_record(&mut connection, &queued_id, "新等待中", "新描述")
+        update_task_record(&mut connection, &queued_id, "新等待中", "新描述", &[])
             .expect("等待中任务应允许修改");
-        let error = update_task_record(&mut connection, &completed_id, "覆盖", "覆盖描述")
+        let error = update_task_record(&mut connection, &completed_id, "覆盖", "覆盖描述", &[])
             .expect_err("已执行过任务必须拒绝修改");
         assert!(error.contains("TASK_UPDATE_STATUS_FORBIDDEN"));
         let completed_title: String = connection
@@ -2491,9 +3102,9 @@ mod tests {
                 [],
             )
             .expect("应插入项目");
-        let created_id = create_task_record(&mut connection, "p", "已创建", "描述")
+        let created_id = create_task_record(&mut connection, "p", "已创建", "描述", &[])
             .expect("已创建任务应创建成功");
-        let running_id = create_task_record(&mut connection, "p", "进行中", "描述")
+        let running_id = create_task_record(&mut connection, "p", "进行中", "描述", &[])
             .expect("进行中任务应创建成功");
         connection
             .execute(
@@ -2602,9 +3213,9 @@ mod tests {
             .contains("TASK_RESULT_INVALID"));
     }
 
-    /// 非法超量任务库必须 fail closed，查询不得静默截断并隐藏旧任务。
+    /// 历史任务超过旧首发十六条后仍必须完整返回，避免本地真实数据被读取层误判异常。
     #[test]
-    fn workspace_tasks_are_bounded() {
+    fn workspace_tasks_are_not_limited_to_initial_cap() {
         let connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         connection
@@ -2613,7 +3224,7 @@ mod tests {
                 [],
             )
             .expect("应插入项目");
-        for index in 0..(WORKSPACE_TASK_LIMIT + 1) {
+        for index in 0..17 {
             connection
                 .execute(
                     "INSERT INTO task (id, project_id, title, prompt, status, updated_at) VALUES (?1, 'p', ?1, 'P', 'created', ?2)",
@@ -2621,13 +3232,13 @@ mod tests {
                 )
                 .expect("应插入边界任务");
         }
-        let error = list_tasks(&connection, "p").expect_err("超量任务库必须拒绝查询");
-        assert!(error.contains("TASK_PROJECT_TASK_CAPACITY_INVALID"));
+        let tasks = list_tasks(&connection, "p").expect("超过十六条历史任务也应完整返回");
+        assert_eq!(tasks.len(), 17);
     }
 
-    /// 非法超量会话库必须 fail closed，查询不得静默截断并隐藏旧会话。
+    /// 项目会话不再限制为十六条，查询应完整返回历史会话。
     #[test]
-    fn workspace_sessions_are_bounded() {
+    fn workspace_sessions_are_not_limited_to_initial_cap() {
         let connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         connection
@@ -2636,7 +3247,7 @@ mod tests {
                 [],
             )
             .expect("应插入项目");
-        for index in 0..(WORKSPACE_SESSION_LIMIT + 1) {
+        for index in 0..17 {
             connection
                 .execute(
                     "INSERT INTO session (id, project_id, provider, workspace_path, title, status, updated_at) VALUES (?1, 'p', 'codex', '/tmp', ?1, 'running', ?2)",
@@ -2644,13 +3255,13 @@ mod tests {
                 )
                 .expect("应插入边界会话");
         }
-        let error = list_sessions(&connection, "p").expect_err("超量会话库必须拒绝查询");
-        assert!(error.contains("TASK_PROJECT_SESSION_CAPACITY_INVALID"));
+        let sessions = list_sessions(&connection, "p").expect("超过十六条会话也应完整返回");
+        assert_eq!(sessions.len(), 17);
     }
 
-    /// 每项目达到上限后的下一任务必须在同一事务插入前拒绝，已有任务及其事件保持不变。
+    /// 创建任务不再受旧十六条上限影响，真实容量由字段校验和聚合响应预算兜底。
     #[test]
-    fn project_task_limit_is_rejected_before_insert() {
+    fn project_task_creation_is_not_limited_to_initial_cap() {
         let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         connection
@@ -2659,24 +3270,27 @@ mod tests {
                 [],
             )
             .expect("应插入项目");
-        for index in 0..WORKSPACE_TASK_LIMIT {
-            create_task_record(&mut connection, "p", &format!("任务-{index}"), "提示词")
-                .expect("边界内任务应创建");
+        for index in 0..17 {
+            create_task_record(
+                &mut connection,
+                "p",
+                &format!("任务-{index}"),
+                "提示词",
+                &[],
+            )
+            .expect("边界内任务应创建");
         }
-        let event_count_before: i64 = connection
-            .query_row("SELECT COUNT(*) FROM task_event", [], |row| row.get(0))
-            .expect("应读取事件数");
-        let error = create_task_record(&mut connection, "p", "额外任务", "提示词")
-            .expect_err("超过任务上限必须拒绝");
-        assert!(error.contains("TASK_PROJECT_TASK_LIMIT_REACHED"));
+        let extra_id = create_task_record(&mut connection, "p", "额外任务", "提示词", &[])
+            .expect("第十八条任务不应被旧上限拒绝");
         let task_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM task", [], |row| row.get(0))
             .expect("应读取任务数");
-        let event_count_after: i64 = connection
+        let event_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM task_event", [], |row| row.get(0))
             .expect("应读取事件数");
-        assert_eq!(task_count, WORKSPACE_TASK_LIMIT);
-        assert_eq!(event_count_after, event_count_before);
+        assert_eq!(task_count, 18);
+        assert_eq!(event_count, 18);
+        assert!(extra_id.starts_with("task_"));
     }
 
     /// 创建任务专用响应必须用事务 ID 区分同项目同名任务，并保持聚合字段扁平且不污染普通查询响应。
@@ -2691,7 +3305,7 @@ mod tests {
             )
             .expect("应插入项目");
 
-        let first_id = create_task_record(&mut connection, "p", "相同标题", "相同提示词")
+        let first_id = create_task_record(&mut connection, "p", "相同标题", "相同提示词", &[])
             .expect("首个同名任务应创建");
         let first_workspace = load_workspace_data_with_connection(&connection, Some("p"))
             .expect("应读取首次创建聚合");
@@ -2703,7 +3317,7 @@ mod tests {
         };
         let first_json = serde_json::to_value(&first_response).expect("首次响应应可序列化");
 
-        let second_id = create_task_record(&mut connection, "p", "相同标题", "相同提示词")
+        let second_id = create_task_record(&mut connection, "p", "相同标题", "相同提示词", &[])
             .expect("第二个同名任务应创建");
         let second_workspace = load_workspace_data_with_connection(&connection, Some("p"))
             .expect("应读取第二次创建聚合");
@@ -2730,9 +3344,9 @@ mod tests {
         assert!(ordinary_workspace_json.get("createdTaskId").is_none());
     }
 
-    /// 每项目达到上限后的下一会话必须在调度写状态前拒绝，避免重试产生查询不可见的执行历史。
+    /// 每项目超过十六条历史会话后仍允许继续创建新执行会话。
     #[test]
-    fn project_session_limit_is_rejected_before_running_transition() {
+    fn project_session_history_does_not_block_running_transition() {
         let connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         connection
@@ -2741,7 +3355,7 @@ mod tests {
                 [],
             )
             .expect("应插入项目");
-        for index in 0..WORKSPACE_SESSION_LIMIT {
+        for index in 0..17 {
             connection
                 .execute(
                     "INSERT INTO session (id, project_id, provider, workspace_path, title, status) VALUES (?1, 'p', 'codex', '/tmp', ?1, 'failed')",
@@ -2749,30 +3363,42 @@ mod tests {
                 )
                 .expect("边界内会话应插入");
         }
-        let error = ensure_project_session_capacity(&connection, "p")
-            .expect_err("超过会话上限必须在写入前拒绝");
-        assert!(error.contains("TASK_PROJECT_SESSION_LIMIT_REACHED"));
+        let sessions = list_sessions(&connection, "p").expect("历史会话不应阻塞查询");
         let session_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))
             .expect("应读取会话数");
-        assert_eq!(session_count, WORKSPACE_SESSION_LIMIT);
+        assert_eq!(session_count, 17);
+        assert_eq!(sessions.len(), 17);
     }
 
-    /// 显式未知项目必须稳定报错，只有省略项目 ID 时才允许选择排序后的首个项目。
+    /// 显式未知项目必须稳定报错，省略项目 ID 时返回全部活跃项目任务。
     #[test]
-    fn workspace_selection_distinguishes_missing_and_unknown_project_id() {
+    fn workspace_selection_distinguishes_missing_unknown_and_all_project_id() {
         let connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         connection
-            .execute(
-                "INSERT INTO project (id, name, workspace_path) VALUES ('known', '已知项目', '/tmp')",
-                [],
+            .execute_batch(
+                "
+                INSERT INTO project (id, name, workspace_path) VALUES ('known-a', '已知项目 A', '/tmp/a');
+                INSERT INTO project (id, name, workspace_path) VALUES ('known-b', '已知项目 B', '/tmp/b');
+                INSERT INTO task (id, project_id, title, prompt, status) VALUES ('task-a', 'known-a', '任务 A', '提示 A', 'created');
+                INSERT INTO task (id, project_id, title, prompt, status) VALUES ('task-b', 'known-b', '任务 B', '提示 B', 'created');
+                ",
             )
-            .expect("应插入项目");
+            .expect("应插入项目和任务");
 
-        let default_data =
-            load_workspace_data_with_connection(&connection, None).expect("省略 ID 应选择首个项目");
-        assert_eq!(default_data.projects[0].id, "known");
+        let default_data = load_workspace_data_with_connection(&connection, None)
+            .expect("省略 ID 应返回全部项目任务");
+        assert_eq!(default_data.projects.len(), 2);
+        assert_eq!(default_data.tasks.len(), 2);
+        assert!(default_data
+            .tasks
+            .iter()
+            .any(|task| task.project_id == "known-a"));
+        assert!(default_data
+            .tasks
+            .iter()
+            .any(|task| task.project_id == "known-b"));
         let error = load_workspace_data_with_connection(&connection, Some("missing"))
             .expect_err("显式未知 ID 不得回落首个项目");
         assert!(error.contains("TASK_PROJECT_NOT_FOUND"));
@@ -2803,7 +3429,7 @@ mod tests {
             "value": "x".repeat(TASK_RESULT_JSON_MAX_BYTES - 12)
         })
         .to_string();
-        for index in 0..WORKSPACE_TASK_LIMIT {
+        for index in 0..WORKSPACE_RESPONSE_BUDGET_SAMPLE_COUNT {
             connection
                 .execute(
                     "INSERT INTO task (id, project_id, title, prompt, status, last_error, result_json) VALUES (?1, 'project-000', ?2, ?3, 'failed', ?4, ?5)",
@@ -2833,8 +3459,14 @@ mod tests {
             .expect("最坏合法聚合仍应成功");
         let bytes = serde_json::to_vec(&response).expect("聚合应可序列化");
         assert_eq!(response.projects.len(), WORKSPACE_PROJECT_LIMIT as usize);
-        assert_eq!(response.tasks.len(), WORKSPACE_TASK_LIMIT as usize);
-        assert_eq!(response.sessions.len(), WORKSPACE_SESSION_LIMIT as usize);
+        assert_eq!(
+            response.tasks.len(),
+            WORKSPACE_RESPONSE_BUDGET_SAMPLE_COUNT as usize
+        );
+        assert_eq!(
+            response.sessions.len(),
+            WORKSPACE_RESPONSE_BUDGET_SAMPLE_COUNT as usize
+        );
         assert!(bytes.len() <= WORKSPACE_RESPONSE_BUDGET_BYTES);
     }
 
@@ -2862,7 +3494,7 @@ mod tests {
                 )
                 .expect("应插入边界项目");
         }
-        let error = create_project_record(&mut connection, "额外项目", Path::new("/"))
+        let error = create_project_record(&mut connection, "额外项目", Path::new("/"), "")
             .expect_err("达到项目上限后必须在插入前拒绝");
         assert!(error.contains("TASK_PROJECT_LIMIT_REACHED"));
         let project_count: i64 = connection
@@ -2913,9 +3545,9 @@ mod tests {
         assert!(canonical.is_dir());
     }
 
-    /// 空项目允许删除，存在任一关联任务时必须整笔拒绝并保留项目。
+    /// 删除项目只软删除项目行，不能因为关联任务或会话而拒绝，也不能级联删除历史。
     #[test]
-    fn project_delete_rejects_related_tasks_transactionally() {
+    fn project_delete_soft_deletes_project_without_touching_history() {
         let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         connection
@@ -2930,44 +3562,50 @@ mod tests {
                 [],
             )
             .expect("应插入任务");
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, task_id, provider, workspace_path, title, status) VALUES ('session', 'used', 'task', 'codex', '/tmp', '会话', 'created')",
+                [],
+            )
+            .expect("应插入会话");
 
         delete_project_record(&mut connection, "empty").expect("空项目应可删除");
+        delete_project_record(&mut connection, "used").expect("有任务和会话历史的项目也应可软删除");
+        let visible_projects = list_projects(&connection).expect("应读取未删除项目");
+        assert!(visible_projects.is_empty());
+        let history_counts: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM project WHERE deleted_at IS NOT NULL), (SELECT COUNT(*) FROM task WHERE project_id = 'used'), (SELECT COUNT(*) FROM session WHERE project_id = 'used')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("应读取软删除和历史数量");
+        assert_eq!(history_counts, (2, 1, 1));
+        assert!(ensure_project_exists(&connection, "used").is_err());
         assert!(delete_project_record(&mut connection, "used").is_err());
-        let remaining: i64 = connection
-            .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
-            .expect("应读取剩余项目数");
-        assert_eq!(remaining, 1);
     }
 
-    /// 项目创建和编辑必须拒绝重复名称或 canonical 工作目录，并允许编辑时保留自身原值。
+    /// 项目创建和编辑必须拒绝重复名称，并允许多个项目绑定同一个 canonical 工作目录。
     #[test]
     fn project_identity_conflicts_leave_database_unchanged() {
         let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
         initialize_database_schema(&connection).expect("首版结构初始化应成功");
         let workspace_a = canonical_workspace_path("/tmp").expect("临时目录应存在");
         let workspace_b = canonical_workspace_path("/").expect("根目录应存在");
-        let project_a = create_project_record(&mut connection, "项目 A", &workspace_a)
+        let project_a = create_project_record(&mut connection, "项目 A", &workspace_a, "")
             .expect("首个项目应创建成功");
 
-        assert!(create_project_record(&mut connection, "项目 A", &workspace_b).is_err());
-        assert!(create_project_record(&mut connection, "项目 B", &workspace_a).is_err());
+        assert!(create_project_record(&mut connection, "项目 A", &workspace_b, "").is_err());
+        let project_b = create_project_record(&mut connection, "项目 B", &workspace_a, "")
+            .expect("不同项目应允许绑定同一工作目录");
         let project_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM project", [], |row| row.get(0))
             .expect("应读取项目数");
-        assert_eq!(project_count, 1);
+        assert_eq!(project_count, 2);
 
-        ensure_project_identity_unique(&connection, "项目 A", &workspace_a, &project_a)
-            .expect("编辑项目应允许保留自身名称和路径");
-        let project_b = create_project_record(&mut connection, "项目 B", &workspace_b)
-            .expect("不同名称和路径应创建成功");
-        assert!(
-            ensure_project_identity_unique(&connection, "项目 A", &workspace_b, &project_b)
-                .is_err()
-        );
-        assert!(
-            ensure_project_identity_unique(&connection, "项目 B", &workspace_a, &project_a)
-                .is_err()
-        );
+        ensure_project_name_unique(&connection, "项目 A", &project_a)
+            .expect("编辑项目应允许保留自身名称");
+        assert!(ensure_project_name_unique(&connection, "项目 A", &project_b).is_err());
     }
 
     /// 创建事件写入失败时任务行必须随 Immediate 事务回滚，恢复后正常创建只产生一条事件。
@@ -2987,7 +3625,7 @@ mod tests {
             )
             .expect("应创建失败触发器");
 
-        assert!(create_task_record(&mut connection, "project", "任务", "提示词").is_err());
+        assert!(create_task_record(&mut connection, "project", "任务", "提示词", &[]).is_err());
         let task_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM task", [], |row| row.get(0))
             .expect("应读取任务数");
@@ -2996,7 +3634,7 @@ mod tests {
         connection
             .execute_batch("DROP TRIGGER reject_task_event;")
             .expect("应移除失败触发器");
-        let task_id = create_task_record(&mut connection, "project", "任务", "提示词")
+        let task_id = create_task_record(&mut connection, "project", "任务", "提示词", &[])
             .expect("事件恢复后应创建成功");
         let event_count: i64 = connection
             .query_row(
@@ -3016,6 +3654,17 @@ mod tests {
         ));
         assert!(is_public_task_contract_error(
             "禁止重排（错误码：CODEX_SEND_UNCERTAIN）"
+        ));
+    }
+
+    /// 项目创建表单校验错误必须作为公开业务码返回，避免用户只看到脱敏后的泛化创建失败。
+    #[test]
+    fn project_form_contract_errors_are_public() {
+        assert!(is_public_task_contract_error(
+            "工作空间不存在或不可访问（错误码：TASK_PROJECT_WORKSPACE_UNAVAILABLE）"
+        ));
+        assert!(is_public_task_contract_error(
+            "项目名称已存在（错误码：TASK_PROJECT_NAME_EXISTS）"
         ));
     }
 
@@ -3190,5 +3839,136 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM task_event", [], |row| row.get(0))
             .expect("应读取事件数");
         assert_eq!(events, 0);
+    }
+
+    /// interrupted 但已有助手最终回复时，应视为可人工验收并保留结果，避免把已产出内容的任务误标失败。
+    #[test]
+    fn interrupted_turn_with_final_text_enters_waiting_acceptance() {
+        let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
+        initialize_database_schema(&connection).expect("首版结构初始化应成功");
+        connection
+            .execute_batch(
+                "
+                INSERT INTO project (id, name, workspace_path) VALUES ('p', 'P', '/tmp');
+                INSERT INTO task (id, project_id, title, prompt, status, current_session_id)
+                VALUES ('t', 'p', 'T', 'P', 'running', 's');
+                INSERT INTO session (
+                    id, project_id, task_id, provider, workspace_path, title, status,
+                    external_thread_id, external_turn_id
+                )
+                VALUES ('s', 'p', 't', 'codex', '/tmp', 'T', 'running', 'thread-1', 'turn-1');
+                ",
+            )
+            .expect("应准备已绑定的 running 任务");
+        let running = RunningTaskRecord {
+            project_id: "p".to_string(),
+            task_id: "t".to_string(),
+            session_id: "s".to_string(),
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        };
+        let result_json = serde_json::json!({
+            "turnId": "turn-1",
+            "status": "interrupted",
+            "completedAt": null,
+            "finalText": "已经生成的回复"
+        })
+        .to_string();
+
+        finish_task_execution_with_connection(
+            &mut connection,
+            &running,
+            "interrupted",
+            &result_json,
+            "",
+        )
+        .expect("有最终回复的 interrupted 应进入待验收");
+
+        let persisted: (String, String, String, String) = connection
+            .query_row(
+                "SELECT t.status, s.status, s.external_status, t.result_json FROM task t JOIN session s ON s.id = t.current_session_id WHERE t.id = 't'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("应读取终态");
+        assert_eq!(
+            persisted,
+            (
+                "waiting_acceptance".to_string(),
+                "waiting_acceptance".to_string(),
+                "interrupted".to_string(),
+                result_json
+            )
+        );
+    }
+
+    /// interrupted 没有最终回复时仍必须失败并清空结果，避免空中断被伪装成可验收内容。
+    #[test]
+    fn interrupted_turn_without_final_text_stays_failed() {
+        let mut connection = Connection::open_in_memory().expect("应创建内存数据库");
+        initialize_database_schema(&connection).expect("首版结构初始化应成功");
+        connection
+            .execute_batch(
+                "
+                INSERT INTO project (id, name, workspace_path) VALUES ('p', 'P', '/tmp');
+                INSERT INTO task (id, project_id, title, prompt, status, current_session_id)
+                VALUES ('t', 'p', 'T', 'P', 'running', 's');
+                INSERT INTO session (
+                    id, project_id, task_id, provider, workspace_path, title, status,
+                    external_thread_id, external_turn_id
+                )
+                VALUES ('s', 'p', 't', 'codex', '/tmp', 'T', 'running', 'thread-1', 'turn-1');
+                ",
+            )
+            .expect("应准备已绑定的 running 任务");
+        let running = RunningTaskRecord {
+            project_id: "p".to_string(),
+            task_id: "t".to_string(),
+            session_id: "s".to_string(),
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        };
+        let result_json = serde_json::json!({
+            "turnId": "turn-1",
+            "status": "interrupted",
+            "completedAt": null,
+            "finalText": "   "
+        })
+        .to_string();
+
+        finish_task_execution_with_connection(
+            &mut connection,
+            &running,
+            "interrupted",
+            &result_json,
+            "用户中断",
+        )
+        .expect("没有最终回复的 interrupted 应保持失败");
+
+        let persisted: (String, String, String, String, String) = connection
+            .query_row(
+                "SELECT t.status, s.status, s.external_status, t.result_json, t.last_error FROM task t JOIN session s ON s.id = t.current_session_id WHERE t.id = 't'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("应读取终态");
+        assert_eq!(
+            persisted,
+            (
+                "failed".to_string(),
+                "failed".to_string(),
+                "interrupted".to_string(),
+                "{}".to_string(),
+                "用户中断".to_string()
+            )
+        );
     }
 }

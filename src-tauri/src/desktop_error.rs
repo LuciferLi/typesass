@@ -79,6 +79,8 @@ fn safe_error_metadata(code: &str, operation: &str) -> (&'static str, &'static s
         "SIDECAR_SHUTDOWN_FAILED" => ("SIDECAR_SHUTDOWN_FAILED", "本机 AI 服务停止失败。"),
         "PRIVATE_RPC_START_FAILED" => ("PRIVATE_RPC_START_FAILED", "本机业务桥接启动失败。"),
         "PRIVATE_RPC_SHUTDOWN_FAILED" => ("PRIVATE_RPC_SHUTDOWN_FAILED", "本机业务桥接停止失败。"),
+        "WEB_SERVER_START_FAILED" => ("WEB_SERVER_START_FAILED", "内置 Web 服务启动失败。"),
+        "WEB_SERVER_SHUTDOWN_FAILED" => ("WEB_SERVER_SHUTDOWN_FAILED", "内置 Web 服务停止失败。"),
         "TASK_WORKSPACE_LOAD_FAILED" => ("TASK_WORKSPACE_LOAD_FAILED", "读取任务工作区失败。"),
         "TASK_PROJECT_CREATE_FAILED" => ("TASK_PROJECT_CREATE_FAILED", "创建任务项目失败。"),
         "TASK_PROJECT_UPDATE_FAILED" => ("TASK_PROJECT_UPDATE_FAILED", "更新任务项目失败。"),
@@ -113,16 +115,21 @@ fn safe_error_metadata(code: &str, operation: &str) -> (&'static str, &'static s
             "Codex 工作空间切换失败。",
         ),
         "CODEX_CDP_NEW_CHAT_FAILED" => ("CODEX_CDP_NEW_CHAT_FAILED", "Codex 新会话导航失败。"),
-        "CODEX_CDP_COMPOSER_NOT_EMPTY" => (
-            "CODEX_CDP_COMPOSER_NOT_EMPTY",
-            "Codex 输入框存在未发送草稿，请处理后重试。",
-        ),
         "CODEX_CDP_COMPOSER_NOT_READY" => {
             ("CODEX_CDP_COMPOSER_NOT_READY", "Codex 输入框尚未就绪。")
         }
         "CODEX_CDP_COMPOSER_WRITE_FAILED" => {
             ("CODEX_CDP_COMPOSER_WRITE_FAILED", "Codex 输入框写入失败。")
         }
+        "CODEX_CDP_ATTACHMENT_INPUT_MISSING" => (
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex 附件上传入口不可用。",
+        ),
+        "CODEX_CDP_ATTACHMENT_INVALID" => ("CODEX_CDP_ATTACHMENT_INVALID", "任务图片附件无效。"),
+        "CODEX_CDP_ATTACHMENT_WRITE_FAILED" => (
+            "CODEX_CDP_ATTACHMENT_WRITE_FAILED",
+            "写入任务图片附件失败。",
+        ),
         "CODEX_CDP_SUBMISSION_PERSIST_FAILED" => (
             "CODEX_CDP_SUBMISSION_PERSIST_FAILED",
             "保存 Codex 提交阶段失败。",
@@ -273,7 +280,6 @@ mod tests {
             "RECONCILE_EMPTY_THREAD_PERSIST_FAILED",
             "CODEX_SEND_UNCERTAIN",
             "CODEX_CDP_WORKSPACE_SWITCH_FAILED",
-            "CODEX_CDP_COMPOSER_NOT_EMPTY",
             "CODEX_CDP_COMPOSER_WRITE_FAILED",
             "CODEX_CDP_SUBMISSION_PERSIST_FAILED",
             "CDP_SUBMISSION_RECOVERY_LOAD_FAILED",

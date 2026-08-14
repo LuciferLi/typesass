@@ -1,3 +1,5 @@
+import type { OpenAppShortcutBindingModel } from '@/model/shortcutBinding';
+
 // 权限状态项模型，用于权限管理页展示每类能力是否可用。
 export type PermissionItemModel = {
     // 权限稳定键，用于页面渲染和操作分发。
@@ -35,4 +37,6 @@ export type ShortcutProfileModel = {
     dictate: string;
     // 选中文本润色模式快捷键。
     polish: string;
+    // 用户创建的打开应用快捷键绑定。
+    appBindings: OpenAppShortcutBindingModel[];
 };

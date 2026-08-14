@@ -2436,18 +2436,18 @@
         <section id="modes" class="section">
           <div class="sectionInner">
             <div class="sectionHeader reveal">
-              <div class="sectionKicker">输入模式</div>
-              <h2 class="sectionTitle">语音转文字和润色，覆盖最常用的输入动作。</h2>
+              <div class="sectionKicker">工作流</div>
+              <h2 class="sectionTitle">语音输入之外，也能管理 Codex 任务和会话。</h2>
               <p class="sectionCopy">
-                需要保留原话时只做语音转文字；需要直接发送时继续整理口语和标点；已有文字也可以单独润色。
+                CodexMan 把日常输入、文本润色、任务看板和历史会话放在同一个桌面工作台里，方便持续追踪结果。
               </p>
             </div>
 
             <div class="modeGrid">
-              <div class="modeSwitch reveal" role="tablist" aria-label="语音模式">
+              <div class="modeSwitch reveal" role="tablist" aria-label="工作流截图">
                 <button class="modeButton isActive" type="button" data-mode="dictate" role="tab" aria-selected="true">
-                  <strong>口述</strong>
-                  <span>说完直接整理成可粘贴文本，也可以关闭 AI 润色保留原始转写。</span>
+                  <strong>任务管理</strong>
+                  <span>把 Codex 任务按状态归类，排队、执行、验收和回看都在看板里完成。</span>
                 </button>
                 <button class="modeButton" type="button" data-mode="polish" role="tab" aria-selected="false">
                   <strong>文本润色</strong>
@@ -2457,11 +2457,11 @@
 
               <article class="modePreview reveal" aria-live="polite">
                 <div class="modeImage">
-                  <img id="modeImage" src="./assets/modesView.png" alt="CodexMan 语音模式设置截图" />
+                  <img id="modeImage" src="./assets/modesView.png" alt="CodexMan 任务管理截图" />
                 </div>
                 <div class="modeCaption">
-                  <strong id="modeCaptionTitle">口述模式</strong>
-                  <span id="modeShortcut">快捷键可配置</span>
+                  <strong id="modeCaptionTitle">任务管理</strong>
+                  <span id="modeShortcut">任务看板</span>
                 </div>
               </article>
             </div>
@@ -2734,10 +2734,10 @@
 
       const modeData = {
         dictate: {
-          title: "口述模式",
-          shortcut: "快捷键可配置",
+          title: "任务管理",
+          shortcut: "任务看板",
           image: "./assets/modesView.png",
-          alt: "CodexMan 语音模式设置截图",
+          alt: "CodexMan 任务管理截图",
         },
         polish: {
           title: "文本润色",

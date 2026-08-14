@@ -99,7 +99,7 @@ export const useSessionManageStore = defineStore('sessionManage', {
         message: ''
     }),
     getters: {
-        /** 读取当前任务项目；ID 不存在时返回 null，禁止猜测项目归属。 */
+        /** 读取当前任务项目；ID 为空代表全部视图，ID 不存在时返回 null，禁止猜测项目归属。 */
         selectedProject: (state): SessionProjectModel | null =>
             state.projects.find((project) => project.id === state.selectedProjectId) ?? null
     },
@@ -135,7 +135,7 @@ export const useSessionManageStore = defineStore('sessionManage', {
 
         /**
          * 初始化任务管理真实数据。
-         * 流程：桌面端读取上次项目选择，普通 Web 保留页面内存选择；再通过 HTTP 加载项目、任务和会话聚合数据。
+         * 流程：桌面端读取上次项目选择，普通 Web 保留页面内存选择；再并行加载任务聚合和 CodeX 工作空间数据。
          * 参数：无。
          * 返回：初始化完成 Promise。
          * 边界：HTTP 失败时清空任务数据并标记未就绪，不回退 IPC 或旧缓存。
@@ -151,7 +151,11 @@ export const useSessionManageStore = defineStore('sessionManage', {
                       })
                     : { selectedProjectId: this.selectedProjectId, selectedWorkspaceCwd: this.selectedWorkspaceCwd };
                 this.selectedProjectId = saved.selectedProjectId ?? '';
-                this.applyWorkspaceData(await loadSessionWorkspaceData(this.selectedProjectId || undefined));
+                const [workspaceData] = await Promise.all([
+                    loadSessionWorkspaceData(this.selectedProjectId || undefined),
+                    this.refreshCodexWorkspaces()
+                ]);
+                this.applyWorkspaceData(workspaceData);
                 await this.persistSelection();
                 this.message = '';
             } catch (error) {
@@ -168,18 +172,18 @@ export const useSessionManageStore = defineStore('sessionManage', {
 
         /**
          * 应用 HTTP 返回的权威任务聚合数据。
-         * 流程：原子替换三个列表，并仅在原选择不存在时选择唯一项目或清空选择。
+         * 流程：原子替换三个列表；项目 ID 为空时保持“全部”视图，显式项目缺失时回到“全部”。
          * 参数：data 为 HTTP 服务从 Rust 任务库取得的真实数据。
          * 返回：无返回值。
-         * 边界：不会在前端补造任务、会话或状态；多项目且无选择时保持未选择。
+         * 边界：不会在前端补造任务、会话或状态；“全部”视图不猜测任务创建归属。
          */
         applyWorkspaceData(data: SessionWorkspaceDataModel): void {
             this.projects = data.projects;
             if (!this.projects.some((project) => project.id === this.selectedProjectId)) {
-                this.selectedProjectId = this.projects.length === 1 ? (this.projects[0]?.id ?? '') : '';
+                this.selectedProjectId = '';
             }
-            this.tasks = this.selectedProjectId ? data.tasks : [];
-            this.sessions = this.selectedProjectId ? data.sessions : [];
+            this.tasks = data.tasks;
+            this.sessions = data.sessions;
             const project = this.projects.find((item) => item.id === this.selectedProjectId);
             if (project) this.selectedWorkspaceCwd = project.workspacePath;
             this.workspaceDataReady = true;
@@ -188,8 +192,8 @@ export const useSessionManageStore = defineStore('sessionManage', {
 
         /**
          * 切换任务项目。
-         * 流程：按项目 ID 重新请求 HTTP 聚合数据，再持久化当前页面选择。
-         * 参数：projectId 为真实项目 ID。
+         * 流程：按项目 ID 重新请求 HTTP 聚合数据；项目 ID 为空时读取全部视图，再持久化当前页面选择。
+         * 参数：projectId 为真实项目 ID，空字符串代表全部项目。
          * 返回：切换完成 Promise。
          * 异常：读取失败时透传，保留服务端之前确认的数据。
          */
@@ -197,7 +201,7 @@ export const useSessionManageStore = defineStore('sessionManage', {
             const previousProjectId = this.selectedProjectId;
             try {
                 this.selectedProjectId = projectId;
-                this.applyWorkspaceData(await loadSessionWorkspaceData(projectId));
+                this.applyWorkspaceData(await loadSessionWorkspaceData(projectId || undefined));
                 await this.persistSelection();
                 this.message = '';
             } catch (error) {
@@ -249,11 +253,11 @@ export const useSessionManageStore = defineStore('sessionManage', {
         },
 
         /**
-         * 删除当前空项目。
-         * 流程：调用 HTTP 删除接口，由 Rust 事务删除没有任务和会话的项目，再采用返回列表并持久化新的选择。
+         * 删除当前项目。
+         * 流程：调用 HTTP 删除接口，由 Rust 事务软删除项目，再采用返回列表并持久化新的选择。
          * 参数：projectId 为待删除项目稳定 ID。
          * 返回：删除完成 Promise。
-         * 异常：存在关联记录或事务失败时透传，前端不移除项目。
+         * 异常：项目不存在、已删除或事务失败时透传，前端不移除项目。
          */
         async removeProject(projectId: string): Promise<void> {
             this.saving = true;
@@ -391,21 +395,21 @@ export const useSessionManageStore = defineStore('sessionManage', {
 
         /**
          * 在任务页存活期间跟踪 Rust 任务状态。
-         * 流程：仅在存在排队中或执行中任务时，以固定有界间隔单飞重读当前项目；响应返回后核对项目与数据版本，再采用数据库真实聚合数据。
+         * 流程：仅在存在排队中或执行中任务时，以固定有界间隔单飞重读当前项目或全部视图；响应返回后核对项目与数据版本，再采用数据库真实聚合数据。
          * 参数：无。
          * 返回：取消监听函数 Promise。
-         * 边界：未选项目、没有活动任务、已有请求或正在写操作时跳过当次；页面卸载、项目切换或期间完成写操作后丢弃旧响应；失败只更新错误信息，不回退 Tauri event/IPC。
+         * 边界：没有活动任务、已有请求或正在写操作时跳过当次；页面卸载、项目切换或期间完成写操作后丢弃旧响应；失败只更新错误信息，不回退 Tauri event/IPC。
          */
         async listenTaskUpdates(): Promise<() => void> {
             let requestInFlight = false;
             let stopped = false;
             const timer = window.setInterval(() => {
                 const hasActiveTask = this.tasks.some((task) => task.status === 'queued' || task.status === 'running');
-                if (!this.selectedProjectId || !hasActiveTask || requestInFlight || this.loading || this.saving) return;
+                if (!hasActiveTask || requestInFlight || this.loading || this.saving) return;
                 const requestedProjectId = this.selectedProjectId;
                 const requestedRevision = this.workspaceDataRevision;
                 requestInFlight = true;
-                void loadSessionWorkspaceData(requestedProjectId)
+                void loadSessionWorkspaceData(requestedProjectId || undefined)
                     .then((data) => {
                         if (
                             stopped ||

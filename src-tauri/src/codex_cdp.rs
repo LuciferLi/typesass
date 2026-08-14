@@ -7,6 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tungstenite::client::IntoClientRequest;
@@ -16,6 +17,7 @@ use tungstenite::{client, Message};
 use url::Url;
 
 use crate::codex_desktop::{codex_page_websocket_url, CODEX_CDP_PORT};
+use crate::task_store::TaskAttachmentRecord;
 
 /// CDP TCP 建连和单条协议交互的最大等待时间。
 const CDP_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -92,12 +94,13 @@ pub(crate) struct CodexCdpFailure {
 }
 
 /// 通过 Codex Desktop 主 renderer 在精确工作空间创建原生新会话并按一次 Enter。
-/// 流程：先读取旧 route/thread 并拒绝当前草稿，再通过受支持的 set-active bridge 让主进程选中项目；只读轮询全局状态精确确认 canonical root，点击项目行新聊天按钮创建空会话，写入前复核选择未变化，最后仅发送一次 Enter。
+/// 流程：通过受支持的 set-active bridge 让主进程选中项目；只读轮询全局状态精确确认 canonical root，点击项目行新聊天按钮创建空会话，写入前复核选择未变化，最后仅发送一次 Enter。
 /// 参数：workspace_path 为 canonical 工作目录，prompt 为任务正文；返回 Enter 前时间水位，真实 thread ID 必须由调用方以 UI/JSONL 双通道唯一恢复。
 /// 异常/边界：全局状态超限、符号链接、selected 记录内重复 root、非 local 选择或中间态超时均在输入前失败；其它项目同 root 不阻断权威选择。
 pub(crate) fn submit_new_chat<F>(
     workspace_path: &str,
     prompt: &str,
+    attachments: &[TaskAttachmentRecord],
     before_enter: F,
 ) -> Result<CodexSubmissionReceipt, CodexCdpFailure>
 where
@@ -117,32 +120,20 @@ where
     }
     let mut session = CdpSession::connect()?;
     session.request(1, "Runtime.enable", json!({}), false)?;
-    let previous_navigation = session.evaluate(
+    session.request(9_000, "Page.bringToFront", json!({}), false)?;
+    session.evaluate(
         2,
         r#"(() => {
             const active = document.querySelector('[data-app-action-sidebar-thread-active="true"]');
             const routeMatch = window.location.pathname.match(/^\/local\/([^/?#]+)/);
             const threadId = active?.getAttribute('data-app-action-sidebar-thread-id') || routeMatch?.[1] || '';
-            const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
-              .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
             return {
                 route: `${window.location.pathname}${window.location.search}${window.location.hash}`,
-                threadId,
-                draft: composers.length === 1 ? composers[0].textContent : null
+                threadId
             };
         })()"#,
         false,
     )?;
-    let previous_draft = previous_navigation
-        .get("draft")
-        .and_then(Value::as_str)
-        .ok_or_else(|| protocol_failure_at(false, "previous navigation draft missing"))?;
-    if !previous_draft.is_empty() {
-        return Err(pre_submission_failure(
-            "CODEX_CDP_COMPOSER_NOT_EMPTY",
-            "Codex Desktop 当前输入框存在未发送草稿，请处理后重试。",
-        ));
-    }
     let workspace_json = serde_json::to_string(workspace_path).map_err(|_| {
         pre_submission_failure(
             "CODEX_CDP_INPUT_INVALID",
@@ -190,16 +181,6 @@ where
             "selected workspace composer count invalid",
         ));
     }
-    let selected_workspace_draft = selected_workspace_composer
-        .get("draft")
-        .and_then(Value::as_str)
-        .ok_or_else(|| protocol_failure_at(false, "selected workspace draft missing"))?;
-    if !selected_workspace_draft.is_empty() {
-        return Err(pre_submission_failure(
-            "CODEX_CDP_COMPOSER_NOT_EMPTY",
-            "Codex Desktop 目标工作空间输入框存在未发送草稿，请处理后重试。",
-        ));
-    }
     let workspace_label = Path::new(workspace_path)
         .file_name()
         .and_then(|value| value.to_str())
@@ -223,33 +204,46 @@ where
                     const label = (button.getAttribute('aria-label') || '').toLowerCase();
                     return label.includes('开始新聊天') || label.includes('start new chat');
                 }});
-                if (!newChatButton) return false;
-                newChatButton.click();
-                return true;
+                if (newChatButton) {{
+                  window.setTimeout(() => newChatButton.click(), 0);
+                  return {{ ok: true, navigation: 'project-button' }};
+                }}
+                window.setTimeout(() => window.postMessage({{
+                    type: 'navigate-to-route',
+                    path: '/',
+                    state: {{ focusComposerNonce: Date.now() }}
+                  }}, window.location.origin), 250);
+                return {{ ok: true, navigation: 'workspace-root' }};
             }})()"#
         ),
         false,
     )?;
-    if navigation_result.as_bool() != Some(true) {
+    if navigation_result.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(pre_submission_failure(
             "CODEX_CDP_NEW_CHAT_FAILED",
             "Codex Desktop 未确认新会话导航。",
         ));
     }
+    let require_project_label =
+        navigation_result.get("navigation").and_then(Value::as_str) == Some("project-button");
     let mut composer_ready = false;
     for attempt in 0..COMPOSER_READY_ATTEMPTS {
         let result = session.evaluate(
             10 + attempt as u64,
             &format!(r#"(() => {{
+                const expectedLabel = {workspace_label_json};
+                const requireProjectLabel = {require_project_label};
+                const activeProject = document.querySelector(
+                  '[data-app-action-sidebar-project-row][aria-current="page"], '
+                  + '[data-app-action-sidebar-project-row][data-app-action-sidebar-project-active="true"]'
+                );
+                const activeProjectLabel = activeProject?.getAttribute('data-app-action-sidebar-project-label') || '';
+                if (requireProjectLabel && activeProjectLabel !== expectedLabel) return false;
                 const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
                   .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
                 if (composers.length !== 1) return false;
                 const composer = composers[0];
-                const activeThreadId = document.querySelector('[data-app-action-sidebar-thread-active="true"]')
-                  ?.getAttribute('data-app-action-sidebar-thread-id') || '';
-                const newThreadReady = !activeThreadId || activeThreadId.startsWith('local:client-new-thread:');
-                if (!newThreadReady) return false;
-                if (composer.textContent !== '') return false;
+                if ((composer.textContent || '').trim() !== '') return false;
                 composer.focus();
                 return document.activeElement === composer;
             }})()"#),
@@ -275,6 +269,205 @@ where
     )? {
         return Err(workspace_state_failure());
     }
+    let cleared_existing_attachments = session.evaluate(
+        51,
+        r#"(() => new Promise((resolve) => {
+            const composer = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+              .find((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+            if (!composer) {
+              resolve(false);
+              return;
+            }
+            const images = document.querySelectorAll(
+              '.composer-attachment-surface img[alt="User attachment"], '
+              + '.composer-attachment-surface img[alt="用户附件"], '
+              + 'img[src^="blob:"], img[src^="app://fs/"]'
+            );
+            for (const image of images) {
+              const surface = image.closest('.composer-attachment-surface[role="button"]');
+              const remove = surface?.querySelector('button[aria-label^="Remove"], button[aria-label^="移除"]');
+              remove?.click();
+            }
+            let attempts = 0;
+            const timer = setInterval(() => {
+              attempts += 1;
+              const remaining = document.querySelectorAll(
+                '.composer-attachment-surface img[alt="User attachment"], '
+                + '.composer-attachment-surface img[alt="用户附件"], '
+                + 'img[src^="blob:"], img[src^="app://fs/"]'
+              ).length;
+              if (remaining === 0 || attempts >= 20) {
+                clearInterval(timer);
+                resolve(remaining === 0);
+              }
+            }, 100);
+        }))()"#,
+        false,
+    )?;
+    if cleared_existing_attachments.as_bool() != Some(true) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex Desktop 当前输入框残留图片附件未清理完成。",
+        ));
+    }
+    if !attachments.is_empty() {
+        let attachment_paths = attachments
+            .iter()
+            .map(write_attachment_temp_file)
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_id = format!("codexman-task-attachment-{}", uuid::Uuid::new_v4().simple());
+        let input_id_json = serde_json::to_string(&input_id)
+            .map_err(|_| protocol_failure_at(false, "attachment input id serialization failed"))?;
+        let prepared = session.evaluate(
+            59,
+            &format!(
+                r#"(() => new Promise((resolve) => {{
+                    const inputId = {input_id_json};
+                    const existing = document.getElementById(inputId);
+                    if (existing) existing.remove();
+                    const composer = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                      .find((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                    if (!composer) {{
+                      resolve({{ ok: false, attachmentImagesBefore: 0 }});
+                      return;
+                    }}
+                    const attachmentImagesBefore = document.querySelectorAll(
+                      'img[src^="blob:"], img[src^="app://fs/"], '
+                      + '.composer-attachment-surface img[alt="User attachment"], '
+                      + '.composer-attachment-surface img[alt="用户附件"]'
+                    ).length;
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    input.multiple = true;
+                    input.id = inputId;
+                    input.style.display = 'none';
+                    document.body.append(input);
+                    resolve({{ ok: true, attachmentImagesBefore }});
+                }}))()"#
+            ),
+            false,
+        )?;
+        if prepared.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(pre_submission_failure(
+                "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+                "Codex Desktop 当前输入框未找到可接收图片的区域。",
+            ));
+        }
+        let attachment_images_before = prepared
+            .get("attachmentImagesBefore")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| protocol_failure_at(false, "attachment count missing"))?;
+        session.request(58, "DOM.enable", json!({}), false)?;
+        let document_node_id = session
+            .request(56, "DOM.getDocument", json!({"depth": 0}), false)?
+            .pointer("/result/root/nodeId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| protocol_failure_at(false, "attachment document node missing"))?;
+        let input_node_id = session
+            .request(
+                57,
+                "DOM.querySelector",
+                json!({
+                    "nodeId": document_node_id,
+                    "selector": format!("#{input_id}")
+                }),
+                false,
+            )?
+            .pointer("/result/nodeId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| protocol_failure_at(false, "attachment input node missing"))?;
+        if input_node_id == 0 {
+            return Err(pre_submission_failure(
+                "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+                "Codex Desktop 图片附件临时输入控件创建失败。",
+            ));
+        }
+        session.request(
+            55,
+            "DOM.setFileInputFiles",
+            json!({
+                "nodeId": input_node_id,
+                "files": attachment_paths
+            }),
+            false,
+        )?;
+        let dispatched = session.evaluate(
+            54,
+            &format!(
+                r#"(() => {{
+                    const input = document.getElementById({input_id_json});
+                    const composer = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                      .find((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                    if (!input || !composer) return false;
+                    const transfer = new DataTransfer();
+                    for (const file of input.files) transfer.items.add(file);
+                    if (transfer.files.length !== input.files.length || transfer.files.length === 0) return false;
+                    const rect = composer.getBoundingClientRect();
+                    const eventOptions = {{
+                      bubbles: true,
+                      cancelable: true,
+                      composed: true,
+                      dataTransfer: transfer,
+                      shiftKey: true,
+                      clientX: Math.round(rect.left + rect.width / 2),
+                      clientY: Math.round(rect.top + rect.height / 2),
+                    }};
+                    composer.focus();
+                    for (const type of ['dragenter', 'dragover', 'drop']) {{
+                      composer.dispatchEvent(new DragEvent(type, eventOptions));
+                    }}
+                    return true;
+                }})()"#
+            ),
+            false,
+        )?;
+        if dispatched.as_bool() != Some(true) {
+            return Err(pre_submission_failure(
+                "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+                "Codex Desktop 未接收图片附件拖拽事件。",
+            ));
+        }
+        let expected_attachment_count = attachment_images_before + attachments.len() as u64;
+        let confirmed = session.evaluate(
+            53,
+            &format!(
+                r#"(() => new Promise((resolve) => {{
+                    const expected = {expected_attachment_count};
+                    let attempts = 0;
+                    const timer = setInterval(() => {{
+                      attempts += 1;
+                      const attachmentImages = document.querySelectorAll(
+                        'img[src^="blob:"], img[src^="app://fs/"], '
+                        + '.composer-attachment-surface img[alt="User attachment"], '
+                        + '.composer-attachment-surface img[alt="用户附件"]'
+                      ).length;
+                      const pending = document.body.innerText.includes('正在上传') || document.body.innerText.includes('Uploading');
+                      if ((attachmentImages >= expected && !pending) || attempts >= 50) {{
+                        clearInterval(timer);
+                        resolve(attachmentImages >= expected && !pending);
+                      }}
+                    }}, 100);
+                }}))()"#
+            ),
+            false,
+        )?;
+        let _ = session.evaluate(
+            52,
+            &format!(
+                r#"(() => {{
+                    document.getElementById({input_id_json})?.remove();
+                    return true;
+                }})()"#
+            ),
+            false,
+        );
+        if confirmed.as_bool() != Some(true) {
+            return Err(pre_submission_failure(
+                "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+                "Codex Desktop 当前输入框未确认图片附件预览。",
+            ));
+        }
+    }
     if let Err(failure) = session.request(60, "Input.insertText", json!({"text": prompt}), false) {
         return Err(if session.clear_composer().is_ok() {
             failure
@@ -286,9 +479,15 @@ where
         61,
         &format!(
             r#"(() => {{
+                const readComposerText = (composer) => {{
+                    const blocks = Array.from(composer.childNodes)
+                      .filter((node) => node instanceof HTMLElement && (node.matches('p,div') || node.getClientRects().length > 0));
+                    if (blocks.length === 0) return composer.textContent || '';
+                    return blocks.map((block) => block.textContent || '').join('\n');
+                }};
                 const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
                   .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
-                return composers.length === 1 && composers[0].textContent === {};
+                return composers.length === 1 && readComposerText(composers[0]) === {};
             }})()"#,
             serde_json::to_string(prompt).map_err(|_| pre_submission_failure(
                 "CODEX_CDP_INPUT_INVALID",
@@ -320,20 +519,41 @@ where
             protocol_failure_at(true, "composer cleanup failed after persist error")
         });
     }
-    session.request(
+    session.evaluate(
         62,
-        "Input.dispatchKeyEvent",
-        json!({
-            "type": "keyDown",
-            "key": "Enter",
-            "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-            "nativeVirtualKeyCode": 36
-        }),
+        r#"(() => {
+            const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+              .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+            const composer = composers.length === 1 ? composers[0] : null;
+            if (!composer) return false;
+            composer?.focus();
+            const range = document.createRange();
+            range.selectNodeContents(composer);
+            range.collapse(false);
+            const selection = window.getSelection();
+            selection?.removeAllRanges();
+            selection?.addRange(range);
+            return document.activeElement === composer;
+        })()"#,
         true,
     )?;
     session.request(
         63,
+        "Input.dispatchKeyEvent",
+        json!({
+            "type": "rawKeyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 36,
+            "macCharCode": 13,
+            "unmodifiedText": "\r",
+            "text": "\r"
+        }),
+        true,
+    )?;
+    session.request(
+        64,
         "Input.dispatchKeyEvent",
         json!({
             "type": "keyUp",
@@ -584,7 +804,7 @@ impl CdpSession {
             r#"(() => {
                 const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
                   .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
-                return composers.length === 1 && composers[0].textContent === '';
+                return composers.length === 1 && (composers[0].textContent || '').trim() === '';
             })()"#,
             true,
         )?;
@@ -711,6 +931,52 @@ fn pre_submission_failure(code: &'static str, message: &str) -> CodexCdpFailure 
         message: message.to_string(),
         submission_uncertain: false,
     }
+}
+
+/// 把任务附件 data URL 写入临时图片文件。
+/// 流程：解析 `data:<mime>;base64,<payload>`，按 MIME 选择扩展名，写入系统临时目录的唯一文件。
+/// 参数：attachment 为已由 TaskStore 校验的图片附件。
+/// 返回：可交给 CDP `DOM.setFileInputFiles` 的本地绝对路径。
+/// 异常/边界：不在错误中回显 data URL 或文件内容；无法解码/写入时发生在 Enter 前，可安全失败。
+fn write_attachment_temp_file(
+    attachment: &TaskAttachmentRecord,
+) -> Result<String, CodexCdpFailure> {
+    let prefix = format!("data:{};base64,", attachment.mime_type);
+    let Some(payload) = attachment.data_url.strip_prefix(&prefix) else {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INVALID",
+            "任务图片附件格式无效。",
+        ));
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| {
+            pre_submission_failure("CODEX_CDP_ATTACHMENT_INVALID", "任务图片附件无法解码。")
+        })?;
+    let extension = match attachment.mime_type.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => {
+            return Err(pre_submission_failure(
+                "CODEX_CDP_ATTACHMENT_INVALID",
+                "任务图片附件类型不支持。",
+            ))
+        }
+    };
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "codexman-task-attachment-{}.{}",
+        uuid::Uuid::new_v4(),
+        extension
+    ));
+    fs::write(&path, bytes).map_err(|_| {
+        pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_WRITE_FAILED",
+            "任务图片附件写入失败。",
+        )
+    })?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// 读取当前 Unix 毫秒水位。
@@ -852,18 +1118,12 @@ mod tests {
             .find("pub(crate) fn submit_new_chat")
             .expect("生产提交函数必须存在");
         let submit_source = &production[submit_start..];
-        let first_draft_gate = submit_source
-            .find("if !previous_draft.is_empty()")
-            .expect("切换前必须拒绝当前草稿");
         let workspace_side_effect = submit_source
             .find("electron-set-active-workspace-root")
             .expect("必须保留工作空间 bridge");
         let new_chat_side_effect = submit_source
             .find("start new chat")
             .expect("必须保留项目行新聊天按钮");
-        let second_draft_gate = submit_source
-            .find("if !selected_workspace_draft.is_empty()")
-            .expect("切换后必须再次拒绝目标工作空间草稿");
         assert!(production.contains("electron-set-active-workspace-root"));
         assert!(!production.contains("electron-add-new-workspace-root-option"));
         assert!(!production.contains("electron-get-active-workspace-root"));
@@ -871,24 +1131,17 @@ mod tests {
         assert!(production.contains("[data-codex-composer=\"true\"][contenteditable=\"true\"]"));
         assert!(production.contains("[data-app-action-sidebar-project-row]"));
         assert!(production.contains("开始新聊天"));
-        assert!(production.contains("newThreadReady"));
-        assert!(production.contains("composer.textContent !== ''"));
-        assert!(production.contains("composers[0].textContent === {}"));
-        assert!(production.contains("CODEX_CDP_COMPOSER_NOT_EMPTY"));
-        assert!(production.contains("if !previous_draft.is_empty()"));
-        assert!(
-            first_draft_gate < workspace_side_effect,
-            "草稿门禁必须发生在首个工作空间副作用之前"
-        );
+        assert!(production.contains("(composer.textContent || '').trim() !== ''"));
+        assert!(production.contains("local:client-new-thread:"));
+        assert!(production.contains("readComposerText(composers[0]) === {}"));
+        assert!(!production.contains("CODEX_CDP_COMPOSER_NOT_EMPTY"));
+        assert!(!production.contains("previous_draft"));
+        assert!(!production.contains("selected_workspace_draft"));
         assert!(
             workspace_side_effect < new_chat_side_effect,
             "必须先通过 bridge 选择精确工作空间，再点击项目行新聊天按钮"
         );
-        assert!(
-            second_draft_gate > workspace_side_effect,
-            "工作空间切换后必须保留第二次草稿门禁"
-        );
-        assert!(!production.contains("innerText"));
+        assert!(!production.contains("composer.innerText"));
         assert!(production.contains("\"Input.insertText\""));
         assert_eq!(production.matches("send.click()").count(), 0);
         assert_eq!(production.matches("nativeVirtualKeyCode\": 36").count(), 2);

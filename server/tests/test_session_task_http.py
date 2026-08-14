@@ -13,6 +13,31 @@ from tests.test_main_api import api_client, assert_error, session_headers
 EMPTY_WORKSPACE = {"projects": [], "tasks": [], "sessions": []}
 
 
+def workspace_task(index: int) -> Dict[str, object]:
+    """构造满足公开工作区响应契约的任务记录。
+
+    流程：按序号生成稳定 ID、标题和时间字段，供响应模型容量回归测试复用。
+    参数：index 为任务序号。
+    返回：完整任务响应字典。
+    异常边界：仅用于测试响应模型，不触发真实 SQLite 或 Codex 执行。
+    """
+
+    return {
+        "id": "task-{0}".format(index),
+        "projectId": "project-1",
+        "title": "任务 {0}".format(index),
+        "prompt": "执行 {0}".format(index),
+        "attachments": [],
+        "status": "created",
+        "currentSessionId": "",
+        "externalThreadId": "",
+        "lastError": "",
+        "resultJson": "{}",
+        "createdAt": "2026-08-13 10:00:00",
+        "updatedAt": "2026-08-13 10:00:00",
+    }
+
+
 class FakePrivateRpcClient:
     """记录公共路由到私有 RPC 的精确方法和参数映射。"""
 
@@ -62,6 +87,45 @@ class FakePrivateRpcClient:
         return EMPTY_WORKSPACE
 
 
+class ManyTasksPrivateRpcClient:
+    """返回超过旧 16 条上限的任务列表，回归工作区响应模型不应误拦真实历史数据。"""
+
+    async def call(
+        self, method: str, request_id: str, params: Dict[str, object]
+    ) -> object:
+        """返回 17 条任务的工作区聚合数据。"""
+
+        return {
+            "projects": [
+                {
+                    "id": "project-1",
+                    "name": "项目",
+                    "workspacePath": "/tmp/work",
+                    "basePrompt": "",
+                    "taskCount": 17,
+                    "sessionCount": 0,
+                    "createdAt": "2026-08-13 10:00:00",
+                    "updatedAt": "2026-08-13 10:00:00",
+                }
+            ],
+            "tasks": [workspace_task(index) for index in range(17)],
+            "sessions": [
+                {
+                    "id": "session-1",
+                    "projectId": "project-1",
+                    "taskId": "task-1",
+                    "provider": "codex",
+                    "workspacePath": "/tmp/work",
+                    "title": "会话",
+                    "status": "running",
+                    "externalThreadId": "thread-1",
+                    "createdAt": "2026-08-13T10:00:00Z",
+                    "updatedAt": "2026-08-13T18:00:00+08:00",
+                }
+            ],
+        }
+
+
 @pytest.mark.asyncio
 async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
     caplog: pytest.LogCaptureFixture,
@@ -90,11 +154,15 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
             ),
             ("POST", "/v1/codex/threads/thread-1/open", None),
             ("POST", "/v1/task-workspace/query", {"projectId": "project-1"}),
-            ("POST", "/v1/projects", {"name": "项目", "workspacePath": "/tmp/work"}),
+            (
+                "POST",
+                "/v1/projects",
+                {"name": "项目", "workspacePath": "/tmp/work", "basePrompt": "项目规则"},
+            ),
             (
                 "POST",
                 "/v1/projects/project-1/update",
-                {"name": "新项目", "workspacePath": "/tmp/new"},
+                {"name": "新项目", "workspacePath": "/tmp/new", "basePrompt": "新项目规则"},
             ),
             ("POST", "/v1/projects/project-1/delete", None),
             (
@@ -147,6 +215,7 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
     assert fake.calls[7][2] == {
         "name": "新项目",
         "workspacePath": "/tmp/new",
+        "basePrompt": "新项目规则",
         "id": "project-1",
     }
     assert responses[0].json() == {
@@ -164,6 +233,7 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
     assert fake.calls[10][2] == {
         "title": "新任务",
         "prompt": "新执行说明",
+        "attachments": [],
         "id": "task-1",
     }
     assert responses[9].json() == {"createdTaskId": "task-created-1", **EMPTY_WORKSPACE}
@@ -177,6 +247,26 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
             "/private/workspace",
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_tc_session_http_001a_workspace_allows_more_than_sixteen_tasks() -> None:
+    """工作区读取允许返回超过 16 条历史任务，避免响应模型把真实项目误判为 500。"""
+
+    async with api_client() as client:
+        headers = await session_headers(client, "session-http-001a")
+        main.app.state.private_rpc = ManyTasksPrivateRpcClient()
+        response = await client.post(
+            "/v1/task-workspace/query", headers=headers, json={}
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["tasks"]) == 17
+    assert data["projects"][0]["taskCount"] == 17
+    assert data["projects"][0]["createdAt"] == "2026-08-13T10:00:00Z"
+    assert data["tasks"][0]["updatedAt"] == "2026-08-13T10:00:00Z"
+    assert data["sessions"][0]["createdAt"] == "2026-08-13T10:00:00Z"
+    assert data["sessions"][0]["updatedAt"] == "2026-08-13T10:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -287,12 +377,12 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
         ),
         ("/v1/projects", "post"): (
             "TASK_PROJECT_CREATE_FAILED",
-            {"name", "workspacePath"},
+            {"name", "workspacePath", "basePrompt"},
             None,
         ),
         ("/v1/projects/{projectId}/update", "post"): (
             "TASK_PROJECT_UPDATE_FAILED",
-            {"name", "workspacePath"},
+            {"name", "workspacePath", "basePrompt"},
             None,
         ),
         ("/v1/projects/{projectId}/delete", "post"): (
@@ -302,12 +392,12 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
         ),
         ("/v1/tasks", "post"): (
             "TASK_CREATE_FAILED",
-            {"projectId", "title", "prompt"},
+            {"projectId", "title", "prompt", "attachments"},
             None,
         ),
         ("/v1/tasks/{taskId}/update", "post"): (
             "TASK_UPDATE_FAILED",
-            {"title", "prompt"},
+            {"title", "prompt", "attachments"},
             None,
         ),
         ("/v1/tasks/{taskId}/delete", "post"): ("TASK_DELETE_FAILED", None, None),
@@ -333,6 +423,7 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
         "id",
         "name",
         "workspacePath",
+        "basePrompt",
         "taskCount",
         "sessionCount",
         "createdAt",
@@ -343,6 +434,7 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
         "projectId",
         "title",
         "prompt",
+        "attachments",
         "status",
         "currentSessionId",
         "externalThreadId",
@@ -476,6 +568,7 @@ async def test_tc_session_http_004_models_document_wire_formats() -> None:
             assert field.get("examples")
 
     assert components["ProjectWriteRequest"]["properties"]["name"]["maxLength"] == 100
+    assert components["ProjectWriteRequest"]["properties"]["basePrompt"]["maxLength"] == 20_000
     connection = components["CodexConnectionResponse"]
     assert set(connection["required"]) == {
         "state",
@@ -528,10 +621,10 @@ async def test_tc_session_http_004_models_document_wire_formats() -> None:
     for model_name in ("ProjectResponse", "TaskResponse", "SessionResponse"):
         for field_name in ("createdAt", "updatedAt"):
             timestamp = components[model_name]["properties"][field_name]
-            assert "SQLite UTC" in timestamp["description"]
-            assert "YYYY-MM-DD HH:MM:SS" in timestamp["description"]
+            assert "ISO 8601 UTC" in timestamp["description"]
+            assert "Z" in timestamp["description"]
             assert re.fullmatch(
-                r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}",
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
                 timestamp["examples"][0],
             )
 
@@ -555,7 +648,6 @@ async def test_tc_session_http_004_models_document_wire_formats() -> None:
     assert {
         "CODEX_SEND_UNCERTAIN",
         "CODEX_DESKTOP_NOT_CONNECTED",
-        "TASK_PROJECT_SESSION_LIMIT_REACHED",
     } <= queue_error_codes
     send_uncertain = next(
         item
@@ -580,11 +672,8 @@ async def test_tc_session_http_004_models_document_wire_formats() -> None:
     assert "仅在该预检通过后，未连接才返回 503 CODEX_DESKTOP_NOT_CONNECTED" in (
         queue_description
     )
-    assert "同一事务" in queue_operation["description"]
-    assert "任何任务、session 或 event 写入前" in queue_operation["description"]
-    assert "零写入" in queue_operation["description"]
     queue_conflict_description = queue_operation["responses"]["409"]["description"]
-    assert "TASK_PROJECT_SESSION_LIMIT_REACHED" in queue_conflict_description
+    assert "TASK_PROJECT_SESSION_LIMIT_REACHED" not in queue_conflict_description
     operation = schema["paths"]["/v1/codex/threads/{threadId}/open"]["post"]
     assert "已确认 thread 存在" in operation["description"]
     assert "向操作系统提交" in operation["description"]

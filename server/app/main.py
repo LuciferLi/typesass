@@ -28,7 +28,10 @@ from .models import (
     AudioTranscriptionRequest,
     AudioTranscriptionResponse,
     AccessTokenRequestResponse,
+    AppAccessTokenApprovalRequest,
+    AppAccessTokenApprovalResponse,
     AppAccessTokenResponse,
+    AppAccessTokenVerifyResponse,
     AppAccessTokenWriteRequest,
     ErrorEnvelope,
     HealthResponse,
@@ -452,6 +455,22 @@ def _is_internal_origin(origin: str) -> bool:
     return address.is_private or address.is_loopback
 
 
+def _api_access_origin(request: Request) -> str:
+    """读取业务接口来源标识。
+
+    用途：兼容 Chrome 扩展后台 fetch 无法稳定携带标准 Origin 的场景，同时保留缺失来源拦截规则。
+    流程：优先读取浏览器标准 ``Origin``；缺失时读取插件后台显式发送的 ``X-CodexMan-Client-Origin``。
+    参数：``request`` 为当前 FastAPI 请求。
+    返回：去除首尾空白后的来源字符串；两者均缺失时返回空字符串。
+    异常边界：该来源只用于公网/内网判定，不能替代 Bearer 授权码校验。
+    """
+
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        return origin
+    return request.headers.get("x-codexman-client-origin", "").strip()
+
+
 async def require_api_access(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
@@ -473,7 +492,7 @@ async def require_api_access(
         request.state.client_id = "dev-access-token"
         return "dev-access-token"
 
-    origin = request.headers.get("origin", "").strip()
+    origin = _api_access_origin(request)
     if not origin:
         raise ApiError(
             401,
@@ -610,6 +629,25 @@ ACCESS_TOKEN_ERROR_CODES = {
             "action": "携带 requestId 检查本机授权码存储。",
         }
     ],
+    "503": [
+        {
+            "code": "PRIVATE_SERVICE_UNAVAILABLE",
+            "retryable": True,
+            "action": "确认 CodexMan 桌面 App 主窗口已启动并处于可响应状态后重试。",
+        },
+        {
+            "code": "RPC_BUSY",
+            "retryable": True,
+            "action": "稍后重试授权申请，避免重复点击。",
+        },
+    ],
+    "504": [
+        {
+            "code": "PRIVATE_SERVICE_TIMEOUT",
+            "retryable": True,
+            "action": "App 确认弹窗超时或桌面端暂未响应，请重新发起授权。",
+        }
+    ],
 }
 
 
@@ -627,18 +665,22 @@ ACCESS_TOKEN_ERROR_CODES = {
         **build_error_responses(
             {
                 422: ("请求字段校验失败。", "VALIDATION_ERROR"),
+                503: ("桌面 App 暂不可确认授权。", "PRIVATE_SERVICE_UNAVAILABLE"),
+                504: ("桌面 App 确认授权超时。", "PRIVATE_SERVICE_TIMEOUT"),
                 500: ("授权码保存失败。", "ACCESS_TOKEN_STORE_FAILED"),
             }
         ),
     },
     tags=["鉴权"],
     summary="请求授权码",
-    description="没有授权码的客户端请求 App 用户确认授权；接口层不保存 pending，用户确认时直接创建授权码并返回。",
+    description="没有授权码的客户端请求 App 用户确认授权；桌面 App 确认后才创建授权码并返回。",
     openapi_extra={
         "parameters": [request_id_openapi_parameter()],
         "x-error-codes": build_error_code_documentation(
             {
                 "422": ACCESS_TOKEN_ERROR_CODES["422"],
+                "503": ACCESS_TOKEN_ERROR_CODES["503"],
+                "504": ACCESS_TOKEN_ERROR_CODES["504"],
                 "500": ACCESS_TOKEN_ERROR_CODES["500"],
             }
         ),
@@ -650,12 +692,26 @@ async def request_app_access_token(
     """请求创建 App 授权码。
 
     用途：给没有授权码的客户端提供在线申请入口。
-    流程：当前接口表示 App 用户已确认授权，不保存 pending，直接创建授权码并返回明文。
+    流程：先通过私有 RPC 通知桌面 App 弹出确认框，用户同意后才创建授权码并返回明文。
     参数：``request`` 提供授权码服务，``payload`` 提供建议名称和有效期。
     返回：approved 状态和明文授权码。
-    异常边界：用户拒绝流程后续由 App 弹窗接入时返回 rejected；本接口不轮询、不生成设备码。
+    异常边界：用户拒绝时返回 rejected 且不创建授权码；桌面 App 不可用时返回稳定错误。
     """
 
+    client: PrivateRpcClient = request.app.state.private_rpc
+    approval_payload = AppAccessTokenApprovalRequest(
+        requestId=request.state.request_id,
+        name=payload.name,
+        expiresAt=payload.expires_at,
+    )
+    approval_result = await client.call(
+        "requestAccessTokenApproval",
+        request.state.request_id,
+        approval_payload.model_dump(by_alias=True),
+    )
+    approval = AppAccessTokenApprovalResponse.model_validate(approval_result)
+    if not approval.approved:
+        return AccessTokenRequestResponse(status="rejected")
     token_service: AppAccessTokenService = request.app.state.app_access_tokens
     record = token_service.create(payload.name, payload.expires_at)
     return AccessTokenRequestResponse(
@@ -705,6 +761,39 @@ async def create_app_access_token(
 
     token_service: AppAccessTokenService = request.app.state.app_access_tokens
     return token_service.create(payload.name, payload.expires_at)
+
+
+@app.get(
+    "/v1/access-tokens/verify",
+    response_model=AppAccessTokenVerifyResponse,
+    responses={
+        200: success_response_documentation(
+            {"ok": True, "clientId": "token_01J00000000000000000000000"}
+        ),
+        **build_error_responses({}),
+    },
+    tags=["鉴权"],
+    summary="校验授权码",
+    description="校验当前 Authorization Bearer 授权码是否可用；成功只表示授权码有效，不读取项目或模型业务数据。",
+    openapi_extra={
+        "parameters": [request_id_openapi_parameter()],
+        "x-error-codes": build_error_code_documentation(
+            {"401": ACCESS_TOKEN_ERROR_CODES["401"]}
+        ),
+    },
+)
+async def verify_app_access_token(
+    client_id: str = Depends(require_api_access),
+) -> AppAccessTokenVerifyResponse:
+    """校验当前 App 授权码。
+
+    流程：复用统一访问门禁确认 Origin 和 Bearer 授权码，校验通过后返回固定 ok。
+    参数：``client_id`` 为鉴权依赖解析出的调用方标识。
+    返回：当前授权码可用状态与调用方标识。
+    异常边界：无效、撤销、过期或缺少 Origin/Bearer 时由统一门禁返回 401。
+    """
+
+    return AppAccessTokenVerifyResponse(ok=True, clientId=client_id)
 
 
 @app.get(
@@ -1268,6 +1357,7 @@ WORKSPACE_DATA_EXAMPLE = {
             "id": "proj_01J00000000000000000000000",
             "name": "AI 工具接口接入",
             "workspacePath": "/Users/demo/Documents/project-a",
+            "basePrompt": "所有任务都优先遵循项目规则。",
             "taskCount": 1,
             "sessionCount": 1,
             "createdAt": "2026-08-11 09:30:00",
@@ -1280,6 +1370,7 @@ WORKSPACE_DATA_EXAMPLE = {
             "projectId": "proj_01J00000000000000000000000",
             "title": "完善 HTTP 接口文档",
             "prompt": "检查现有接口契约，补齐请求示例、响应示例和稳定错误码。",
+            "attachments": [],
             "status": "waiting_acceptance",
             "currentSessionId": "session_01J00000000000000000000000",
             "externalThreadId": "0198f25a-1111-7000-8000-000000000001",
@@ -1407,16 +1498,6 @@ TASK_AGGREGATE_INVARIANT_ERROR_CODES = {
             "action": "项目数据超过首发 200 条不变量；携带 requestId 排查本地任务库，禁止当作空数据。",
         },
         {
-            "code": "TASK_PROJECT_TASK_CAPACITY_INVALID",
-            "retryable": False,
-            "action": "项目任务数据超过 16 条不变量；携带 requestId 排查本地任务库。",
-        },
-        {
-            "code": "TASK_PROJECT_SESSION_CAPACITY_INVALID",
-            "retryable": False,
-            "action": "项目会话数据超过 16 条不变量；携带 requestId 排查本地任务库。",
-        },
-        {
             "code": "TASK_WORKSPACE_SERIALIZATION_FAILED",
             "retryable": False,
             "action": "聚合响应序列化失败；携带 requestId 排查本地任务库和版本。",
@@ -1510,7 +1591,7 @@ PROJECT_DELETE_ERROR_CODES = {
         {
             "code": "TASK_PROJECT_DELETE_FAILED",
             "retryable": False,
-            "action": "仅空项目可删除；有任务或会话历史时必须保留，不提供级联删除。",
+            "action": "确认 projectId 存在且未删除；删除仅标记项目已删除，不级联清理任务或会话历史。",
         }
     ],
     "422": [
@@ -1553,11 +1634,6 @@ TASK_CREATE_ERROR_CODES = {
         },
     ],
     "409": [
-        {
-            "code": "TASK_PROJECT_TASK_LIMIT_REACHED",
-            "retryable": False,
-            "action": "该项目已达到 16 个任务上限；不要重试或创建不可见历史。",
-        },
         {
             "code": "TASK_CREATE_FAILED",
             "retryable": False,
@@ -1659,14 +1735,6 @@ TASK_QUEUE_ERROR_CODES = {
             "code": "TASK_QUEUE_FAILED",
             "retryable": False,
             "action": "刷新聚合数据；只对 created 或 failed 任务由用户再次发起排队，禁止自动重放。",
-        },
-        {
-            "code": "TASK_PROJECT_SESSION_LIMIT_REACHED",
-            "retryable": False,
-            "action": (
-                "项目已有 16 个 session；queue 在同一事务内、任何任务/session/event 写入前同步拒绝，"
-                "保持任务原状态并禁止自动重试。"
-            ),
         },
         {
             "code": "CODEX_SEND_UNCERTAIN",
@@ -2010,14 +2078,18 @@ async def query_task_workspace(
     description="创建并绑定真实工作空间。Rust 校验目录、重复项并在事务提交后返回最新聚合数据。",
     openapi_extra=private_route_openapi(
         PROJECT_CREATE_ERROR_CODES,
-        {"name": "AI 工具接口接入", "workspacePath": "/Users/demo/Documents/project-a"},
+        {
+            "name": "AI 工具接口接入",
+            "workspacePath": "/Users/demo/Documents/project-a",
+            "basePrompt": "所有任务都优先遵循项目规则。",
+        },
     ),
 )
 async def create_project(request: Request, payload: ProjectWriteRequest) -> object:
     """创建绑定真实工作空间的任务项目。
 
     流程：校验名称和路径长度后调用 Rust ``createProject``，等待事务提交并返回聚合快照。
-    参数：``request`` 提供 RPC 上下文；``payload`` 为项目名称和工作空间路径。
+    参数：``request`` 提供 RPC 上下文；``payload`` 为项目名称、工作空间路径和基础提示词。
     返回：创建完成后的完整工作区聚合数据。
     异常边界：路径存在性、重复项和权限由 Rust 最终校验；失败时不生成临时项目。
     """
@@ -2042,6 +2114,7 @@ async def create_project(request: Request, payload: ProjectWriteRequest) -> obje
         {
             "name": "AI 工具接口接入 v2",
             "workspacePath": "/Users/demo/Documents/project-a-v2",
+            "basePrompt": "所有任务都优先遵循项目规则。",
         },
     ),
 )
@@ -2060,7 +2133,7 @@ async def update_project(
     """更新任务项目名称和后续任务工作空间。
 
     流程：把安全路径 projectId 与严格正文合并，调用 Rust ``updateProject`` 原子更新。
-    参数：``request`` 提供 RPC 上下文；``project_id`` 为稳定 ID；``payload`` 为新名称和路径。
+    参数：``request`` 提供 RPC 上下文；``project_id`` 为稳定 ID；``payload`` 为新名称、路径和基础提示词。
     返回：提交完成后的完整工作区聚合数据。
     异常边界：已有会话路径快照不被改写；项目不存在或路径非法时保持原数据。
     """
@@ -2078,8 +2151,8 @@ async def update_project(
     ),
     dependencies=[Depends(require_api_access)],
     tags=["任务管理"],
-    summary="删除空任务项目",
-    description="仅删除没有任务或会话历史的项目；Rust 拒绝级联删除并在事务后返回最新聚合数据。",
+    summary="删除任务项目",
+    description="软删除任务项目；Rust 仅标记项目已删除，不级联清理任务或会话历史，并在事务后返回最新聚合数据。",
     openapi_extra=private_route_openapi(PROJECT_DELETE_ERROR_CODES),
 )
 async def delete_project(
@@ -2088,17 +2161,17 @@ async def delete_project(
         SafeBusinessId,
         Path(
             alias="projectId",
-            description="待删除的空项目稳定 ID。",
+            description="待删除项目稳定 ID。",
             examples=["proj_01J00000000000000000000000"],
         ),
     ],
 ) -> object:
-    """删除没有任务或会话历史的空项目。
+    """软删除任务项目。
 
-    流程：校验 projectId 后调用 Rust ``deleteProject``，由任务库在事务内检查关联记录。
+    流程：校验 projectId 后调用 Rust ``deleteProject``，由任务库在事务内标记项目已删除。
     参数：``request`` 提供 RPC 上下文；``project_id`` 为待删除项目稳定 ID。
     返回：删除提交后的完整工作区聚合数据。
-    异常边界：存在关联记录时返回状态冲突，禁止级联删除任务或会话。
+    异常边界：未知或已删除项目返回状态冲突，禁止级联删除任务或会话。
     """
 
     return await _call_private(request, "deleteProject", {"projectId": project_id})
@@ -2120,6 +2193,7 @@ async def delete_project(
             "projectId": "proj_01J00000000000000000000000",
             "title": "完善 HTTP 接口文档",
             "prompt": "检查现有接口契约，补齐请求示例、响应示例和稳定错误码。",
+            "attachments": [],
         },
     ),
 )
@@ -2148,6 +2222,7 @@ async def create_task(request: Request, payload: TaskCreateRequest) -> object:
         {
             "title": "完善任务管理接口文档",
             "prompt": "补充修改任务和删除任务接口说明，并同步界面操作。",
+            "attachments": [],
         },
     ),
 )
@@ -2220,8 +2295,7 @@ async def delete_task(
         "把 created 或可安全重试的 failed 任务加入执行队列。externalStatus=sendUncertain 的 failed 任务优先返回"
         " 409 CODEX_SEND_UNCERTAIN；即使当前断连也不会降级为 503，且禁止自动重排或重放 prompt。"
         "仅在该预检通过后，未连接才返回 503 CODEX_DESKTOP_NOT_CONNECTED，任务和事件表不会发生变化。"
-        "连接检查通过后，项目已有 16 个 session 时返回 409 TASK_PROJECT_SESSION_LIMIT_REACHED；"
-        "容量检查、任务状态检查与 queue CAS 位于同一事务，"
+        "连接检查通过后，任务状态检查与 queue CAS 位于同一事务，"
         "在任何任务、session 或 event 写入前同步拒绝并保证零写入。"
     ),
     openapi_extra=private_route_openapi(TASK_QUEUE_ERROR_CODES),
@@ -2240,12 +2314,12 @@ async def queue_task(
     """请求真实任务进入桌面业务核心执行队列。
 
     流程：校验 taskId 后调用 Rust ``queueTask``；Rust 先只读检查 ``CODEX_SEND_UNCERTAIN``，再检查 Codex Desktop 连接，
-    最后在同一事务内检查 session 容量和任务状态并执行 queue CAS。
+    最后在同一事务内检查任务状态并执行 queue CAS。
     参数：``request`` 提供 RPC 上下文；``task_id`` 为待排队任务稳定 ID。
     返回：包含最新任务状态的工作区聚合数据。
     异常边界：发送结果不确定优先于断连返回稳定 409；仅预检通过后断连才返回 503；
-    session 达到 16 条、状态冲突或发送结果不确定时均不重放、不乐观更新；
-    session 容量拒绝发生在任何任务/session/event 写入前，事务保证零写入，HTTP 层也不直接启动 Codex 执行器。
+    状态冲突或发送结果不确定时均不重放、不乐观更新；
+    状态拒绝发生在任何任务/session/event 写入前，事务保证零写入，HTTP 层也不直接启动 Codex 执行器。
     """
 
     return await _call_private(request, "queueTask", {"taskId": task_id})

@@ -1,11 +1,13 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const rootDir = normalize(fileURLToPath(new URL("..", import.meta.url)));
 const distDir = join(rootDir, "dist");
 const port = Number(process.env.PORT || 1421);
+const host = process.env.HOST || "0.0.0.0";
 
 const mimeByExt = {
   ".html": "text/html; charset=utf-8",
@@ -26,9 +28,18 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(port, () => {
-  process.stdout.write(`CodexMan 网页预览：http://127.0.0.1:${port}\n`);
+server.listen(port, host, () => {
+  const urls = [`http://127.0.0.1:${port}`, ...listLanUrls(port)];
+  process.stdout.write(`CodexMan 网页预览：\n${urls.map((url) => `  ${url}`).join("\n")}\n`);
 });
+
+/** 获取当前机器可用于局域网访问的 IPv4 地址。 */
+function listLanUrls(currentPort) {
+  return Object.values(networkInterfaces())
+    .flatMap((interfaces) => interfaces || [])
+    .filter((item) => item.family === "IPv4" && !item.internal)
+    .map((item) => `http://${item.address}:${currentPort}`);
+}
 
 /** 提供构建后的前端静态资源。 */
 async function serveStatic(pathname, res) {

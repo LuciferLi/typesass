@@ -106,7 +106,9 @@
     import {
         DefaultShortcutProfile,
         hasShortcutProfileValue,
-        normalizeShortcutProfileValue
+        normalizeKeyboardEvent,
+        normalizeShortcutProfileValue,
+        splitShortcutParts
     } from '@/service/shortcut/shortcutProfile';
     import { readClientJson, writeClientJson } from '@/service/storage/clientJsonStorage';
     import {
@@ -347,77 +349,5 @@
         }
         if (typeof window === 'undefined') return;
         window.localStorage.setItem(StorageKey.shortcuts, JSON.stringify(profile));
-    }
-
-    /**
-     * 把快捷键字符串拆成展示片段。
-     * 流程：按加号拆分后统一修饰键和主键大小写。
-     * 参数：shortcut 为原生侧格式的快捷键字符串。
-     * 返回：用于 Kbd 组件展示的片段列表。
-     * 边界：空值时返回占位文本，避免 UI 空白。
-     */
-    function splitShortcutParts(shortcut: string): string[] {
-        const parts = shortcut
-            .split('+')
-            .map((part) => formatShortcutPart(part))
-            .filter(Boolean);
-        return parts.length ? parts : ['未设置'];
-    }
-
-    /**
-     * 格式化单个快捷键片段。
-     * 流程：修饰键使用常见英文缩写，普通按键首字母大写。
-     * 参数：part 为原始快捷键片段。
-     * 返回：面向用户展示的按键文本。
-     * 边界：未知按键保持原文本，避免误丢信息。
-     */
-    function formatShortcutPart(part: string): string {
-        const normalized = part.trim().toLowerCase();
-        const labelByPart: Record<string, string> = {
-            ctrl: 'Ctrl',
-            control: 'Ctrl',
-            cmd: 'Cmd',
-            meta: 'Cmd',
-            alt: 'Alt',
-            option: 'Alt',
-            shift: 'Shift',
-            space: 'Space'
-        };
-        if (labelByPart[normalized]) return labelByPart[normalized];
-        return normalized ? normalized.slice(0, 1).toUpperCase() + normalized.slice(1) : '';
-    }
-
-    /**
-     * 从键盘事件生成快捷键字符串。
-     * 流程：按 Ctrl/Cmd/Alt/Shift 顺序收集修饰键，再追加主键。
-     * 参数：event 为用户按下组合键的事件。
-     * 返回：原生侧可规范化的快捷键字符串；只有修饰键时返回空字符串。
-     * 边界：不允许把 Ctrl、Shift、Alt、Meta 单独作为主键。
-     */
-    function normalizeKeyboardEvent(event: KeyboardEvent): string {
-        const key = normalizeEventKey(event);
-        if (!key) return '';
-        const parts: string[] = [];
-        if (event.ctrlKey) parts.push('ctrl');
-        if (event.metaKey) parts.push('cmd');
-        if (event.altKey) parts.push('alt');
-        if (event.shiftKey) parts.push('shift');
-        parts.push(key);
-        return parts.join('+');
-    }
-
-    /**
-     * 规范化 KeyboardEvent 主键。
-     * 流程：过滤修饰键，兼容空格、字母和常见符号。
-     * 参数：event 为用户按键事件。
-     * 返回：可用于快捷键配置的主键。
-     * 边界：只按修饰键返回空字符串，避免无效组合。
-     */
-    function normalizeEventKey(event: KeyboardEvent): string {
-        const key = event.key.toLowerCase();
-        if (['control', 'shift', 'alt', 'meta'].includes(key)) return '';
-        if (key === ' ') return 'space';
-        if (key.length === 1) return key;
-        return key.replace(/\s+/g, '');
     }
 </script>

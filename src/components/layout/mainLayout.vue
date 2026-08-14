@@ -219,11 +219,58 @@
             </div>
         </sidebar-inset>
         <codex-connection-dialog />
+        <Dialog
+            :open="approvalDialogVisible"
+            @update:open="handleApprovalDialogOpenChange">
+            <DialogContent class="windowNoDrag sm:max-w-[440px]">
+                <DialogHeader>
+                    <DialogTitle>是否确认授权</DialogTitle>
+                    <DialogDescription>
+                        浏览器插件正在申请 codexMan 授权码。确认后，插件可以读取任务项目并创建浏览器标注任务。
+                    </DialogDescription>
+                </DialogHeader>
+                <div class="grid gap-3 rounded-md border border-border bg-muted/35 p-3 text-[13px] leading-6">
+                    <div class="flex items-center justify-between gap-3">
+                        <span class="text-muted-foreground">申请方</span>
+                        <span class="min-w-0 truncate text-foreground">
+                            {{ accessTokenApprovalRequest?.name || '-' }}
+                        </span>
+                    </div>
+                    <div class="flex items-center justify-between gap-3">
+                        <span class="text-muted-foreground">有效期</span>
+                        <span class="text-foreground">{{ accessTokenApprovalExpiresText }}</span>
+                    </div>
+                    <div class="flex items-center justify-between gap-3">
+                        <span class="text-muted-foreground">请求 ID</span>
+                        <span class="min-w-0 truncate font-mono text-[12px] text-foreground">
+                            {{ accessTokenApprovalRequest?.requestId || '-' }}
+                        </span>
+                    </div>
+                </div>
+                <DialogFooter>
+                    <button
+                        class="inline-flex h-9 items-center justify-center rounded-md border border-input bg-background px-3 text-[13px] font-medium text-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50"
+                        type="button"
+                        :disabled="approvalSubmitting"
+                        @click="handleRespondAccessTokenApproval(false)">
+                        拒绝
+                    </button>
+                    <button
+                        class="inline-flex h-9 items-center justify-center rounded-md bg-primary px-3 text-[13px] font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
+                        type="button"
+                        :disabled="approvalSubmitting"
+                        @click="handleRespondAccessTokenApproval(true)">
+                        确认授权
+                    </button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
     </sidebar-provider>
 </template>
 
 <script setup lang="ts">
     import {
+        Keyboard,
         KeyboardOne,
         LinkBreak,
         List,
@@ -239,6 +286,14 @@
     import brandLogoUrl from '@/assets/codexManLogo.png';
     import CodexConnectionDialog from '@/components/layout/codexConnectionDialog.vue';
     import {
+        Dialog,
+        DialogContent,
+        DialogDescription,
+        DialogFooter,
+        DialogHeader,
+        DialogTitle
+    } from '@/components/ui/dialog';
+    import {
         Sidebar,
         SidebarContent,
         SidebarFooter,
@@ -251,7 +306,13 @@
     } from '@/components/ui/sidebar';
     import { Switch as UiSwitch } from '@/components/ui/switch';
     import { HubRouteName } from '@/router';
-    import { checkPublicApiHealth, isTauriRuntime, listenEvent } from '@/service/tauri/command';
+    import type { PublicApiAccessTokenApprovalEventModel } from '@/service/tauri/command';
+    import {
+        checkPublicApiHealth,
+        isTauriRuntime,
+        listenEvent,
+        respondPublicApiAccessTokenRequest
+    } from '@/service/tauri/command';
     import { useCodexConnectionStore } from '@/stores/codexConnection';
     import { usePermissionStore } from '@/stores/permission';
     import { useSettingsStore } from '@/stores/settings';
@@ -273,11 +334,15 @@
     /** 公共 HTTP 健康检查间隔；30 秒可及时恢复状态，同时避免高频请求淹没业务访问日志。 */
     const PUBLIC_API_HEALTH_INTERVAL_MS = 30_000;
     const clientBridgeHealthy = ref(false);
+    const approvalSubmitting = ref(false);
+    const accessTokenApprovalRequest = ref<PublicApiAccessTokenApprovalEventModel | null>(null);
     let clientBridgeHealthTimer: number | undefined;
+    let unlistenAccessTokenApproval: (() => void) | undefined;
 
     const navItems = [
         { routeName: HubRouteName.VoicePolish, label: '语音转文字润色', icon: Microphone },
         { routeName: HubRouteName.TextPolish, label: '润色', icon: Magic },
+        { routeName: HubRouteName.ShortcutBinding, label: '快捷键绑定', icon: Keyboard },
         { routeName: HubRouteName.SessionManage, label: '会话管理', icon: Terminal },
         { routeName: HubRouteName.TaskManage, label: '任务管理', icon: List },
         { routeName: HubRouteName.Permission, label: '权限管理', icon: Permissions },
@@ -294,6 +359,8 @@
     const clientBridgeHealthTextClass = computed(() =>
         clientBridgeHealthy.value ? 'text-sidebar-foreground' : 'text-sidebar-foreground/45'
     );
+    const approvalDialogVisible = computed(() => accessTokenApprovalRequest.value !== null);
+    const accessTokenApprovalExpiresText = computed(() => accessTokenApprovalRequest.value?.expiresAt || '永久有效');
     /** Codex 连接状态行的实时中文文案。 */
     const codexConnectionText = computed<string>(() => {
         if (codexConnectionStore.connectionState === 'checking') return 'Codex 检测中';
@@ -345,6 +412,7 @@
     const routeNameByHubView = {
         voicePolish: HubRouteName.VoicePolish,
         textPolish: HubRouteName.TextPolish,
+        shortcutBinding: HubRouteName.ShortcutBinding,
         sessionManage: HubRouteName.SessionManage,
         taskManage: HubRouteName.TaskManage,
         permission: HubRouteName.Permission,
@@ -432,6 +500,52 @@
         }, PUBLIC_API_HEALTH_INTERVAL_MS);
     }
 
+    /**
+     * 记录浏览器插件发起的授权申请并打开确认弹窗。
+     * 流程：保存事件载荷，主布局通过 Dialog 展示；若已有申请正在处理，则以后到事件为准刷新弹窗内容。
+     * 参数：payload 为 Rust 通过私有 RPC 转发的授权申请。
+     * 返回：无返回值。
+     * 边界：不在前端生成或保存授权码，确认后仍由后端创建。
+     */
+    function handleAccessTokenApprovalRequested(payload: PublicApiAccessTokenApprovalEventModel): void {
+        accessTokenApprovalRequest.value = payload;
+        approvalSubmitting.value = false;
+    }
+
+    /**
+     * 响应授权确认弹窗。
+     * 流程：读取当前 requestId，调用 Tauri 命令唤醒等待中的 HTTP 请求，然后关闭弹窗。
+     * 参数：approved 表示用户是否同意创建授权码。
+     * 返回：异步完成 Promise。
+     * 边界：命令失败时展示侧栏通知文案并关闭本次弹窗，避免前端状态卡住。
+     */
+    async function handleRespondAccessTokenApproval(approved: boolean): Promise<void> {
+        const request = accessTokenApprovalRequest.value;
+        if (!request || approvalSubmitting.value) return;
+        approvalSubmitting.value = true;
+        try {
+            await respondPublicApiAccessTokenRequest(request.requestId, approved);
+        } catch (error) {
+            permissionStore.message = error instanceof Error ? error.message : '授权确认失败，请重新发起。';
+        } finally {
+            approvalSubmitting.value = false;
+            accessTokenApprovalRequest.value = null;
+        }
+    }
+
+    /**
+     * 处理授权弹窗显隐变化。
+     * 流程：用户点遮罩或 Esc 关闭时按拒绝处理，保证 HTTP 请求不会一直等待。
+     * 参数：open 为 Dialog 新显隐状态。
+     * 返回：无返回值。
+     * 边界：程序主动关闭弹窗时当前申请已清空，不会重复发送拒绝。
+     */
+    function handleApprovalDialogOpenChange(open: boolean): void {
+        if (!open && accessTokenApprovalRequest.value && !approvalSubmitting.value) {
+            void handleRespondAccessTokenApproval(false);
+        }
+    }
+
     onMounted(async () => {
         settingsStore.applyThemeMode(settingsStore.settings.themeMode);
         startClientBridgeHealthPolling();
@@ -450,6 +564,10 @@
             if (mode === 'asr') void voicePolishStore.runVoicePolish('', 'asr');
             if (mode === 'dictate') void voicePolishStore.runVoicePolish('');
         });
+        unlistenAccessTokenApproval = await listenEvent<PublicApiAccessTokenApprovalEventModel>(
+            'public-api-access-token-requested',
+            handleAccessTokenApprovalRequested
+        );
     });
 
     onUnmounted(() => {
@@ -457,6 +575,7 @@
         if (clientBridgeHealthTimer !== undefined) {
             window.clearInterval(clientBridgeHealthTimer);
         }
+        unlistenAccessTokenApproval?.();
     });
 </script>
 

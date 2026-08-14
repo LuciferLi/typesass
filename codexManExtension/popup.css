@@ -18,9 +18,20 @@ body {
 
 .typesass-popup__header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.typesass-popup__logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+}
+
+.typesass-popup__title {
+  flex: 1;
+  min-width: 0;
 }
 
 .typesass-popup__header strong {
@@ -78,6 +89,11 @@ label span,
   font-weight: 600;
 }
 
+.typesass-token-field {
+  position: relative;
+  display: block;
+}
+
 input,
 select {
   width: 100%;
@@ -89,6 +105,10 @@ select {
   background: #09090b;
   outline: none;
   font-size: 12px;
+}
+
+.typesass-token-field input {
+  padding-right: 42px;
 }
 
 input:focus,
@@ -117,6 +137,36 @@ button:hover {
 button:disabled {
   cursor: default;
   opacity: 0.62;
+}
+
+.typesass-icon-button {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  width: 28px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0;
+  color: #a1a1aa;
+  background: transparent;
+  transform: translateY(-50%);
+}
+
+.typesass-icon-button:hover {
+  border-color: transparent;
+  color: #ffffff;
+  background: #27272a;
+}
+
+.typesass-eye-icon {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .typesass-primary {

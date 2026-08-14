@@ -312,18 +312,6 @@ async def test_tc_bridge_004_unavailable_timeout_and_request_limit(
             None,
         ),
         (
-            b'{"ok":false,"error":{"code":"TASK_PROJECT_TASK_CAPACITY_INVALID","message":"bad"}}',
-            500,
-            "TASK_PROJECT_TASK_CAPACITY_INVALID",
-            None,
-        ),
-        (
-            b'{"ok":false,"error":{"code":"TASK_PROJECT_SESSION_CAPACITY_INVALID","message":"bad"}}',
-            500,
-            "TASK_PROJECT_SESSION_CAPACITY_INVALID",
-            None,
-        ),
-        (
             b'{"ok":false,"error":{"code":"TASK_STATE_CONFLICT","message":"conflict"}}',
             409,
             "TASK_STATE_CONFLICT",

@@ -9,6 +9,7 @@ export const HubRouteName = {
     VoicePolish: 'VoicePolish',
     VoicePolishDictionary: 'VoicePolishDictionary',
     TextPolish: 'TextPolish',
+    ShortcutBinding: 'ShortcutBinding',
     SessionManage: 'SessionManage',
     TaskManage: 'TaskManage',
     Permission: 'Permission',
@@ -43,6 +44,12 @@ const hubRoutes: RouteRecordRaw[] = [
         name: HubRouteName.TextPolish,
         component: () => import('@/views/textPolish/index.vue'),
         meta: { title: '润色' }
+    },
+    {
+        path: '/shortcut-binding',
+        name: HubRouteName.ShortcutBinding,
+        component: () => import('@/views/shortcutBinding/index.vue'),
+        meta: { title: '快捷键绑定' }
     },
     {
         path: '/session-manage',

@@ -512,7 +512,7 @@ function createMarker(id) {
   marker.className = "marker";
   marker.dataset.browserCommentMarker = "true";
   marker.dataset.annotationId = String(id);
-  marker.setAttribute("aria-label", `编辑第 ${id} 个 Typesass 浏览器评论`);
+  marker.setAttribute("aria-label", `编辑第 ${id} 个 codexMan 浏览器标注`);
   marker.innerHTML = `
     <svg aria-hidden="true" class="marker-icon" height="25" viewBox="0 0 26 25" width="26">
       <path d="M12.6504 0.824799C6.21496 0.824799 0.825466 5.77554 0.825195 12.0885C0.825245 14.2375 1.46183 16.2421 2.55176 17.943L2.02148 20.235L1.99316 20.3756C1.77603 21.655 2.78945 22.7791 4.02832 22.7691L4.0791 22.8209L4.53418 22.7047L7.12305 22.0426C8.77593 22.8778 10.6577 23.3531 12.6504 23.3531C19.086 23.3531 24.4754 18.4014 24.4756 12.0885C24.4753 5.77554 19.0858 0.824799 12.6504 0.824799Z" fill="#0069FB" stroke="white" stroke-width="1.65"></path>
@@ -537,7 +537,7 @@ function createMarker(id) {
 function updateAnnotationId(annotation, id) {
   annotation.id = id;
   annotation.marker.dataset.annotationId = String(id);
-  annotation.marker.setAttribute("aria-label", `编辑第 ${id} 个 Typesass 浏览器评论`);
+  annotation.marker.setAttribute("aria-label", `编辑第 ${id} 个 codexMan 浏览器标注`);
   const label = annotation.marker.querySelector(".marker-label");
   if (label) {
     label.textContent = String(id);
@@ -908,7 +908,7 @@ function buildBrowserCommentsMarkdown() {
     lines.push(`Target: "${element.text || element.tagName}"`);
     lines.push(`Target selector: ${element.selector}`);
     lines.push(`Target path: ${element.path}`);
-    lines.push(`Saved marker screenshot: attached as a labeled image for Comment ${index + 1}`);
+    lines.push("Saved marker screenshot: pending capture by this extension");
     lines.push("Comment:");
     lines.push(annotation.comment || "");
     lines.push("");
@@ -926,7 +926,7 @@ function sendAnnotations() {
     return;
   }
   closeEditor();
-  showToast("正在创建 Typesass 任务");
+  showToast("正在创建 codexMan 任务");
   void chrome.runtime.sendMessage({
     type: "CODEXMAN_COMMENTS_CONFIRMED",
     payload: {
@@ -956,28 +956,6 @@ function showToast(message) {
       CODEXMAN_STATE.toast = null;
     }
   }, 2600);
-}
-
-/**
- * 在页面上下文触发 HTML 报告下载。
- * @param {string} html 报告 HTML 文本。
- * @param {string} filename 下载文件名。
- * @returns {void}
- */
-function downloadReportHtml(html, filename) {
-  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.style.display = "none";
-  link.dataset.codexmanOverlay = "true";
-  document.documentElement.appendChild(link);
-  link.click();
-  window.setTimeout(() => {
-    link.remove();
-    URL.revokeObjectURL(url);
-  }, 1000);
 }
 
 /**
@@ -1166,13 +1144,13 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "CODEXMAN_START_PICKER") {
     startPicker();
   }
-  if (message?.type === "CODEXMAN_DOWNLOAD_REPORT") {
-    restoreAnnotationDisplay();
-    downloadReportHtml(message.html, message.filename);
-    showToast("任务已创建，Browser comments 报告已保存");
-  }
   if (message?.type === "TYPESASS_TASK_CREATED") {
     showToast(`任务已创建：${message.payload?.title || message.payload?.createdTaskId || ""}`);
+    window.setTimeout(() => {
+      if (CODEXMAN_STATE.active) {
+        cleanupPicker();
+      }
+    }, 900);
   }
   if (message?.type === "CODEXMAN_PREPARE_COMMENT_SCREENSHOT") {
     prepareCommentScreenshot(message.annotationId);

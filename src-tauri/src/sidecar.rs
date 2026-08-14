@@ -233,7 +233,7 @@ impl RuntimeSidecar {
             return Err("sidecar 已由当前 App 生命周期管理，禁止重复启动".to_string());
         }
         let binary_path = resolve_sidecar_binary()?;
-        cleanup_stale_development_sidecar(&binary_path)?;
+        cleanup_stale_sidecar(&binary_path)?;
         ensure_port_available()?;
         let app_data_dir = app
             .path()
@@ -673,17 +673,17 @@ fn sidecar_process_group_exists(process_group_id: i32) -> Result<bool, String> {
     }
 }
 
-/// 清理开发热重载留下的旧 sidecar 监听进程。
-/// 流程：仅 debug + macOS 生效，通过 lsof 找到 18080 监听 PID，确认命令行指向当前项目 sidecar 二进制后结束同进程组。
+/// 清理当前 App 二进制留下的旧 sidecar 监听进程。
+/// 流程：仅 macOS 生效，通过 lsof 找到 18080 监听 PID，确认命令行指向当前 sidecar 二进制后结束同进程组。
 /// 参数：binary_path 为当前启动将使用的 sidecar 二进制；返回清理结果。
-/// 异常/边界：正式包不启用；无法确认进程来源时不终止，交回固定端口检查输出明确错误。
-fn cleanup_stale_development_sidecar(binary_path: &Path) -> Result<(), String> {
-    #[cfg(all(debug_assertions, target_os = "macos"))]
+/// 异常/边界：无法确认进程来源时不终止，交回固定端口检查输出明确错误，避免误杀其它应用。
+fn cleanup_stale_sidecar(binary_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
     {
         let output = Command::new("/usr/sbin/lsof")
             .args(["-nP", "-tiTCP:18080", "-sTCP:LISTEN"])
             .output()
-            .map_err(|error| format!("检查开发 sidecar 端口占用失败：{}", error))?;
+            .map_err(|error| format!("检查 sidecar 端口占用失败：{}", error))?;
         if !output.status.success() || output.stdout.is_empty() {
             return Ok(());
         }
@@ -692,9 +692,9 @@ fn cleanup_stale_development_sidecar(binary_path: &Path) -> Result<(), String> {
             let pid = raw_pid
                 .trim()
                 .parse::<i32>()
-                .map_err(|error| format!("解析开发 sidecar 端口占用 PID 失败：{}", error))?;
-            if development_sidecar_process_matches(pid, binary_path)? {
-                terminate_development_sidecar_process(pid)?;
+                .map_err(|error| format!("解析 sidecar 端口占用 PID 失败：{}", error))?;
+            if stale_sidecar_process_matches(pid, binary_path)? {
+                terminate_stale_sidecar_process(pid)?;
             }
         }
     }
@@ -702,35 +702,42 @@ fn cleanup_stale_development_sidecar(binary_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 判断监听进程是否为当前项目构建出的 sidecar。
-/// 流程：读取 ps 命令行，只接受当前二进制绝对路径或当前 src-tauri/target/debug 下的开发副本。
+/// 判断监听进程是否为当前 App 可清理的 sidecar。
+/// 流程：读取 ps 命令行，只接受当前二进制绝对路径，开发模式额外接受当前 src-tauri/target/debug 下的副本。
 /// 参数：pid 为端口监听进程；binary_path 为当前 sidecar 二进制路径；返回是否允许清理。
 /// 异常/边界：进程已退出时按不匹配处理；命令执行失败不误杀。
-#[cfg(all(debug_assertions, target_os = "macos"))]
-fn development_sidecar_process_matches(pid: i32, binary_path: &Path) -> Result<bool, String> {
+#[cfg(target_os = "macos")]
+fn stale_sidecar_process_matches(pid: i32, binary_path: &Path) -> Result<bool, String> {
     let output = Command::new("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
-        .map_err(|error| format!("读取开发 sidecar 进程命令失败：{}", error))?;
+        .map_err(|error| format!("读取 sidecar 进程命令失败：{}", error))?;
     if !output.status.success() {
         return Ok(false);
     }
     let command_line = String::from_utf8_lossy(&output.stdout);
     let expected_binary = binary_path.to_string_lossy();
-    let expected_debug_copy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join(SIDECAR_BINARY_NAME);
-    Ok(command_line.contains(expected_binary.as_ref())
-        || command_line.contains(expected_debug_copy.to_string_lossy().as_ref()))
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(command_line.contains(expected_binary.as_ref()))
+    }
+    #[cfg(debug_assertions)]
+    {
+        let expected_debug_copy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join(SIDECAR_BINARY_NAME);
+        Ok(command_line.contains(expected_binary.as_ref())
+            || command_line.contains(expected_debug_copy.to_string_lossy().as_ref()))
+    }
 }
 
-/// 终止开发期残留 sidecar。
-/// 流程：优先按进程组发送 SIGTERM，短等待后仍监听则补 SIGKILL；只服务开发热重载清理。
-/// 参数：pid 为已确认属于当前项目 sidecar 的监听进程；返回清理结果。
+/// 终止当前 App 留下的残留 sidecar。
+/// 流程：优先按进程组发送 SIGTERM，短等待后仍监听则补 SIGKILL；只清理已由命令行匹配确认的进程。
+/// 参数：pid 为已确认属于当前 App sidecar 的监听进程；返回清理结果。
 /// 异常/边界：进程自然退出视为成功；清理后端口仍占用则返回错误，让启动阶段停止。
-#[cfg(all(debug_assertions, target_os = "macos"))]
-fn terminate_development_sidecar_process(pid: i32) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+fn terminate_stale_sidecar_process(pid: i32) -> Result<(), String> {
     let process_group_id = unsafe { libc::getpgid(pid) };
     let signal_target = if process_group_id > 0 {
         -process_group_id
@@ -741,7 +748,7 @@ fn terminate_development_sidecar_process(pid: i32) -> Result<(), String> {
     if terminate_result != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!("停止开发 sidecar 残留进程失败：{}", error));
+            return Err(format!("停止 sidecar 残留进程失败：{}", error));
         }
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -755,7 +762,7 @@ fn terminate_development_sidecar_process(pid: i32) -> Result<(), String> {
     if kill_result != 0 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!("强制停止开发 sidecar 残留进程失败：{}", error));
+            return Err(format!("强制停止 sidecar 残留进程失败：{}", error));
         }
     }
     let cleanup_deadline = Instant::now() + Duration::from_secs(2);
@@ -766,7 +773,7 @@ fn terminate_development_sidecar_process(pid: i32) -> Result<(), String> {
         thread::sleep(Duration::from_millis(50));
     }
     Err(format!(
-        "开发 sidecar 残留进程已发送停止信号，但固定端口 {} 仍被占用",
+        "sidecar 残留进程已发送停止信号，但固定端口 {} 仍被占用",
         SIDECAR_PORT
     ))
 }

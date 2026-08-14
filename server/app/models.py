@@ -1,8 +1,9 @@
 """HTTP 请求、响应和统一错误模型。"""
 
+from datetime import datetime, timezone
 from typing import Annotated, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 
 StrictText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -29,6 +30,67 @@ class StrictRequestModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid", str_strip_whitespace=True, populate_by_name=True
     )
+
+
+def normalize_sqlite_utc_timestamp(value: object) -> object:
+    """把 Rust/SQLite 返回的 UTC 时间字符串转换为 ISO 8601 UTC。
+
+    流程：仅处理任务 HTTP 响应中的时间字段；无时区的 ``YYYY-MM-DD HH:MM:SS`` 按 UTC 解析并输出 ``Z`` 后缀，
+    已带 ``Z`` 或时区偏移的 ISO 字符串转换为等价 UTC ``Z`` 格式。
+    参数：``value`` 为 Pydantic 收到的原始字段值。
+    返回：标准 ISO UTC 字符串；非字符串值原样返回，由字段类型继续校验。
+    异常边界：无法识别的历史时间值原样交给响应模型，避免 HTTP 层编造时间或吞掉结构错误。
+    """
+
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    if not normalized:
+        return value
+    parsed: Optional[datetime] = None
+    if normalized.endswith("Z"):
+        with_timezone = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(with_timezone)
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    utc_value = parsed.astimezone(timezone.utc).replace(microsecond=0)
+    return utc_value.isoformat().replace("+00:00", "Z")
+
+
+class WorkspaceTimestampResponseModel(BaseModel):
+    """任务工作区响应时间规范化基类。
+
+    用途：HTTP 对外统一输出带时区的 UTC ISO 字符串，避免前端把 SQLite 无时区字符串按本地时间解析。
+    边界：只处理 createdAt/updatedAt 两个公开响应字段，不改 Rust 存储格式或其它业务字段。
+    """
+
+    @field_validator("created_at", "updated_at", mode="before", check_fields=False)
+    @classmethod
+    def normalize_workspace_timestamp(cls, value: object) -> object:
+        """规范化工作区响应时间字段。
+
+        流程：调用统一 UTC 时间转换函数，保证 ``YYYY-MM-DD HH:MM:SS`` 这类 SQLite UTC 字符串带上 ``Z``。
+        参数：``value`` 为字段原始值。
+        返回：转换后的 UTC ISO 字符串或原始值。
+        异常边界：转换失败时不抛出自定义错误，交由 Pydantic 字段类型保留原响应兼容性。
+        """
+
+        return normalize_sqlite_utc_timestamp(value)
 
 
 class CodexThreadSearchRequest(StrictRequestModel):
@@ -76,7 +138,7 @@ class WorkspaceQueryRequest(StrictRequestModel):
 class ProjectWriteRequest(StrictRequestModel):
     """任务项目创建或更新请求。
 
-    流程：HTTP 只校验展示字段边界；Rust 对真实路径、重复项目和关联状态执行最终校验与事务。
+    流程：HTTP 只校验展示字段边界；Rust 对真实路径、重复项目、基础提示词和关联状态执行最终校验与事务。
     """
 
     name: StrictText = Field(
@@ -87,8 +149,15 @@ class ProjectWriteRequest(StrictRequestModel):
     workspace_path: StrictText = Field(
         alias="workspacePath",
         max_length=4096,
-        description="项目绑定的真实工作空间绝对路径；必须存在且可访问，Rust 会规范化并校验唯一性。",
+        description="项目绑定的真实工作空间绝对路径；必须存在且可访问，Rust 会规范化路径并允许多个项目复用。",
         examples=["/Users/demo/Documents/project-a"],
+    )
+    base_prompt: str = Field(
+        default="",
+        alias="basePrompt",
+        max_length=20_000,
+        description="项目基础提示词；后续任务执行时自动放在任务内容前，为空表示不追加。",
+        examples=["所有回答都优先遵循本项目的 AGENTS.md 和 .codex/rules。"],
     )
 
 
@@ -114,6 +183,12 @@ class TaskCreateRequest(StrictRequestModel):
         description="提交给 CodeX 的完整提示词，最多 50000 个 Unicode 字符；正文不会写入 HTTP 日志。",
         examples=["检查现有接口契约，补齐请求示例、响应示例和稳定错误码。"],
     )
+    attachments: List["TaskAttachmentRequest"] = Field(
+        default_factory=list,
+        max_length=4,
+        description="随任务发送给 CodeX 的图片附件，最多 4 张；附件不会拼入 prompt 文本。",
+        examples=[[]],
+    )
 
 
 class TaskUpdateRequest(StrictRequestModel):
@@ -132,6 +207,60 @@ class TaskUpdateRequest(StrictRequestModel):
         max_length=50_000,
         description="任务新描述或提示词，最多 50000 个 Unicode 字符；正文不会写入 HTTP 日志。",
         examples=["补充修改任务和删除任务接口说明，并同步界面操作。"],
+    )
+    attachments: List["TaskAttachmentRequest"] = Field(
+        default_factory=list,
+        max_length=4,
+        description="随任务发送给 CodeX 的图片附件，最多 4 张；更新任务会整体替换附件列表。",
+        examples=[[]],
+    )
+
+
+class TaskAttachmentRequest(StrictRequestModel):
+    """任务图片附件请求。
+
+    流程：客户端提交 data URL 图片，HTTP 严格校验字段后转交 Rust 保存并在执行时上传给 CodeX。
+    边界：仅作为任务附件处理，不进入 prompt 文本；当前只接受 PNG/JPEG/WebP 图片。
+    """
+
+    id: SafeBusinessId = Field(
+        description="客户端生成的附件稳定 ID，便于前端列表渲染和排障。",
+        examples=["comment-1"],
+    )
+    name: StrictText = Field(
+        max_length=120,
+        description="附件文件名，执行前会由 Rust 再次收敛为安全文件名。",
+        examples=["browser-comment-1.jpg"],
+    )
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"] = Field(
+        alias="mimeType",
+        description="附件媒体类型；当前仅支持图片。",
+        examples=["image/jpeg"],
+    )
+    data_url: StrictText = Field(
+        alias="dataUrl",
+        max_length=200_000,
+        description="图片 data URL；只用于本机任务转发，不写入日志。",
+        examples=["data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD..."],
+    )
+
+
+class TaskAttachmentResponse(BaseModel):
+    """任务图片附件响应。
+
+    流程：Rust 从任务事件中读取附件并返回给前端预览；执行时仍使用同一份 data URL 生成临时文件上传。
+    边界：附件是结构化字段，不要求调用方从 prompt 中解析图片。
+    """
+
+    id: str = Field(description="附件稳定 ID。", examples=["comment-1"])
+    name: str = Field(description="附件文件名。", examples=["browser-comment-1.jpg"])
+    mime_type: Literal["image/png", "image/jpeg", "image/webp"] = Field(
+        alias="mimeType", description="附件媒体类型。", examples=["image/jpeg"]
+    )
+    data_url: str = Field(
+        alias="dataUrl",
+        description="图片 data URL，供前端预览和本机执行上传使用。",
+        examples=["data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD..."],
     )
 
 
@@ -266,11 +395,11 @@ class CodexRestartAcceptedResponse(BaseModel):
     )
 
 
-class ProjectResponse(BaseModel):
+class ProjectResponse(WorkspaceTimestampResponseModel):
     """任务项目响应。
 
     流程：Rust 从真实任务数据库读取项目并聚合任务、会话计数，HTTP 不缓存或重新计算。
-    边界：时间统一为 SQLite UTC ``YYYY-MM-DD HH:MM:SS``，项目列表单次最多返回 200 条。
+    边界：时间由 HTTP 层统一输出为 ISO 8601 UTC ``Z`` 后缀，项目列表单次最多返回 200 条。
     """
 
     id: str = Field(
@@ -282,37 +411,41 @@ class ProjectResponse(BaseModel):
         description="项目当前绑定的规范化绝对工作空间路径。",
         examples=["/Users/demo/Documents/project-a"],
     )
+    base_prompt: str = Field(
+        default="",
+        alias="basePrompt",
+        description="项目基础提示词，任务执行时自动追加在任务内容前。",
+        examples=["所有回答都优先遵循本项目规则。"],
+    )
     task_count: int = Field(
         alias="taskCount",
         ge=0,
-        le=16,
-        description="该项目任务总数，范围 0 到 16。",
+        description="该项目任务总数。",
         examples=[3],
     )
     session_count: int = Field(
         alias="sessionCount",
         ge=0,
-        le=16,
-        description="该项目会话总数，范围 0 到 16。",
+        description="该项目会话总数。",
         examples=[2],
     )
     created_at: str = Field(
         alias="createdAt",
-        description="创建时间，SQLite UTC 格式 YYYY-MM-DD HH:MM:SS。",
-        examples=["2026-08-11 09:30:00"],
+        description="创建时间，ISO 8601 UTC 格式，带 Z 后缀。",
+        examples=["2026-08-11T09:30:00Z"],
     )
     updated_at: str = Field(
         alias="updatedAt",
-        description="最后更新时间，SQLite UTC 格式 YYYY-MM-DD HH:MM:SS。",
-        examples=["2026-08-11 10:15:00"],
+        description="最后更新时间，ISO 8601 UTC 格式，带 Z 后缀。",
+        examples=["2026-08-11T10:15:00Z"],
     )
 
 
-class TaskResponse(BaseModel):
+class TaskResponse(WorkspaceTimestampResponseModel):
     """真实任务记录响应。
 
     流程：Rust 状态机持久化并返回任务全量字段，HTTP 只执行响应 schema 验证。
-    边界：生命周期不得由 HTTP 层推断；每个项目最多保留 16 条任务，第 17 条在写入前拒绝。
+    边界：生命周期不得由 HTTP 层推断；任务列表容量由 Rust 工作区聚合预算和业务查询规则控制。
     """
 
     id: str = Field(
@@ -326,6 +459,12 @@ class TaskResponse(BaseModel):
     title: str = Field(description="任务标题。", examples=["完善 HTTP 接口文档"])
     prompt: str = Field(
         description="任务创建时提交的完整提示词。", examples=["检查并补齐接口契约。"]
+    )
+    attachments: List[TaskAttachmentResponse] = Field(
+        default_factory=list,
+        max_length=4,
+        description="任务图片附件；不会拼入 prompt 文本。",
+        examples=[[]],
     )
     status: Literal[
         "created", "queued", "running", "waiting_acceptance", "completed", "failed"
@@ -362,21 +501,21 @@ class TaskResponse(BaseModel):
     )
     created_at: str = Field(
         alias="createdAt",
-        description="创建时间，SQLite UTC 格式 YYYY-MM-DD HH:MM:SS。",
-        examples=["2026-08-11 09:30:00"],
+        description="创建时间，ISO 8601 UTC 格式，带 Z 后缀。",
+        examples=["2026-08-11T09:30:00Z"],
     )
     updated_at: str = Field(
         alias="updatedAt",
-        description="最后更新时间，SQLite UTC 格式 YYYY-MM-DD HH:MM:SS。",
-        examples=["2026-08-11 10:15:00"],
+        description="最后更新时间，ISO 8601 UTC 格式，带 Z 后缀。",
+        examples=["2026-08-11T10:15:00Z"],
     )
 
 
-class SessionResponse(BaseModel):
+class SessionResponse(WorkspaceTimestampResponseModel):
     """任务关联的 CodeX 会话记录响应。
 
     流程：Rust 在真实执行开始后创建记录，并随任务执行和人工验收更新状态。
-    边界：每个项目最多保留 16 条会话，第 17 条在写入前拒绝；时间统一为 SQLite UTC ``YYYY-MM-DD HH:MM:SS``。
+    边界：会话按真实执行历史保留；时间由 HTTP 层统一输出为 ISO 8601 UTC ``Z`` 后缀。
     """
 
     id: str = Field(
@@ -412,13 +551,13 @@ class SessionResponse(BaseModel):
     )
     created_at: str = Field(
         alias="createdAt",
-        description="创建时间，SQLite UTC 格式 YYYY-MM-DD HH:MM:SS。",
-        examples=["2026-08-11 09:31:00"],
+        description="创建时间，ISO 8601 UTC 格式，带 Z 后缀。",
+        examples=["2026-08-11T09:31:00Z"],
     )
     updated_at: str = Field(
         alias="updatedAt",
-        description="最后更新时间，SQLite UTC 格式 YYYY-MM-DD HH:MM:SS。",
-        examples=["2026-08-11 10:14:00"],
+        description="最后更新时间，ISO 8601 UTC 格式，带 Z 后缀。",
+        examples=["2026-08-11T10:14:00Z"],
     )
 
 
@@ -426,7 +565,7 @@ class WorkspaceDataResponse(BaseModel):
     """任务与会话管理原子聚合响应。
 
     流程：Rust 在同一业务调用中返回项目全集和选中项目的最近任务、会话，避免拆分请求导致状态撕裂。
-    边界：项目最多 200 条，每项目任务和会话各最多 16 条，内部序列化预算为 7 MiB；超限不会截断伪成功。
+    边界：项目最多 200 条，任务和会话按真实执行历史返回，内部序列化预算为 7 MiB；超限不会截断伪成功。
     """
 
     projects: List[ProjectResponse] = Field(
@@ -435,13 +574,11 @@ class WorkspaceDataResponse(BaseModel):
         examples=[[]],
     )
     tasks: List[TaskResponse] = Field(
-        max_length=16,
-        description="选中或默认项目的全部任务，最多 16 条；没有项目或任务时为空数组。",
+        description="选中或默认项目的全部任务；没有项目或任务时为空数组。",
         examples=[[]],
     )
     sessions: List[SessionResponse] = Field(
-        max_length=16,
-        description="选中或默认项目的全部会话，最多 16 条；没有项目或会话时为空数组。",
+        description="选中或默认项目的全部会话；没有项目或会话时为空数组。",
         examples=[[]],
     )
 
@@ -663,6 +800,44 @@ class AppAccessTokenWriteRequest(StrictRequestModel):
     )
 
 
+class AppAccessTokenApprovalRequest(BaseModel):
+    """App 授权确认请求。
+
+    用途：HTTP sidecar 将浏览器插件的授权申请转交给桌面 App，由 App 用户确认是否创建授权码。
+    流程：服务端生成 requestId 后只传递展示名称和有效期；确认结果由桌面端同步返回，不在 HTTP 层保存 pending。
+    边界：本模型不包含明文授权码，拒绝或超时时不会创建任何授权码记录。
+    """
+
+    request_id: str = Field(
+        alias="requestId",
+        description="本次公开 HTTP 请求 ID，供 App 弹窗、插件提示和日志排查对齐。",
+        examples=["client-request-1"],
+    )
+    name: str = Field(description="申请方展示名称。", examples=["codexMan"])
+    expires_at: Optional[str] = Field(
+        default=None,
+        alias="expiresAt",
+        description="申请方希望的授权码过期时间；null 表示永久有效。",
+        examples=[None],
+    )
+
+
+class AppAccessTokenApprovalResponse(BaseModel):
+    """App 授权确认响应。
+
+    用途：承载桌面 App 用户对授权申请的确认结论。
+    流程：approved 为 true 时 HTTP sidecar 才创建授权码；false 时接口返回 rejected。
+    边界：响应只包含确认状态和可选说明，不包含 token 或桌面内部状态。
+    """
+
+    approved: bool = Field(description="用户是否确认授权。", examples=[True])
+    message: Optional[str] = Field(
+        default=None,
+        description="拒绝、超时或界面不可用时的安全说明。",
+        examples=["用户已拒绝授权。"],
+    )
+
+
 class AppAccessTokenResponse(BaseModel):
     """App 授权码响应。
 
@@ -695,11 +870,27 @@ class AppAccessTokenResponse(BaseModel):
     )
 
 
+class AppAccessTokenVerifyResponse(BaseModel):
+    """App 授权码校验响应。
+
+    用途：供浏览器插件和系统设置页在不读取明文授权码列表的情况下确认当前授权码是否可用。
+    流程：鉴权依赖先校验 Bearer 授权码，路由只返回固定可用状态和已识别调用方。
+    边界：无效、过期或撤销授权码不会进入本模型，而是返回统一 401 错误。
+    """
+
+    ok: Literal[True] = Field(description="固定为 true，表示当前授权码可用。", examples=[True])
+    client_id: str = Field(
+        alias="clientId",
+        description="鉴权通过后的调用方标识；用于排障，不包含明文授权码。",
+        examples=["token_abc"],
+    )
+
+
 class AccessTokenRequestResponse(BaseModel):
     """请求授权码响应。
 
     用途：没有授权码的客户端在 App 用户确认后直接拿到授权码。
-    流程：不创建 pending 记录，确认时立即创建授权码并返回 approved。
+    流程：HTTP sidecar 先请求桌面 App 弹窗确认，确认通过时立即创建授权码并返回 approved。
     边界：拒绝时返回 rejected 且不包含 token。
     """
 

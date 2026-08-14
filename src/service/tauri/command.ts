@@ -23,6 +23,7 @@ import type {
     UpdateSessionProjectRequestModel,
     UpdateSessionTaskRequestModel
 } from '@/model/sessionManage';
+import type { ApplicationOptionModel } from '@/model/shortcutBinding';
 import type { PasteResponseModel, SelectedTextResponseModel } from '@/model/textPolish';
 import type {
     ProcessTextRequestModel,
@@ -126,15 +127,48 @@ interface PublicApiAccessTokenRequestModel {
     /** 授权结果状态。 */
     status: 'approved' | 'rejected';
     /** 用户确认后返回的明文 App 授权码。 */
-    accessToken: string;
+    accessToken: string | null;
     /** 授权码过期时间；永久有效时为空。 */
     expiresAt: string | null;
+}
+
+/** App 授权码状态，供系统设置页展示授权码生命周期。 */
+export type PublicApiAccessTokenStatus = 'active' | 'expired' | 'revoked';
+
+/** App 授权码记录，包含系统设置页可长期查看和复制的明文授权码。 */
+export interface PublicApiAccessTokenModel {
+    /** 授权码稳定 ID，用于撤销操作。 */
+    id: string;
+    /** 授权码名称，用于区分调用方。 */
+    name: string;
+    /** 明文授权码，系统设置页可复制和查看。 */
+    token: string;
+    /** 授权码到期时间；永久有效时为空。 */
+    expiresAt: string | null;
+    /** 授权码当前状态。 */
+    status: PublicApiAccessTokenStatus;
+    /** 授权码创建时间。 */
+    createdAt: string;
+    /** 授权码撤销时间；未撤销时为空。 */
+    revokedAt: string | null;
+    /** 授权码最近一次通过业务接口鉴权的时间。 */
+    lastUsedAt: string | null;
 }
 
 /** 浏览器插件 ZIP 下载响应。 */
 export interface BrowserExtensionDownloadModel {
     /** ZIP 文件最终保存到本机的绝对路径。 */
     filePath: string;
+}
+
+/** App 授权确认弹窗事件。 */
+export interface PublicApiAccessTokenApprovalEventModel {
+    /** 本次 HTTP 请求追踪 ID，确认时需要原样带回。 */
+    requestId: string;
+    /** 申请方展示名称。 */
+    name: string;
+    /** 授权码过期时间；永久有效时为空。 */
+    expiresAt: string | null;
 }
 
 /** 浏览器设备码授权启动响应。 */
@@ -196,6 +230,17 @@ export async function setPublicApiToken(token: string): Promise<void> {
  */
 export async function downloadBrowserExtensionZip(): Promise<BrowserExtensionDownloadModel> {
     return invokeDesktop<BrowserExtensionDownloadModel>('download_browser_extension_zip');
+}
+
+/**
+ * 响应 App 授权码申请。
+ * 流程：Hub 主窗口弹出确认框后把 requestId 与用户选择交回 Rust，Rust 再唤醒等待中的 HTTP 请求。
+ * 参数：requestId 为授权申请事件 ID，approved 表示是否同意创建授权码。
+ * 返回：无返回值。
+ * 异常：申请已过期、窗口无权限或桌面状态异常时抛出错误。
+ */
+export async function respondPublicApiAccessTokenRequest(requestId: string, approved: boolean): Promise<void> {
+    await invokeDesktop<void>('respond_public_api_access_token_request', { requestId, approved });
 }
 
 /**
@@ -469,6 +514,52 @@ export async function requestPublicApiAccessToken(
 }
 
 /**
+ * 手动创建 App 授权码。
+ * 流程：调用系统设置页专用授权码创建接口，成功后返回包含明文 token 的完整记录。
+ * 参数：name 为授权码名称，expiresAt 为可选到期时间。
+ * 返回：可在系统设置页展示的授权码记录。
+ * 异常：鉴权失败、字段校验失败或授权码存储不可用时抛出带 requestId 的错误。
+ */
+export async function createPublicApiAccessToken(
+    name: string,
+    expiresAt: string | null
+): Promise<PublicApiAccessTokenModel> {
+    return requestPublicApi<PublicApiAccessTokenModel>('/v1/access-tokens', {
+        method: 'POST',
+        payload: { name, expiresAt },
+        timeoutMs: PUBLIC_API_TIMEOUT_MS
+    });
+}
+
+/**
+ * 查询 App 授权码列表。
+ * 流程：读取系统设置页授权码管理接口，返回所有明文授权码及当前状态。
+ * 参数：无。
+ * 返回：按服务端创建时间倒序排列的授权码列表。
+ * 异常：鉴权失败或授权码存储不可用时抛出带 requestId 的错误。
+ */
+export async function listPublicApiAccessTokens(): Promise<PublicApiAccessTokenModel[]> {
+    return requestPublicApi<PublicApiAccessTokenModel[]>('/v1/access-tokens', {
+        method: 'GET',
+        timeoutMs: PUBLIC_API_TIMEOUT_MS
+    });
+}
+
+/**
+ * 撤销 App 授权码。
+ * 流程：按授权码稳定 ID 调用撤销接口，服务端保留历史记录并返回撤销后的状态。
+ * 参数：tokenId 为授权码稳定 ID。
+ * 返回：撤销后的授权码记录。
+ * 异常：未知授权码、鉴权失败或授权码存储不可用时抛出带 requestId 的错误。
+ */
+export async function revokePublicApiAccessToken(tokenId: string): Promise<PublicApiAccessTokenModel> {
+    return requestPublicApi<PublicApiAccessTokenModel>(`/v1/access-tokens/${encodeURIComponent(tokenId)}/revoke`, {
+        method: 'POST',
+        timeoutMs: PUBLIC_API_TIMEOUT_MS
+    });
+}
+
+/**
  * 检查公共 HTTP 服务健康状态。
  * 流程：读取独立 FastAPI `/health`，只校验服务标识和健康状态。
  * 参数：无。
@@ -568,6 +659,17 @@ export async function registerShortcuts(shortcuts: ShortcutProfileModel): Promis
  */
 export async function suspendShortcutsForRecording(): Promise<void> {
     await invokeDesktop<void>('suspend_shortcuts_for_recording');
+}
+
+/**
+ * 读取本机可打开的应用列表。
+ * 流程：通过 Tauri IPC 扫描 macOS 常见应用目录，并返回按名称排序的 .app 列表。
+ * 参数：无。
+ * 返回：可用于快捷键绑定选择的应用选项。
+ * 异常：普通 Web 或系统扫描失败时透传 IPC 错误。
+ */
+export async function listInstalledApplications(): Promise<ApplicationOptionModel[]> {
+    return invokeDesktop<ApplicationOptionModel[]>('list_installed_applications');
 }
 
 /**
@@ -811,8 +913,8 @@ export async function loadSessionWorkspaceData(projectId?: string): Promise<Sess
 
 /**
  * 创建真实任务项目。
- * 流程：把项目名称和工作空间提交给 HTTP，Rust 事务落盘后返回最新聚合数据。
- * 参数：request 为项目展示名称与真实工作空间路径。
+ * 流程：把项目名称、工作空间和项目基础提示词提交给 HTTP，Rust 事务落盘后返回最新聚合数据。
+ * 参数：request 为项目展示名称、真实工作空间路径和任务执行基础提示词。
  * 返回：HTTP 服务确认的项目、任务和会话聚合数据。
  * 异常：路径无效、项目重复或任务库写入失败时透传稳定错误码和 requestId。
  */
@@ -824,7 +926,7 @@ export async function createSessionProject(
 
 /**
  * 编辑真实任务项目。
- * 流程：把稳定 ID、名称和后续工作空间提交给 HTTP，在 Rust 事务确认后返回聚合数据。
+ * 流程：把稳定 ID、名称、后续工作空间和项目基础提示词提交给 HTTP，在 Rust 事务确认后返回聚合数据。
  * 参数：request 为完整项目编辑字段。
  * 返回：HTTP 服务确认的项目、任务和会话聚合数据。
  * 异常：项目不存在、路径非法或事务失败时透传，不修改前端列表。
@@ -834,16 +936,16 @@ export async function updateSessionProject(
 ): Promise<SessionWorkspaceDataModel> {
     return requestPublicApi<SessionWorkspaceDataModel>(`/v1/projects/${encodeURIComponent(request.id)}/update`, {
         method: 'POST',
-        payload: { name: request.name, workspacePath: request.workspacePath }
+        payload: { name: request.name, workspacePath: request.workspacePath, basePrompt: request.basePrompt }
     });
 }
 
 /**
- * 删除没有任务或会话历史的项目。
- * 流程：只通过 HTTP 路径发送项目稳定 ID，由 Rust 事务校验关联记录并删除空项目。
+ * 软删除任务项目。
+ * 流程：只通过 HTTP 路径发送项目稳定 ID，由 Rust 事务标记项目已删除并刷新当前聚合。
  * 参数：projectId 为待删除项目 ID。
  * 返回：HTTP 服务确认删除后的聚合数据。
- * 异常：项目含任务/会话、不存在或事务失败时透传，绝不级联删除业务记录。
+ * 异常：项目不存在、已删除或事务失败时透传，绝不级联删除任务和会话历史。
  */
 export async function deleteSessionProject(projectId: string): Promise<SessionWorkspaceDataModel> {
     return requestPublicApi<SessionWorkspaceDataModel>(`/v1/projects/${encodeURIComponent(projectId)}/delete`, {

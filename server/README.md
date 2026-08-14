@@ -30,7 +30,7 @@ HTTP 服务不按浏览器 `Origin` 做 CORS 拦截，CORS 预检允许任意来
 ## 鉴权流程
 
 1. App 系统设置维护明文授权码，支持创建、查询和撤销；授权码可长期查看，不做只展示一次。
-2. `/health` 和 `POST /v1/access-tokens/request` 不需要授权码；申请接口不保存 pending，当前版本在用户确认创建时直接返回授权码。
+2. `/health` 和 `POST /v1/access-tokens/request` 不需要授权码；申请接口会通知桌面 App 弹出“是否确认授权”弹窗，用户确认后才创建并返回授权码，拒绝或超时不会创建授权码。
 3. 业务接口必须带 `Origin`。`localhost`、`127.0.0.1`、`::1`、私有网段 IP 和 `tauri.localhost` 视为内网来源，可免授权码；其它公网 IP 或域名必须携带 `Authorization: Bearer <App 授权码>`。
 4. 授权码不做 scope、refresh token、短期 session token 或 Basic 换 token。撤销或过期后再次访问业务接口统一返回 `401 UNAUTHORIZED`。
 5. 开发环境可启用固定授权码，使用 `AITOOL_ENABLE_DEV_BEARER_TOKEN=1` 和 `AITOOL_DEV_ACCESS_TOKEN=<至少 32 字符>`；该固定授权码不写入授权码列表，生产环境不得启用。
@@ -43,6 +43,8 @@ curl -X POST 'http://127.0.0.1:18080/v1/access-tokens/request' \
   -H 'X-Request-ID: partner-auth-001' \
   -d '{"name":"Chrome 插件","expiresAt":null}'
 ```
+
+执行该命令后，CodexMan 桌面 App 会弹出确认授权窗口；只有点击“确认授权”才会生成授权码。
 
 成功返回：
 
@@ -264,7 +266,7 @@ done
 [ "$STATUS" = 'waiting_acceptance' ] || { echo 'poll timeout'; exit 1; }
 ```
 
-轮询可能观察到 `queued -> running -> waiting_acceptance`；执行失败则进入终态 `failed`，此时先展示 `lastError` 和 requestId，再判断是否允许用户采取后续操作，绝不能看到 `failed` 就自动 queue。项目已有 16 个 session 时，queue 在同一个写事务内、任何任务状态/事件/session 写入前同步返回 `409 TASK_PROJECT_SESSION_LIMIT_REACHED`、`retryable=false`；事务零写入，任务保持原来的 `created` 或 `failed` 状态，不会先进入 queued，也不会生成第 17 个 session。只有 `waiting_acceptance` 允许调用 complete；`created/queued/running/completed/failed` 调用 complete 都会失败，不得通过重试绕过状态机。
+轮询可能观察到 `queued -> running -> waiting_acceptance`；执行失败则进入终态 `failed`，此时先展示 `lastError` 和 requestId，再判断是否允许用户采取后续操作，绝不能看到 `failed` 就自动 queue。queue 的状态检查和状态变更在同一个写事务内完成；状态不允许时，任何任务状态/事件/session 写入前同步返回 `409 TASK_STATE_CONFLICT`、`retryable=false`，任务保持原来的 `created` 或 `failed` 状态。只有 `waiting_acceptance` 允许调用 complete；`created/queued/running/completed/failed` 调用 complete 都会失败，不得通过重试绕过状态机。
 
 queue 的两个连接相关错误必须单独处理：
 
@@ -279,15 +281,15 @@ curl -X POST "$BASE_URL/v1/tasks/$TASK_ID/complete" \
   -H 'X-Request-ID: partner-task-complete-001'
 ```
 
-5. 删除项目只允许空项目。已有任务或会话历史的上述项目不能删除，也不提供级联删除、软删除或历史兼容分支。需要验证删除流程时应单独创建一个空项目，再使用服务返回的 ID 删除。
+5. 删除项目为软删除，只在本机数据库中标记项目已删除；已有任务或会话历史不会级联删除，也不会阻止删除。删除后该项目不再出现在当前项目列表中，不能继续作为新建任务目标。
 
 ```bash
 EMPTY_PROJECT_RESPONSE="$(curl -fsS -X POST "$BASE_URL/v1/projects" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -H 'X-Request-ID: partner-empty-project-create-001' \
-  -d '{"name":"待删除空项目","workspacePath":"/Users/demo/Documents/empty-project"}')"
-EMPTY_PROJECT_ID="$(printf '%s' "$EMPTY_PROJECT_RESPONSE" | jq -r '.projects[] | select(.name == "待删除空项目") | .id')"
+  -d '{"name":"待删除项目","workspacePath":"/Users/demo/Documents/deleted-project"}')"
+EMPTY_PROJECT_ID="$(printf '%s' "$EMPTY_PROJECT_RESPONSE" | jq -r '.projects[] | select(.name == "待删除项目") | .id')"
 
 curl -X POST "$BASE_URL/v1/projects/$EMPTY_PROJECT_ID/delete" \
   -H "Authorization: Bearer $TOKEN" \
@@ -300,7 +302,7 @@ curl -X POST "$BASE_URL/v1/projects/$EMPTY_PROJECT_ID/delete" \
 - 创建项目、更新项目、删除项目、创建任务、queue、complete 都不是幂等接口，HTTP 服务不会替调用方自动重试。写操作遇到 503/504 或连接中断时，先用聚合查询核对项目/任务真实状态，再决定是否发起新的用户操作，禁止原样盲目重放。
 - `RPC_BUSY` 表示本机业务服务过载，返回 503 且可退避；它不是业务状态冲突。聚合业务 JSON 的公开容量预算为 7 MiB。
 - 显式未知 `projectId/taskId/threadId` 从不回退到默认或首条资源。项目和任务操作先刷新 `/v1/task-workspace/query`；CodeX 操作先刷新工作空间和 thread 搜索结果。
-- 最多创建并返回 200 个项目；每个项目最多保留 16 个任务和 16 个 session。第 17 个任务由创建接口同步返回 `TASK_PROJECT_TASK_LIMIT_REACHED`；可能产生第 17 个 session 的 queue 由事务同步返回 `TASK_PROJECT_SESSION_LIMIT_REACHED`，并保证任务状态、事件、session 零写入。两者都不会静默截断成看似成功。项目总量达到 200 时创建返回 `TASK_PROJECT_LIMIT_REACHED`。
+- 最多创建并返回 200 个项目；每个项目最多保留 16 个任务，session 历史不再按条数设上限，但仍受聚合业务 JSON 7 MiB 预算保护。第 17 个任务由创建接口同步返回 `TASK_PROJECT_TASK_LIMIT_REACHED`，不会静默截断成看似成功。项目总量达到 200 时创建返回 `TASK_PROJECT_LIMIT_REACHED`。
 - CodeX thread 搜索每页最多 60 条；会话扫描最多检查最近 180 个文件，索引最多 500 项，目录枚举最多 1024 个目录/500 个文件，精确查找最多 4096 个条目。单会话文件最大 64 MiB、单次总扫描最大 512 MiB、会话索引最大 8 MiB；触发容量错误时不会返回伪造空结果。
 - v1 没有取消任务、SSE、会话详情、删除历史任务或批量操作 API。第三方不得在客户端伪造这些入口，也不得通过 Tauri command、私有 socket、SQLite 文件或客户端直连 CodeX 绕过 HTTP 服务。
 

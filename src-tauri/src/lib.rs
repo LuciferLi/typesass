@@ -7,6 +7,7 @@ mod private_models;
 mod private_rpc;
 mod sidecar;
 mod task_store;
+mod web_server;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -31,6 +32,7 @@ use task_store::{
     CreateProjectRequest, CreateTaskRequest, CreateTaskResponse, RunningTaskRecord,
     UpdateProjectRequest, WorkspaceDataResponse,
 };
+use web_server::RuntimeWebServer;
 
 #[cfg(target_os = "macos")]
 use objc2::rc::{autoreleasepool, Retained};
@@ -63,6 +65,8 @@ const PASTE_TARGET_REFOCUS_DELAY_MS: u64 = 160;
 const PASTE_FOCUS_RETRY_COUNT: usize = 4;
 const PASTE_FOCUS_RETRY_DELAY_MS: u64 = 75;
 const LOCAL_CONFIG_FILE_NAME: &str = "codexman-config.json";
+/// 系统设置分区 key；必须与前端 `StorageKey.settings` 保持一致。
+const LOCAL_CONFIG_SETTINGS_KEY: &str = "codexman.settings.v1";
 /// 首发客户端配置格式版本；未知版本必须拒绝，禁止静默兼容历史结构。
 const LOCAL_CONFIG_VERSION: u32 = 1;
 const LOCAL_CONFIG_WATCH_INTERVAL_MS: u64 = 500;
@@ -117,8 +121,14 @@ const CODEX_AMBIGUOUS_THREAD_TURNS_ERROR: &str =
     "Codex 任务专用 thread 出现多个 turn，无法可靠恢复 turnId";
 /// app-server 普通 JSON-RPC 请求最大等待时间。
 const CODEX_APP_SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
-/// 单 worker 任务调度器空闲或等待已有 running 任务时的轮询间隔。
+/// 任务调度器空闲或等待可用并发槽位时的轮询间隔。
 const CODEX_TASK_DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// Codex 任务默认并发数，允许多个已提交任务同时等待终态，但避免首次启动时一次性压垮 Desktop 和本机资源。
+const CODEX_TASK_DEFAULT_CONCURRENT_RUNNING: usize = 3;
+/// Codex 任务最小并发数；设置页非法值会回落默认值，调度器仍以该值兜底防止 0 并发。
+const CODEX_TASK_MIN_CONCURRENT_RUNNING: usize = 1;
+/// Codex 任务最大并发数；限制用户配置上限，避免一次性打开过多任务导致 Desktop 或本机资源不可控。
+const CODEX_TASK_MAX_CONCURRENT_RUNNING: usize = 10;
 /// Enter 后等待 Codex session JSONL 持久化并恢复唯一 thread 的最长时间。
 const CODEX_CDP_THREAD_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// CDP thread 恢复轮询间隔，避免高频扫描本地 session 文件。
@@ -128,6 +138,7 @@ const PUBLIC_API_TOKEN_IPC_ERROR_CODE: &str = "DESKTOP_OPERATION_FAILED";
 const BROWSER_EXTENSION_ZIP_BYTES: &[u8] =
     include_bytes!("../../public/downloads/typesass-extension.zip");
 const BROWSER_EXTENSION_ZIP_FILE_NAME: &str = "typesass-extension.zip";
+const ACCESS_TOKEN_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 浏览器插件 ZIP 下载结果。
 #[derive(Debug, Serialize)]
@@ -135,6 +146,53 @@ const BROWSER_EXTENSION_ZIP_FILE_NAME: &str = "typesass-extension.zip";
 struct BrowserExtensionDownloadResponse {
     /// ZIP 文件最终保存到本机的绝对路径。
     file_path: String,
+}
+
+/// 本机可打开的应用选项。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplicationOption {
+    /// 应用展示名称，通常取自 .app bundle 文件名。
+    name: String,
+    /// 应用 bundle 的绝对路径，用于通过 open 命令精确打开。
+    path: String,
+}
+
+/// 浏览器插件发起的 App 授权确认事件。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessTokenApprovalEvent {
+    /// 本次 HTTP 请求追踪 ID，前端确认时原样带回。
+    request_id: String,
+    /// 申请方展示名称。
+    name: String,
+    /// 授权码到期时间；空值表示永久有效。
+    expires_at: Option<String>,
+}
+
+/// 前端确认授权后返回给 HTTP sidecar 的结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessTokenApprovalResponse {
+    /// 用户是否确认授权。
+    approved: bool,
+    /// 拒绝、超时或界面不可用时的安全说明。
+    message: Option<String>,
+}
+
+/// 待用户确认的授权申请。
+struct PendingAccessTokenApproval {
+    /// 本次申请展示给前端的结构化事件。
+    event: AccessTokenApprovalEvent,
+    /// 等待确认的同步响应通道，只能消费一次。
+    responder: mpsc::Sender<AccessTokenApprovalResponse>,
+}
+
+/// 运行期间保存当前唯一一条 App 授权确认请求。
+#[derive(Default)]
+struct RuntimeAccessTokenApproval {
+    /// 当前待确认申请；避免多个插件请求同时弹出多个授权框。
+    pending: Mutex<Option<PendingAccessTokenApproval>>,
 }
 
 /// 运行期间保存的全局快捷键映射。
@@ -519,6 +577,118 @@ fn ensure_sensitive_management_window(window_label: &str) -> Result<(), String> 
     }
 }
 
+/// 请求 Hub 主窗口确认是否允许创建 App 授权码。
+/// 流程：私有 RPC worker 创建一次性 pending 通道，投递前端事件后等待用户确认、拒绝或超时。
+/// 参数：app 为桌面端上下文，name/expires_at 为插件申请展示信息。
+/// 返回：approved 表示用户确认，false 表示拒绝、超时或窗口不可用。
+/// 异常/边界：同一时间只允许一个 pending，避免连续点击生成多条长期授权码。
+pub(crate) fn request_access_token_approval_core(
+    app: &AppHandle,
+    request_id: String,
+    name: String,
+    expires_at: Option<String>,
+) -> Result<AccessTokenApprovalResponse, String> {
+    let event = AccessTokenApprovalEvent {
+        request_id,
+        name,
+        expires_at,
+    };
+    let (sender, receiver) = mpsc::channel::<AccessTokenApprovalResponse>();
+    {
+        let approval_state = app.state::<RuntimeAccessTokenApproval>();
+        let mut pending = approval_state
+            .pending
+            .lock()
+            .map_err(|_| "授权确认状态不可用".to_string())?;
+        if pending.is_some() {
+            return Ok(AccessTokenApprovalResponse {
+                approved: false,
+                message: Some("已有一条授权申请正在等待确认。".to_string()),
+            });
+        }
+        *pending = Some(PendingAccessTokenApproval {
+            event: event.clone(),
+            responder: sender,
+        });
+    }
+    let emit_result = app.emit_to("hub", "public-api-access-token-requested", event.clone());
+    if emit_result.is_err() {
+        let _ = take_pending_access_token_approval(app, &event.request_id);
+        return Ok(AccessTokenApprovalResponse {
+            approved: false,
+            message: Some("未找到可确认授权的主窗口。".to_string()),
+        });
+    }
+    match receiver.recv_timeout(ACCESS_TOKEN_APPROVAL_TIMEOUT) {
+        Ok(response) => Ok(response),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = take_pending_access_token_approval(app, &event.request_id);
+            Ok(AccessTokenApprovalResponse {
+                approved: false,
+                message: Some("授权确认已超时。".to_string()),
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(AccessTokenApprovalResponse {
+            approved: false,
+            message: Some("授权确认通道已关闭。".to_string()),
+        }),
+    }
+}
+
+/// 取走指定 requestId 的 pending 授权申请。
+/// 流程：在同一把锁内校验 requestId，匹配时移除并返回 pending；不匹配时保持原状态。
+/// 参数：app 为桌面端上下文，request_id 为前端或超时路径传回的申请 ID。
+/// 返回：匹配到的 pending；无匹配时返回 None。
+/// 异常/边界：状态锁损坏时返回 None，调用方按拒绝或无效请求处理。
+fn take_pending_access_token_approval(
+    app: &AppHandle,
+    request_id: &str,
+) -> Option<PendingAccessTokenApproval> {
+    let approval_state = app.state::<RuntimeAccessTokenApproval>();
+    let mut pending = approval_state.pending.lock().ok()?;
+    let should_take = pending
+        .as_ref()
+        .is_some_and(|approval| approval.event.request_id == request_id);
+    if should_take {
+        pending.take()
+    } else {
+        None
+    }
+}
+
+/// 响应当前 App 授权码申请。
+/// 流程：仅允许 Hub 主窗口调用，按 requestId 取走 pending 并把确认结果发送给等待中的 HTTP 请求。
+/// 参数：window 用于校验调用窗口，request_id 为授权申请 ID，approved 为用户确认结论。
+/// 返回：发送成功时无返回。
+/// 异常/边界：未知或已超时的 requestId 返回稳定错误，不会创建授权码。
+#[tauri::command]
+fn respond_public_api_access_token_request(
+    window: tauri::WebviewWindow,
+    request_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    if window.label() != "hub" {
+        return Err(
+            "当前窗口无权确认 App 授权（错误码：ACCESS_TOKEN_APPROVAL_FORBIDDEN）".to_string(),
+        );
+    }
+    let app = window.app_handle().clone();
+    let Some(pending) = take_pending_access_token_approval(&app, &request_id) else {
+        return Err("授权申请已失效，请重新发起。".to_string());
+    };
+    pending
+        .responder
+        .send(AccessTokenApprovalResponse {
+            approved,
+            message: if approved {
+                None
+            } else {
+                Some("用户已拒绝授权。".to_string())
+            },
+        })
+        .map_err(|_| "授权申请等待通道已关闭，请重新发起。".to_string())
+}
+
 /// 通过桌面端进程内批准方凭据批准浏览器设备码。
 /// 流程：先限制为 hub 窗口，再把阻塞式本机 HTTP 批准放入后台线程；后台从 App 状态读取本次临时 Basic 凭据。
 /// 参数：window 用于窗口权限和取得 AppHandle，user_code 为浏览器展示码；返回不含凭据的批准说明。
@@ -563,7 +733,7 @@ pub(crate) fn load_session_workspace_data_core(
 /// 创建任务项目的共享业务入口。
 /// 流程：由私有 UDS RPC 把请求交给唯一 TaskStore 完成目录校验和事务写入，失败时记录脱敏诊断。
 /// 参数：app 定位同一份业务库，request 包含名称和工作空间；返回创建后工作区聚合。
-/// 异常/边界：目录不可访问、名称或路径冲突时整笔失败，不记录用户任务正文。
+/// 异常/边界：目录不可访问或名称冲突时整笔失败；同一工作目录允许绑定多个任务项目，不记录用户任务正文。
 pub(crate) fn create_session_project_core(
     app: &AppHandle,
     request: CreateProjectRequest,
@@ -582,7 +752,7 @@ pub(crate) fn create_session_project_core(
 /// 更新任务项目的共享业务入口。
 /// 流程：保留项目 ID 作为脱敏诊断上下文，再由唯一 TaskStore 事务更新名称和后续工作空间。
 /// 参数：app 定位同一份业务库，request 为完整编辑表单；返回更新后工作区聚合。
-/// 异常/边界：并发删除、重复名称或目录冲突均拒绝覆盖，已有会话路径快照保持不变。
+/// 异常/边界：并发删除或重复名称时拒绝覆盖；工作目录允许被多个任务项目复用，已有会话路径快照保持不变。
 pub(crate) fn update_session_project_core(
     app: &AppHandle,
     request: UpdateProjectRequest,
@@ -599,10 +769,10 @@ pub(crate) fn update_session_project_core(
     })
 }
 
-/// 删除空任务项目的共享业务入口。
-/// 流程：由唯一 TaskStore 在关联校验通过后物理删除项目，失败时记录项目 ID 对应的脱敏诊断。
+/// 软删除任务项目的共享业务入口。
+/// 流程：由唯一 TaskStore 标记项目已删除，失败时记录项目 ID 对应的脱敏诊断。
 /// 参数：app 定位同一份业务库，project_id 为目标项目；返回删除后聚合。
-/// 异常/边界：项目仍有任务或会话时整笔拒绝，不提供软删除或历史兼容分支。
+/// 异常/边界：任务和会话历史不级联删除；未知或已删除项目返回稳定业务错误。
 pub(crate) fn delete_session_project_core(
     app: &AppHandle,
     project_id: String,
@@ -1025,6 +1195,26 @@ struct ShortcutProfile {
     dictate: String,
     /// 文本润色模式快捷键。
     polish: String,
+    /// 用户创建的打开应用快捷键绑定。
+    app_bindings: Vec<AppShortcutBinding>,
+}
+
+/// 用户创建的打开应用快捷键绑定。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppShortcutBinding {
+    /// 绑定唯一 ID，用于前端渲染和后续删除。
+    id: String,
+    /// 触发打开应用动作的全局快捷键。
+    shortcut: String,
+    /// 动作类型，当前只允许 openApp。
+    action_type: String,
+    /// 目标应用展示名称。
+    app_name: String,
+    /// 目标应用 bundle 绝对路径。
+    app_path: String,
+    /// 创建时间 ISO 字符串。
+    created_at: String,
 }
 
 impl Default for ShortcutProfile {
@@ -1033,6 +1223,7 @@ impl Default for ShortcutProfile {
             asr: DEFAULT_ASR_TEXT_SHORTCUT.to_string(),
             dictate: DEFAULT_DICTATE_SHORTCUT.to_string(),
             polish: DEFAULT_POLISH_SHORTCUT.to_string(),
+            app_bindings: Vec::new(),
         }
     }
 }
@@ -1257,11 +1448,13 @@ pub fn run() {
         .manage(RuntimeShortcuts::default())
         .manage(RuntimeResult::default())
         .manage(RuntimePublicApiToken::default())
+        .manage(RuntimeAccessTokenApproval::default())
         .manage(RuntimeDictationHistory::default())
         .manage(RuntimePasteFocusSnapshot::default())
         .manage(RuntimeLocalConfigWatcher::default())
         .manage(RuntimePrivateRpc::default())
         .manage(RuntimeSidecar::default())
+        .manage(RuntimeWebServer::default())
         .manage(RuntimeCodexDesktop::default())
         .setup(|app| {
             let catalog = private_models::sidecar_catalog_json(app.handle()).map_err(|error| {
@@ -1298,18 +1491,36 @@ pub fn run() {
                     .into());
                 }
             };
-            *app.state::<RuntimePublicApiToken>()
-                .token
-                .lock()
-                .map_err(|_| {
-                    std::io::Error::other(desktop_error::record_desktop_error(
+            let public_api_token_state = app.state::<RuntimePublicApiToken>();
+            let mut public_api_token = match public_api_token_state.token.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = app.state::<RuntimeSidecar>().shutdown();
+                    let _ = app.state::<RuntimePrivateRpc>().shutdown();
+                    return Err(std::io::Error::other(desktop_error::record_desktop_error(
                         app.handle(),
                         "SIDECAR_TOKEN_STORE_FAILED",
                         "app_setup",
                         None,
                         "保存 sidecar 短 Token 失败：状态锁已损坏",
                     ))
-                })? = token;
+                    .into());
+                }
+            };
+            *public_api_token = token;
+            drop(public_api_token);
+            if let Err(error) = app.state::<RuntimeWebServer>().start(app.handle()) {
+                let _ = app.state::<RuntimeSidecar>().shutdown();
+                let _ = app.state::<RuntimePrivateRpc>().shutdown();
+                return Err(std::io::Error::other(desktop_error::record_desktop_error(
+                    app.handle(),
+                    "WEB_SERVER_START_FAILED",
+                    "app_setup",
+                    None,
+                    &error,
+                ))
+                .into());
+            }
             let dispatcher_app = app.handle().clone();
             thread::spawn(move || run_codex_task_dispatcher(&dispatcher_app));
             #[cfg(desktop)]
@@ -1361,12 +1572,14 @@ pub fn run() {
             hide_result_window,
             get_last_result_window_payload,
             download_browser_extension_zip,
+            respond_public_api_access_token_request,
             set_public_api_token,
             get_public_api_token,
             refresh_public_api_token_if_matches,
             clear_public_api_token_if_matches,
             register_shortcuts,
             suspend_shortcuts_for_recording,
+            list_installed_applications,
             get_runtime_diagnostics,
             open_accessibility_settings,
             open_microphone_settings,
@@ -1411,6 +1624,15 @@ pub fn run() {
                     let _ = desktop_error::record_desktop_error(
                         app,
                         "PRIVATE_RPC_SHUTDOWN_FAILED",
+                        "app_exit",
+                        None,
+                        &error,
+                    );
+                }
+                if let Err(error) = app.state::<RuntimeWebServer>().shutdown() {
+                    let _ = desktop_error::record_desktop_error(
+                        app,
+                        "WEB_SERVER_SHUTDOWN_FAILED",
                         "app_exit",
                         None,
                         &error,
@@ -1788,8 +2010,43 @@ fn is_window_visible(app: &tauri::AppHandle, label: &str) -> bool {
 
 /// 根据全局快捷键字符串判断目标模式，并通知悬浮窗开始或停止。
 fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
+    if trigger_app_shortcut(app.clone(), &shortcut) {
+        return;
+    }
     let mode = shortcut_to_mode(&app, &shortcut);
     trigger_voice_mode(app, &mode);
+}
+
+/// 触发用户创建的打开应用快捷键。
+/// 流程：按规范化快捷键查找自定义绑定，命中后通过系统 open 命令打开目标 App。
+/// 参数：app 为 Tauri AppHandle，shortcut 为插件回调传入的快捷键字符串。
+/// 返回：命中自定义绑定并已尝试打开时返回 true。
+/// 异常/边界：打开失败只记录日志，不继续落入语音模式，避免同一个快捷键触发双动作。
+fn trigger_app_shortcut(app: tauri::AppHandle, shortcut: &str) -> bool {
+    let normalized = normalize_shortcut(shortcut);
+    let binding = app
+        .state::<RuntimeShortcuts>()
+        .profile
+        .lock()
+        .ok()
+        .and_then(|profile| {
+            profile
+                .app_bindings
+                .iter()
+                .find(|binding| normalize_shortcut(&binding.shortcut) == normalized)
+                .cloned()
+        });
+    if let Some(binding) = binding {
+        if let Err(error) = open_application_bundle(&binding.app_path) {
+            eprintln!(
+                "打开快捷键绑定应用失败：{}，目标：{}",
+                trim_error_message(&error),
+                binding.app_name
+            );
+        }
+        return true;
+    }
+    false
 }
 
 /// 按指定模式通知悬浮录音条开始或停止。
@@ -1932,6 +2189,19 @@ fn suspend_shortcuts_for_recording(window: tauri::WebviewWindow) -> Result<(), S
     ensure_sensitive_management_window(window.label())?;
     let app = window.app_handle().clone();
     suspend_shortcut_profile(&app)
+}
+
+/// 读取本机可绑定的应用列表。
+/// 流程：校验 hub 窗口后扫描系统和用户 Applications 目录，返回去重排序后的 .app bundle。
+/// 参数：window 为调用窗口，用于限制只有主界面能读取本机应用目录。
+/// 返回：可供前端选择的应用列表。
+/// 异常/边界：非 macOS 返回当前平台不支持；目录不存在时跳过，不把空目录视为错误。
+#[tauri::command]
+fn list_installed_applications(
+    window: tauri::WebviewWindow,
+) -> Result<Vec<ApplicationOption>, String> {
+    ensure_sensitive_management_window(window.label())?;
+    list_installed_applications_core()
 }
 
 /// 读取当前桌面端能力状态，供设置页展示真实诊断结果。
@@ -2834,7 +3104,7 @@ fn parse_matching_terminal_notification(
     parse_codex_terminal_turn(turn).map(Some)
 }
 
-/// 通过 Codex Desktop 原生 composer 执行一个真实任务，并仅用 app-server 做只读终态对账。
+/// 通过 Codex Desktop 原生 composer 提交一个真实任务，并启动后台终态对账。
 /// 流程：记录 Enter 前已知 thread，CDP 精确切换工作区和新会话，回调事务持久化提交水位后只按一次 Enter，再以 canonical cwd、水位和首条用户消息从 JSONL 唯一恢复 thread 并绑定。
 /// 参数：AppHandle、队列任务和本地 session ID；返回无；只有 Enter 前的确定失败向调度线程传播，绑定后交给 thread/read 监控。
 /// 异常/边界：Enter 后无论传输是否成功都绝不重放 prompt；零或多候选、UI 与 JSONL 冲突均原子标记 sendUncertain 并返回成功，避免调度器覆盖为普通 failed。
@@ -2851,7 +3121,7 @@ fn execute_codex_task(
     let cwd = canonical_cwd.to_string_lossy().to_string();
     let known_thread_ids = capture_codex_thread_ids(&cwd)?;
     let client_user_message_id = uuid::Uuid::new_v4().to_string();
-    let receipt = codex_cdp::submit_new_chat(&cwd, &task.prompt, |watermark| {
+    let receipt = codex_cdp::submit_new_chat(&cwd, &task.prompt, &task.attachments, |watermark| {
         task_store::mark_task_submission_started(
             app,
             &task.id,
@@ -2902,16 +3172,15 @@ fn execute_codex_task(
         &thread_id,
         &client_user_message_id,
     )?;
-    monitor_reconciled_task(
-        app,
-        RunningTaskRecord {
-            task_id: task.id.clone(),
-            project_id: task.project_id.clone(),
-            session_id: session_id.to_string(),
-            thread_id,
-            turn_id: String::new(),
-        },
-    );
+    let monitor_app = app.clone();
+    let running = RunningTaskRecord {
+        task_id: task.id.clone(),
+        project_id: task.project_id.clone(),
+        session_id: session_id.to_string(),
+        thread_id,
+        turn_id: String::new(),
+    };
+    thread::spawn(move || monitor_reconciled_task(&monitor_app, running));
     Ok(())
 }
 
@@ -3063,7 +3332,7 @@ fn normalize_codex_user_message(message: &str) -> &str {
 }
 
 /// 提取 Codex Desktop 自动包裹消息中的真实用户请求正文。
-/// 流程：允许开头存在 in-app browser ambient context，随后必须是固定 `## My request:` 标记；返回标记后的正文。
+/// 流程：允许开头存在 in-app browser ambient context 或文件附件清单，随后必须包含固定 `## My request:` 标记；返回标记后的正文。
 /// 参数：message 为 JSONL 用户消息；返回去除末尾 CR/LF 后的正文切片。
 /// 异常/边界：不移除普通空格或正文内部换行；缺少固定标记时返回 None，避免把任意长文本误当作任务 prompt。
 fn extract_codex_wrapped_request_message(message: &str) -> Option<&str> {
@@ -3072,6 +3341,10 @@ fn extract_codex_wrapped_request_message(message: &str) -> Option<&str> {
         let context_end = remaining.find("</in-app-browser-context>")?;
         remaining = &remaining[context_end + "</in-app-browser-context>".len()..];
         remaining = remaining.trim_start_matches(['\r', '\n']);
+    }
+    if remaining.starts_with("# Files mentioned by the user:") {
+        let request_start = remaining.find("## My request:")?;
+        remaining = &remaining[request_start..];
     }
     let request = remaining.strip_prefix("## My request:")?;
     Some(normalize_codex_user_message(
@@ -3287,28 +3560,30 @@ fn read_codex_submission_identity(
     )
 }
 
-/// 持续运行首发版单 worker Codex 任务调度器。
-/// 流程：先恢复并监控重启前 running 任务；确认数据库不存在 running 后，按排队顺序取首项并通过 CAS 领取，当前任务进入可靠终态后再处理下一项。
+/// 持续运行 Codex 任务调度器。
+/// 流程：先恢复并监控重启前 running 任务；每轮按 running 数量计算剩余并发槽位，再按排队顺序通过 CAS 领取 queued 任务并启动独立执行线程。
 /// 参数：AppHandle 用于访问任务库、启动 Codex 和广播页面刷新；本方法运行至 App 进程退出，无返回值。
-/// 异常/边界：数据库读取或 CAS 失败只记录诊断并重试；queued 不会被错误标失败；已有 running 始终优先对账且绝不重放 prompt。
+/// 异常/边界：数据库读取或 CAS 失败只记录诊断并重试；queued 不会被错误标失败；并发上限只限制提交/监控中的任务数，不重放 running prompt。
 fn run_codex_task_dispatcher(app: &AppHandle) {
     reconcile_codex_tasks(app);
     loop {
-        match task_store::list_running_tasks(app) {
-            Ok(tasks) if !tasks.is_empty() => {
-                thread::sleep(CODEX_TASK_DISPATCH_INTERVAL);
-                continue;
-            }
-            Ok(_) => {}
+        let running_count = match task_store::list_running_tasks(app) {
+            Ok(tasks) => tasks.len(),
             Err(error) => {
                 let _ =
                     record_desktop_task_error(app, "", "TASK_DISPATCH_RUNNING_LIST_FAILED", &error);
                 thread::sleep(CODEX_TASK_DISPATCH_INTERVAL);
                 continue;
             }
+        };
+        let max_running = read_codex_task_concurrency_limit(app);
+        let available_slots = max_running.saturating_sub(running_count);
+        if available_slots == 0 {
+            thread::sleep(CODEX_TASK_DISPATCH_INTERVAL);
+            continue;
         }
-        let task = match task_store::list_queued_tasks(app) {
-            Ok(tasks) => tasks.into_iter().next(),
+        let tasks = match task_store::list_queued_tasks(app) {
+            Ok(tasks) => tasks,
             Err(error) => {
                 let _ =
                     record_desktop_task_error(app, "", "TASK_DISPATCH_QUEUE_LIST_FAILED", &error);
@@ -3316,28 +3591,37 @@ fn run_codex_task_dispatcher(app: &AppHandle) {
                 continue;
             }
         };
-        let Some(task) = task else {
+        if tasks.is_empty() {
             thread::sleep(CODEX_TASK_DISPATCH_INTERVAL);
             continue;
-        };
-        let session_id = match codex_desktop::with_execution_start_gate(app, || {
-            task_store::mark_task_running(app, &task)
-        }) {
-            Ok(session_id) => session_id,
-            Err(error) => {
-                let _ =
-                    record_desktop_task_error(app, &task.id, "TASK_DISPATCH_CAS_MISSED", &error);
-                thread::sleep(CODEX_TASK_DISPATCH_INTERVAL);
-                continue;
-            }
-        };
+        }
+        for task in tasks.into_iter().take(available_slots) {
+            let worker_app = app.clone();
+            thread::spawn(move || execute_dispatched_codex_task(&worker_app, task));
+        }
+        thread::sleep(CODEX_TASK_DISPATCH_INTERVAL);
+    }
+}
+
+/// 执行调度器领取到的单个 queued 任务。
+/// 流程：在 Codex 执行启动门禁内完成 DB 领取和 composer 提交，提交成功后由任务自身监控逻辑等待终态；参数为 AppHandle 和队列任务。
+/// 返回：无返回值，所有失败都会写入任务诊断并广播刷新。
+/// 异常/边界：CAS 未命中代表其它调度线程已领取；提交前失败会把任务置为 failed，提交不确定则由 execute_codex_task 标记 sendUncertain，避免重放 prompt。
+fn execute_dispatched_codex_task(app: &AppHandle, task: task_store::QueuedTaskRecord) {
+    let mut claimed_session_id = String::new();
+    let result = codex_desktop::with_execution_start_gate(app, || {
+        let session_id = task_store::mark_task_running(app, &task)?;
+        claimed_session_id = session_id.clone();
         emit_session_task_updated(app, &task.id, &task.project_id);
-        if let Err(error) = execute_codex_task(app, &task, &session_id) {
-            let diagnostic_code = task_execution_diagnostic_code(&error);
-            let diagnostic_error =
-                record_desktop_task_error(app, &task.id, diagnostic_code, &error);
+        execute_codex_task(app, &task, &session_id)?;
+        Ok(())
+    });
+    if let Err(error) = result {
+        let diagnostic_code = task_execution_diagnostic_code(&error);
+        let diagnostic_error = record_desktop_task_error(app, &task.id, diagnostic_code, &error);
+        if !claimed_session_id.is_empty() {
             if let Err(persist_error) =
-                task_store::mark_task_failed(app, &task.id, &session_id, &diagnostic_error)
+                task_store::mark_task_failed(app, &task.id, &claimed_session_id, &diagnostic_error)
             {
                 let _ = record_desktop_task_error(
                     app,
@@ -3352,16 +3636,32 @@ fn run_codex_task_dispatcher(app: &AppHandle) {
     }
 }
 
+/// 读取系统设置中的 Codex 任务并发上限。
+/// 流程：从客户端 JSON 的 settings 分区读取 `taskConcurrencyLimit`，只接受 1-10 的整数；参数为 AppHandle。
+/// 返回：当前有效并发上限。
+/// 异常/边界：配置文件不存在、损坏或字段非法时回落默认 3，调度器继续工作且不把坏配置写回覆盖现场。
+fn read_codex_task_concurrency_limit(app: &AppHandle) -> usize {
+    read_local_config_document(app)
+        .ok()
+        .and_then(|document| document.items.get(LOCAL_CONFIG_SETTINGS_KEY).cloned())
+        .and_then(|settings| {
+            settings
+                .get("taskConcurrencyLimit")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+        })
+        .filter(|value| {
+            (CODEX_TASK_MIN_CONCURRENT_RUNNING..=CODEX_TASK_MAX_CONCURRENT_RUNNING).contains(value)
+        })
+        .unwrap_or(CODEX_TASK_DEFAULT_CONCURRENT_RUNNING)
+}
+
 /// 从任务执行失败中提取允许写入诊断日志的稳定错误码。
 /// 流程：只识别内部 CDP 失败生成的完整固定标记；其它工作目录、数据库或未知错误统一收敛为任务执行失败。
 /// 参数：error 为 `execute_codex_task` 返回的内部失败说明；返回桌面错误白名单中的稳定错误码。
 /// 异常/边界：不做前缀、模糊或任意括号内容解析，避免未知正文伪造诊断元数据。
 fn task_execution_diagnostic_code(error: &str) -> &'static str {
     for (marker, code) in [
-        (
-            "（错误码：CODEX_CDP_COMPOSER_NOT_EMPTY）",
-            "CODEX_CDP_COMPOSER_NOT_EMPTY",
-        ),
         (
             "（错误码：CODEX_CDP_TARGET_CHECK_FAILED）",
             "CODEX_CDP_TARGET_CHECK_FAILED",
@@ -3390,6 +3690,18 @@ fn task_execution_diagnostic_code(error: &str) -> &'static str {
         (
             "（错误码：CODEX_CDP_COMPOSER_WRITE_FAILED）",
             "CODEX_CDP_COMPOSER_WRITE_FAILED",
+        ),
+        (
+            "（错误码：CODEX_CDP_ATTACHMENT_INPUT_MISSING）",
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+        ),
+        (
+            "（错误码：CODEX_CDP_ATTACHMENT_INVALID）",
+            "CODEX_CDP_ATTACHMENT_INVALID",
+        ),
+        (
+            "（错误码：CODEX_CDP_ATTACHMENT_WRITE_FAILED）",
+            "CODEX_CDP_ATTACHMENT_WRITE_FAILED",
         ),
         (
             "（错误码：CODEX_CDP_SUBMISSION_PERSIST_FAILED）",
@@ -3665,7 +3977,15 @@ fn reconcile_codex_task(
     if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
         return Ok(None);
     }
-    parse_codex_terminal_turn(&turn).map(Some)
+    let (status, result, error) = parse_codex_terminal_turn(&turn)?;
+    match resolve_interrupted_turn_from_session(&status, &result, running)? {
+        InterruptedTurnResolution::Recovered(recovered_result) => {
+            Ok(Some((status, recovered_result, error)))
+        }
+        InterruptedTurnResolution::Aborted => Ok(Some((status, result, error))),
+        InterruptedTurnResolution::Pending => Ok(None),
+        InterruptedTurnResolution::Unchanged => Ok(Some((status, result, error))),
+    }
 }
 
 /// 从 thread/read 返回值中选择当前任务可证明归属的 turn。
@@ -3725,6 +4045,77 @@ fn parse_codex_terminal_turn(turn: &Value) -> Result<(String, String, String), S
     })
     .to_string();
     Ok((status.to_string(), result, error))
+}
+
+/// 当 app-server 只返回 interrupted 且 items 缺少最终文本时，从 Codex JSONL 的同 turn task_complete 事件恢复回复。
+/// 流程：先确认终态结果没有 finalText，再按 threadId 精确定位本地 session 文件，并只接受 turnId 完全一致的 last_agent_message。
+/// 参数：status/result_json 来自 thread/read，running 提供当前任务绑定的 thread/turn；返回可落库结果 JSON。
+/// 异常/边界：找不到会话文件、没有 task_complete 或消息为空时保留原结果，后续仍按 interrupted 失败处理；不会读取其它 turn 的回复。
+fn resolve_interrupted_turn_from_session(
+    status: &str,
+    result_json: &str,
+    running: &RunningTaskRecord,
+) -> Result<InterruptedTurnResolution, String> {
+    if status != "interrupted" {
+        return Ok(InterruptedTurnResolution::Unchanged);
+    }
+    let Ok(session_path) = find_codex_session_file(&running.thread_id) else {
+        return Ok(InterruptedTurnResolution::Pending);
+    };
+    match read_codex_turn_completion_state(&session_path, &running.turn_id)? {
+        CodexTurnCompletionState::Completed(message) if !message.trim().is_empty() => {
+            Ok(InterruptedTurnResolution::Recovered(
+                with_codex_terminal_result_final_text(result_json, &message)?,
+            ))
+        }
+        CodexTurnCompletionState::Aborted => Ok(InterruptedTurnResolution::Aborted),
+        CodexTurnCompletionState::Completed(_) | CodexTurnCompletionState::Pending => {
+            Ok(InterruptedTurnResolution::Pending)
+        }
+    }
+}
+
+/// interrupted turn 的本地 JSONL 对账结果。
+enum InterruptedTurnResolution {
+    /// 已从 task_complete 补回最终回复。
+    Recovered(String),
+    /// 已确认用户或系统中止，可按 interrupted 失败落库。
+    Aborted,
+    /// JSONL 还没有写入 task_complete/turn_aborted，继续轮询。
+    Pending,
+    /// 非需要兜底的状态，沿用 thread/read 结果。
+    Unchanged,
+}
+
+/// 指定 turn 在 Codex JSONL 中的完成状态。
+enum CodexTurnCompletionState {
+    /// 同 turn 已写入 task_complete，并携带最终助手消息。
+    Completed(String),
+    /// 同 turn 已写入 turn_aborted，说明不会再产出可验收结果。
+    Aborted,
+    /// 尚未观察到 task_complete 或 turn_aborted，调用方应继续等待。
+    Pending,
+}
+
+/// 返回替换 finalText 后的 Codex 终态结果 JSON，保持其它字段不变。
+fn with_codex_terminal_result_final_text(
+    result_json: &str,
+    final_text: &str,
+) -> Result<String, String> {
+    let mut value = serde_json::from_str::<Value>(result_json)
+        .map_err(|_| "Codex turn 结果不是有效 JSON".to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "Codex turn 结果不是对象 JSON".to_string())?;
+    object.insert(
+        "finalText".to_string(),
+        Value::String(limit_chars(final_text, CODEX_TASK_RESULT_TEXT_MAX_CHARS)),
+    );
+    object.insert(
+        "finalTextSource".to_string(),
+        Value::String("sessionTaskComplete".to_string()),
+    );
+    Ok(value.to_string())
 }
 
 /// 通过统一桌面错误入口记录任务核心故障并返回可排障文案。
@@ -4349,6 +4740,65 @@ fn read_codex_session_messages(path: &Path) -> Result<Vec<CodexThreadMessage>, S
     read_codex_session_messages_from_file(file)
 }
 
+/// 从 Codex session JSONL 中读取指定 turn 的 task_complete/turn_aborted 状态。
+/// 流程：复用受限 session 文件打开与逐帧读取预算，只匹配 turn_id 完全一致的完成或中止事件。
+/// 参数：path 为精确 thread 定位出的会话文件，turn_id 为当前任务绑定的 turn；返回当前 JSONL 已确认的完成状态。
+/// 异常/边界：turn_id 为空或文件增长超限时 fail closed；找不到匹配事件返回 Pending，不猜测其它 assistant 消息。
+fn read_codex_turn_completion_state(
+    path: &Path,
+    turn_id: &str,
+) -> Result<CodexTurnCompletionState, String> {
+    if turn_id.trim().is_empty() {
+        return Ok(CodexTurnCompletionState::Pending);
+    }
+    let file = open_bounded_codex_session_file(path, "任务完成事件")?;
+    read_codex_turn_completion_state_from_file(file, turn_id)
+}
+
+/// 从已打开 session 句柄中解析指定 turn 的完成状态。
+fn read_codex_turn_completion_state_from_file(
+    file: fs::File,
+    turn_id: &str,
+) -> Result<CodexTurnCompletionState, String> {
+    let mut reader = BufReader::new(file.take(CODEX_SESSION_FILE_MAX_BYTES + 1));
+    let mut state = CodexTurnCompletionState::Pending;
+    while let Some(frame) = read_bounded_codex_session_frame(&mut reader)? {
+        if frame.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&frame) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let payload_type = payload.get("type").and_then(Value::as_str);
+        if !matches!(payload_type, Some("task_complete" | "turn_aborted")) {
+            continue;
+        }
+        if payload.get("turn_id").and_then(Value::as_str) != Some(turn_id) {
+            continue;
+        }
+        state = if payload_type == Some("task_complete") {
+            let message = payload
+                .get("last_agent_message")
+                .and_then(Value::as_str)
+                .map(|text| limit_chars(text, CODEX_TASK_RESULT_TEXT_MAX_CHARS))
+                .unwrap_or_default();
+            CodexTurnCompletionState::Completed(message)
+        } else {
+            CodexTurnCompletionState::Aborted
+        };
+    }
+    if reader.get_ref().limit() == 0 {
+        return Err(format!(
+            "Codex 会话文件超过 {} 字节，已拒绝加载（错误码：CODEX_SESSION_FILE_TOO_LARGE）",
+            CODEX_SESSION_FILE_MAX_BYTES
+        ));
+    }
+    Ok(state)
+}
+
 /// 从已打开 session 句柄解析最近可展示消息。
 /// 流程：在句柄上施加单文件上限加一字节预算，逐帧解析并仅保留最后 80 条消息，结束时检查预算是否耗尽。
 /// 参数：file 为路径与句柄元数据均已校验的普通文件；返回最近消息列表。
@@ -4622,6 +5072,12 @@ fn register_shortcut_profile(
             shortcuts.push(shortcut.to_string());
         }
     }
+    for binding in &profile.app_bindings {
+        let normalized = normalize_shortcut(&binding.shortcut);
+        if seen.insert(normalized) {
+            shortcuts.push(binding.shortcut.clone());
+        }
+    }
     let shortcut_refs = shortcuts.iter().map(String::as_str).collect::<Vec<_>>();
     app.global_shortcut()
         .unregister_all()
@@ -4663,6 +5119,7 @@ fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfil
         asr: normalize_shortcut_or_default(&profile.asr, DEFAULT_ASR_TEXT_SHORTCUT),
         dictate: normalize_shortcut_or_default(&profile.dictate, DEFAULT_DICTATE_SHORTCUT),
         polish: normalize_shortcut_or_default(&profile.polish, DEFAULT_POLISH_SHORTCUT),
+        app_bindings: normalize_app_shortcut_bindings(profile.app_bindings)?,
     };
     let mut seen = std::collections::HashSet::new();
     for shortcut in [&normalized.asr, &normalized.dictate, &normalized.polish] {
@@ -4671,7 +5128,53 @@ fn normalize_shortcut_profile(profile: ShortcutProfile) -> Result<ShortcutProfil
             return Err("语音转文字、语音润色和文本润色不能使用同一个快捷键".to_string());
         }
     }
+    for binding in &normalized.app_bindings {
+        let key = normalize_shortcut(&binding.shortcut);
+        if !seen.insert(key) {
+            return Err(format!("快捷键绑定冲突：{}", binding.shortcut));
+        }
+    }
     Ok(normalized)
+}
+
+/// 规范化用户创建的打开应用快捷键绑定。
+/// 流程：过滤字段空白、固定动作类型为 openApp、规范化快捷键，并校验目标路径是 .app。
+/// 参数：bindings 为前端提交的绑定列表。
+/// 返回：可注册到系统全局快捷键的绑定列表。
+/// 异常/边界：任一绑定字段非法时整体拒绝，避免部分注册造成前后端状态不一致。
+fn normalize_app_shortcut_bindings(
+    bindings: Vec<AppShortcutBinding>,
+) -> Result<Vec<AppShortcutBinding>, String> {
+    let mut normalized_bindings = Vec::new();
+    for binding in bindings {
+        let shortcut = normalize_shortcut(&binding.shortcut);
+        let app_path = binding.app_path.trim().to_string();
+        if binding.action_type != "openApp" {
+            return Err("当前只支持打开应用动作".to_string());
+        }
+        if binding.id.trim().is_empty() || shortcut.is_empty() {
+            return Err("快捷键绑定缺少 ID 或快捷键".to_string());
+        }
+        if binding.app_name.trim().is_empty() || app_path.is_empty() {
+            return Err("快捷键绑定缺少目标 APP".to_string());
+        }
+        if Path::new(&app_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("app")
+        {
+            return Err(format!("目标 APP 路径无效：{}", app_path));
+        }
+        normalized_bindings.push(AppShortcutBinding {
+            id: binding.id.trim().to_string(),
+            shortcut,
+            action_type: "openApp".to_string(),
+            app_name: binding.app_name.trim().to_string(),
+            app_path,
+            created_at: binding.created_at.trim().to_string(),
+        });
+    }
+    Ok(normalized_bindings)
 }
 
 /// 规范化单个快捷键，空值时使用默认值。
@@ -4936,7 +5439,9 @@ fn download_browser_extension_zip(
             target_path = (1..=99)
                 .map(|index| download_dir.join(format!("typesass-extension-{}.zip", index)))
                 .find(|candidate| !candidate.exists())
-                .ok_or_else(|| "下载目录中已存在过多同名插件 ZIP，请先清理旧文件后重试。".to_string())?;
+                .ok_or_else(|| {
+                    "下载目录中已存在过多同名插件 ZIP，请先清理旧文件后重试。".to_string()
+                })?;
         }
         fs::write(&target_path, BROWSER_EXTENSION_ZIP_BYTES)
             .map_err(|error| format!("写入浏览器插件 ZIP 失败：{}", error))?;
@@ -6539,6 +7044,90 @@ fn open_microphone_preferences() -> Result<(), String> {
     Err("当前版本只支持在 macOS 打开麦克风设置".to_string())
 }
 
+/// 扫描 macOS 常见应用目录并返回 .app bundle。
+/// 流程：依次读取系统、用户和系统应用目录，按 bundle 文件名生成展示名称并按路径去重。
+/// 返回：按应用名排序后的应用选项。
+/// 异常/边界：单个目录无权限或不存在时跳过；全部扫描失败时返回空列表而不是中断页面。
+#[cfg(target_os = "macos")]
+fn list_installed_applications_core() -> Result<Vec<ApplicationOption>, String> {
+    let mut directories = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+    ];
+    if let Ok(home) = env::var("HOME") {
+        directories.push(PathBuf::from(home).join("Applications"));
+    }
+    let mut seen_paths = HashSet::new();
+    let mut applications = Vec::new();
+    for directory in directories {
+        if !directory.is_dir() {
+            continue;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("app") {
+                continue;
+            }
+            let path_text = path.to_string_lossy().to_string();
+            if !seen_paths.insert(path_text.clone()) {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|file_stem| file_stem.to_str())
+                .unwrap_or("未知应用")
+                .to_string();
+            applications.push(ApplicationOption {
+                name,
+                path: path_text,
+            });
+        }
+    }
+    applications.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(applications)
+}
+
+/// 非 macOS 平台暂不支持扫描应用目录。
+#[cfg(not(target_os = "macos"))]
+fn list_installed_applications_core() -> Result<Vec<ApplicationOption>, String> {
+    Err("当前版本只支持在 macOS 选择 APP".to_string())
+}
+
+/// 打开指定应用 bundle。
+/// 流程：校验路径指向 .app 后用系统 open 命令启动或激活目标应用。
+/// 参数：app_path 为 .app bundle 绝对路径。
+/// 返回：open 命令发起成功时返回空值。
+/// 异常/边界：非 .app、路径不存在或系统命令失败时返回明确错误。
+#[cfg(target_os = "macos")]
+fn open_application_bundle(app_path: &str) -> Result<(), String> {
+    let path = PathBuf::from(app_path.trim());
+    if path.extension().and_then(|extension| extension.to_str()) != Some("app") || !path.exists() {
+        return Err("目标 APP 不存在或不是有效的 .app 应用".to_string());
+    }
+    Command::new("open")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("打开 APP 失败：{}", error))?;
+    Ok(())
+}
+
+/// 非 macOS 平台暂不支持打开应用 bundle。
+#[cfg(not(target_os = "macos"))]
+fn open_application_bundle(_app_path: &str) -> Result<(), String> {
+    Err("当前版本只支持在 macOS 打开 APP".to_string())
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -6549,21 +7138,21 @@ extern "C" {
 mod tests {
     use super::*;
 
-    /// 任务执行诊断只能保留完整固定的草稿错误码，其它相似文本必须降级为通用执行失败。
+    /// 任务执行诊断只能保留完整固定的内部错误码，其它相似文本必须降级为通用执行失败。
     #[test]
     fn task_execution_diagnostic_code_preserves_only_exact_internal_marker() {
         assert_eq!(
             task_execution_diagnostic_code(
-                "Codex Desktop 当前输入框存在未发送草稿，请处理后重试。（错误码：CODEX_CDP_COMPOSER_NOT_EMPTY）"
+                "Codex Desktop 主页面地址无效。（错误码：CODEX_CDP_TARGET_INVALID）"
             ),
-            "CODEX_CDP_COMPOSER_NOT_EMPTY"
+            "CODEX_CDP_TARGET_INVALID"
         );
         assert_eq!(
-            task_execution_diagnostic_code("CODEX_CDP_COMPOSER_NOT_EMPTY"),
+            task_execution_diagnostic_code("CODEX_CDP_TARGET_INVALID"),
             "TASK_EXECUTION_FAILED"
         );
         assert_eq!(
-            task_execution_diagnostic_code("（错误码：CODEX_CDP_COMPOSER_NOT_EMPTY_EXTRA）"),
+            task_execution_diagnostic_code("（错误码：CODEX_CDP_TARGET_INVALID_EXTRA）"),
             "TASK_EXECUTION_FAILED"
         );
     }
@@ -7155,6 +7744,146 @@ mod tests {
         fs::remove_dir_all(&temp_dir).expect("应删除精确测试临时目录");
     }
 
+    /// 任务对账只能从同一 turn 的 task_complete 恢复最终回复，不能串用同文件其它 turn 的助手消息。
+    #[test]
+    fn codex_task_complete_result_recovery_matches_exact_turn() {
+        let temp_dir = create_test_temp_dir("codex-task-complete-recovery");
+        let session_path = temp_dir.join("rollout-recovery.jsonl");
+        let mut session = fs::File::create(&session_path).expect("应创建任务完成事件测试文件");
+        for (turn_id, message) in [
+            ("turn-other", "其它 turn 回复"),
+            ("turn-target", "目标 turn 最终回复"),
+        ] {
+            writeln!(
+                session,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-12T10:00:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": turn_id,
+                        "last_agent_message": message
+                    }
+                })
+            )
+            .expect("应写入 task_complete 事件");
+        }
+        drop(session);
+
+        let recovered = read_codex_turn_completion_state(&session_path, "turn-target")
+            .expect("应读取任务完成事件");
+        assert!(matches!(
+            recovered,
+            CodexTurnCompletionState::Completed(ref message) if message == "目标 turn 最终回复"
+        ));
+        let missing = read_codex_turn_completion_state(&session_path, "turn-missing")
+            .expect("缺失 turn 不应报错");
+        assert!(matches!(missing, CodexTurnCompletionState::Pending));
+        fs::remove_dir_all(&temp_dir).expect("应删除任务完成事件测试目录");
+    }
+
+    /// interrupted 对账必须等到 JSONL 出现 task_complete 或 turn_aborted，避免过早把仍在运行的 turn 标成失败。
+    #[test]
+    fn codex_turn_completion_state_waits_until_complete_or_aborted() {
+        let temp_dir = create_test_temp_dir("codex-turn-completion-state");
+        let session_path = temp_dir.join("rollout-state.jsonl");
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-08-12T10:00:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": "还在输出",
+                        "phase": "commentary"
+                    }
+                })
+            ),
+        )
+        .expect("应写入尚未完成的会话");
+        let pending = read_codex_turn_completion_state(&session_path, "turn-target")
+            .expect("尚未完成时应可读取");
+        assert!(matches!(pending, CodexTurnCompletionState::Pending));
+
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-08-12T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "turn_aborted",
+                        "turn_id": "turn-target",
+                        "reason": "interrupted"
+                    }
+                })
+            ),
+        )
+        .expect("应写入中止事件");
+        let aborted = read_codex_turn_completion_state(&session_path, "turn-target")
+            .expect("中止事件应可读取");
+        assert!(matches!(aborted, CodexTurnCompletionState::Aborted));
+        fs::remove_dir_all(&temp_dir).expect("应删除任务完成状态测试目录");
+    }
+
+    /// interrupted 且 thread/read 没带 agentMessage 时，应把同 turn task_complete 的最终回复补回 resultJson。
+    #[test]
+    fn interrupted_result_can_be_completed_from_task_complete_message() {
+        let result_json = json!({
+            "turnId": "turn-target",
+            "status": "interrupted",
+            "completedAt": null,
+            "finalText": ""
+        })
+        .to_string();
+        let patched = with_codex_terminal_result_final_text(&result_json, "目标 turn 最终回复")
+            .expect("应补写最终回复");
+        let value = serde_json::from_str::<Value>(&patched).expect("补写后应仍是 JSON");
+        assert_eq!(
+            value.get("finalText").and_then(Value::as_str),
+            Some("目标 turn 最终回复")
+        );
+        assert_eq!(
+            value.get("finalTextSource").and_then(Value::as_str),
+            Some("sessionTaskComplete")
+        );
+        assert_eq!(
+            value.get("finalText").and_then(Value::as_str),
+            Some("目标 turn 最终回复")
+        );
+    }
+
+    /// interrupted 即使 thread/read items 中已有 commentary，也必须等待 task_complete，避免半截回复进入待验收。
+    #[test]
+    fn interrupted_result_with_intermediate_text_still_waits_for_task_complete() {
+        let temp_dir = create_test_temp_dir("codex-interrupted-intermediate-text");
+        let session_path = temp_dir.join("rollout-intermediate.jsonl");
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-08-12T10:00:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": "中间回复",
+                        "phase": "commentary"
+                    }
+                })
+            ),
+        )
+        .expect("应写入中间回复");
+        let completion = read_codex_turn_completion_state(&session_path, "turn-target")
+            .expect("中间回复不应阻断读取");
+        assert!(matches!(completion, CodexTurnCompletionState::Pending));
+        fs::remove_dir_all(&temp_dir).expect("应删除中间回复测试目录");
+    }
+
     /// Token 续签与清除 IPC 必须共享稳定桌面错误码，由 desktop_error 统一附加诊断 ID。
     #[test]
     fn public_api_token_ipc_uses_stable_desktop_error_code() {
@@ -7565,6 +8294,26 @@ mod tests {
         };
         assert!(submission_identity_matches(
             &wrapped_identity,
+            10_500,
+            10_000,
+            &known,
+            "/tmp/project",
+            "exact prompt"
+        ));
+        let image_wrapped_identity = CodexSubmissionIdentity {
+            thread_id: "thread-image-wrapped".to_string(),
+            canonical_cwd: "/tmp/project".to_string(),
+            first_user_message: concat!(
+                "\n# Files mentioned by the user:\n\n",
+                "## codexman-task-attachment.webp: /tmp/codexman-task-attachment.webp\n\n",
+                "## My request:\n",
+                "exact prompt\n"
+            )
+            .to_string(),
+            first_user_message_at_ms: 10_500,
+        };
+        assert!(submission_identity_matches(
+            &image_wrapped_identity,
             10_500,
             10_000,
             &known,

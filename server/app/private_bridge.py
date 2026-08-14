@@ -14,7 +14,7 @@ from .errors import ApiError
 
 PRIVATE_RPC_REQUEST_MAX_BYTES = 1024 * 1024
 PRIVATE_RPC_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
-PRIVATE_RPC_TIMEOUT_SECONDS = 10.0
+PRIVATE_RPC_TIMEOUT_SECONDS = 70.0
 _PRIVATE_RPC_BOOTSTRAP: Optional[object] = None
 logger = logging.getLogger("aitool.private_rpc")
 
@@ -296,8 +296,6 @@ class PrivateRpcClient:
         elif code in {
             "CODEX_CONNECTION_STATE_FAILED",
             "TASK_PROJECT_CAPACITY_INVALID",
-            "TASK_PROJECT_SESSION_CAPACITY_INVALID",
-            "TASK_PROJECT_TASK_CAPACITY_INVALID",
             "TASK_WORKSPACE_RESPONSE_TOO_LARGE",
             "TASK_WORKSPACE_SERIALIZATION_FAILED",
         }:

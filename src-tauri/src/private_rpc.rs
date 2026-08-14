@@ -21,14 +21,16 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
 use crate::task_store::{
-    CreateProjectRequest, CreateTaskRequest, UpdateProjectRequest, UpdateTaskRequest,
+    CreateProjectRequest, CreateTaskRequest, TaskAttachmentRecord, UpdateProjectRequest,
+    UpdateTaskRequest,
 };
 use crate::{
     complete_session_task_core, create_session_project_core, create_session_task_core,
     delete_session_project_core, delete_session_task_core, get_codex_connection_core,
     list_codex_threads_core, list_codex_workspaces_core, load_session_workspace_data_core,
-    open_session_external_thread_core, queue_session_task_core, restart_codex_core,
-    update_session_project_core, update_session_task_core, CodexThreadListRequest,
+    open_session_external_thread_core, queue_session_task_core, request_access_token_approval_core,
+    restart_codex_core, update_session_project_core, update_session_task_core,
+    CodexThreadListRequest,
 };
 
 /// 私有 RPC 单次请求 JSON 的最大长度，防止本机异常客户端造成无界内存分配。
@@ -38,8 +40,8 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// 编译期容量契约：TaskStore 聚合必须给 RPC envelope 至少保留 1 MiB，不允许两层上限独立漂移。
 const _: () =
     assert!(MAX_RESPONSE_BYTES - crate::task_store::WORKSPACE_RESPONSE_BUDGET_BYTES >= 1024 * 1024);
-/// 每条私有 RPC 连接的读写期限，避免半连接阻塞退出和后续 HTTP 请求。
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+/// 每条私有 RPC 连接的读写期限，授权确认会等待用户操作，因此需要覆盖一次弹窗确认窗口。
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(75);
 /// 非阻塞 listener 无连接时的短轮询间隔，确保 App 退出可及时回收线程。
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// 私有 RPC 同时执行业务分发的固定线程数，避免单个慢 Codex 调用阻塞所有 HTTP 请求。
@@ -47,7 +49,8 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 /// worker 全忙时允许短暂排队的连接数；超过后立即返回 RPC_BUSY，不形成无界线程或内存队列。
 const MAX_PENDING_CONNECTIONS: usize = 8;
 /// FastAPI 可调用的私有 RPC 方法全集；未登记方法在进入业务分发器前默认拒绝。
-const ALLOWED_METHODS: [&str; 14] = [
+const ALLOWED_METHODS: [&str; 15] = [
+    "requestAccessTokenApproval",
     "loadWorkspaceData",
     "createProject",
     "updateProject",
@@ -170,6 +173,9 @@ struct CreateProjectParams {
     name: String,
     /// 已存在的本地工作空间绝对路径。
     workspace_path: String,
+    /// 项目基础提示词；为空时后续任务只发送任务自身内容。
+    #[serde(default)]
+    base_prompt: String,
 }
 
 /// 更新项目的严格 RPC 参数，字段与现有 TaskStore 请求一一对应。
@@ -182,6 +188,9 @@ struct UpdateProjectParams {
     name: String,
     /// 后续任务使用的本地工作空间绝对路径。
     workspace_path: String,
+    /// 项目基础提示词；为空时后续任务只发送任务自身内容。
+    #[serde(default)]
+    base_prompt: String,
 }
 
 /// 创建任务的严格 RPC 参数，防止未知字段形成未实现的兼容协议。
@@ -194,6 +203,9 @@ struct CreateTaskParams {
     title: String,
     /// 真实发送给 Codex 的任务提示词。
     prompt: String,
+    /// 随任务发送给 Codex 的图片附件。
+    #[serde(default)]
+    attachments: Vec<TaskAttachmentRecord>,
 }
 
 /// 更新任务的严格 RPC 参数，防止绕过状态机补写额外字段。
@@ -206,6 +218,9 @@ struct UpdateTaskParams {
     title: String,
     /// 真实发送给 Codex 的新任务提示词。
     prompt: String,
+    /// 随任务发送给 Codex 的图片附件；更新时整体替换。
+    #[serde(default)]
+    attachments: Vec<TaskAttachmentRecord>,
 }
 
 /// 查询 Codex 会话列表的严格 RPC 参数。
@@ -220,6 +235,19 @@ struct ListCodexThreadsParams {
     offset: i64,
     /// 标题、预览或 thread ID 搜索关键词。
     keyword: String,
+}
+
+/// 申请 App 授权码的严格 RPC 参数。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccessTokenApprovalParams {
+    /// 公开 HTTP 请求追踪 ID，前端确认时原样返回。
+    request_id: String,
+    /// 插件或外部调用方展示名称。
+    name: String,
+    /// 授权码到期时间；空值表示永久有效。
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 impl RuntimePrivateRpc {
@@ -560,6 +588,19 @@ fn constant_time_equal(actual: &[u8], expected: &[u8]) -> bool {
 /// 异常/边界：未知方法默认拒绝；参数错误与业务错误使用不同错误码，不记录 prompt、结果或私有凭据。
 fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value, RpcErrorBody> {
     match method {
+        "requestAccessTokenApproval" => {
+            let request = decode_params::<AccessTokenApprovalParams>(params)?;
+            serialize_business_result(
+                request_access_token_approval_core(
+                    app,
+                    request.request_id,
+                    request.name,
+                    request.expires_at,
+                ),
+                "ACCESS_TOKEN_APPROVAL_FAILED",
+                "App 授权确认失败。",
+            )
+        }
         "loadWorkspaceData" => {
             let request = decode_params::<ProjectIdParams>(params)?;
             serialize_business_result(
@@ -576,6 +617,7 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                     CreateProjectRequest {
                         name: request.name,
                         workspace_path: request.workspace_path,
+                        base_prompt: request.base_prompt,
                     },
                 ),
                 "TASK_PROJECT_CREATE_FAILED",
@@ -591,6 +633,7 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                         id: request.id,
                         name: request.name,
                         workspace_path: request.workspace_path,
+                        base_prompt: request.base_prompt,
                     },
                 ),
                 "TASK_PROJECT_UPDATE_FAILED",
@@ -618,6 +661,7 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                         project_id: request.project_id,
                         title: request.title,
                         prompt: request.prompt,
+                        attachments: request.attachments,
                     },
                 ),
                 "TASK_CREATE_FAILED",
@@ -633,6 +677,7 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                         id: request.id,
                         title: request.title,
                         prompt: request.prompt,
+                        attachments: request.attachments,
                     },
                 ),
                 "TASK_UPDATE_FAILED",

@@ -62,24 +62,21 @@
                     <div class="grid content-start gap-2">
                         <h2 class="text-[14px] font-semibold text-foreground">接入流程与鉴权</h2>
                         <p>
-                            1. 浏览器/Tauri 调用 <code class="text-foreground">POST /v1/auth/device</code>
-                            生成设备授权码；该请求无 Body。只把 userCode 提供给批准方，前端保存 deviceCode，但不接触长期
-                            secret。
+                            1. 客户端先调用 <code class="text-foreground">GET /health</code>
+                            判断本机 App HTTP 服务是否可用；服务未启动时提示用户打开 typesass App。
                         </p>
                         <p>
-                            2. 机密服务端客户端可使用 HTTP Basic 调用
-                            <code class="text-foreground">POST /v1/auth/token</code> 换取固定 8 小时工作会话 Token。
+                            2. 没有授权码的客户端调用
+                            <code class="text-foreground">POST /v1/access-tokens/request</code>
+                            申请 App 授权码；用户确认后立即返回明文授权码。
                         </p>
                         <p>
-                            3. 本机桌面 App 的 hub 文档页手工输入 userCode 后，通过私有 IPC 使用 Rust
-                            内存中的临时凭据批准；普通浏览器不显示批准入口，也无法读取 Basic
-                            凭据。独立部署服务才由已配置的机密 CLI/BFF 调用
-                            <code class="text-foreground">POST /v1/auth/device/approve</code>。
+                            3. App 授权码统一在系统设置页维护，可手动创建、长期查看、复制和撤销；HTTP API
+                            文档页只负责说明契约，不维护授权码列表。
                         </p>
                         <p>
-                            4. 浏览器按 interval 轮询
-                            <code class="text-foreground">POST /v1/auth/device/token</code>；428/429 必须遵循
-                            Retry-After，成功后 deviceCode 立即失效。
+                            4. 内网来源业务接口可免授权码；公网 IP 或公网域名来源必须携带
+                            <code class="text-foreground">Authorization: Bearer &lt;App 授权码&gt;</code>。
                         </p>
                         <p>
                             5. 鉴权后先调用 <code class="text-foreground">GET /v1/models</code>，按 capability 选择
@@ -87,7 +84,8 @@
                         </p>
                         <p>
                             6. 业务请求携带
-                            <code class="text-foreground">Authorization: Bearer &lt;token&gt;</code>；每次尝试生成新的
+                            <code class="text-foreground">Authorization: Bearer &lt;App 授权码&gt;</code
+                            >；每次尝试生成新的
                             <code class="text-foreground">X-Request-ID</code>；响应也会返回该值，排障时请提供它。
                         </p>
                         <p>
@@ -98,11 +96,11 @@
                     <div class="grid content-start gap-2">
                         <h2 class="text-[14px] font-semibold text-foreground">限制、重试与排障</h2>
                         <p>v1 固定正文上限 12 MiB、解码后音频上限 8 MiB、文本上限 20000 字符。</p>
+                        <p>授权码由 App 明文维护，支持永久有效或指定到期时间；撤销或过期后公网业务接口统一返回 401。</p>
                         <p>
-                            设备码 600 秒过期、待授权容量 1000 条；批准后 Token 固定有效 8
-                            小时。服务重启后未完成授权失效，调用方应重新创建。
+                            401 检查授权码是否缺失、错误、过期或已撤销；413 缩小请求；422 修正字段；429 严格遵循
+                            Retry-After。
                         </p>
-                        <p>401 重新交换 Token；413 缩小请求；422 修正字段；429 严格遵循 Retry-After。</p>
                         <p>
                             模型 ID 失效、被禁用或 capability 不匹配时，先刷新 GET
                             /v1/models，再选择同能力的已启用模型；没有可用项时停止请求并提示管理员配置。
@@ -112,14 +110,13 @@
                             时必须优先按该值等待；仅在缺失时使用 1 秒、2 秒加随机抖动的退避。
                         </p>
                         <p>
-                            AUTHORIZATION_PENDING 按 interval 继续轮询；DEVICE_POLLING_TOO_FAST、并发/分钟限流按
-                            Retry-After 再请求；DAILY_QUOTA_EXCEEDED 等到 Retry-After 指定时间后发起新的业务请求，不受
-                            60 秒转换重试窗口约束。
+                            并发/分钟限流按 Retry-After 再请求；DAILY_QUOTA_EXCEEDED 等到 Retry-After
+                            指定时间后发起新的业务请求，不受 60 秒转换重试窗口约束。
                         </p>
-                        <p>服务不会在响应或日志中记录 Token、模型密钥、音频正文和完整请求正文。</p>
+                        <p>服务不会在响应或日志中记录授权码、模型密钥、音频正文和完整请求正文。</p>
                         <p>
-                            浏览器来源不参与访问判断；健康检查和设备码创建可以直接访问，模型、任务和 Codex
-                            状态等敏感接口仍必须携带有效 Bearer Token。
+                            浏览器来源参与访问判断；健康检查和授权码申请可以直接访问，模型、任务和 Codex
+                            状态等敏感接口按内网/公网来源执行授权码门禁。
                         </p>
                         <p>
                             Chrome/Edge 等浏览器还可能要求用户允许当前站点访问本地网络。该权限由浏览器控制，与 Bearer
@@ -135,50 +132,24 @@
                             type="button"
                             class="h-9 rounded-md bg-primary px-4 text-[13px] text-primary-foreground"
                             :disabled="exchangingToken"
-                            @click="startDeviceAuthorization">
-                            {{ exchangingToken ? '等待批准' : '生成设备授权码' }}
+                            @click="handleRequestAccessToken">
+                            {{ exchangingToken ? '申请中' : '申请 App 授权码' }}
                         </button>
-                        <code
-                            v-if="deviceUserCode"
-                            class="flex h-9 items-center rounded-md border border-border bg-muted px-3 text-[14px] font-semibold text-foreground">
-                            {{ deviceUserCode }}
-                        </code>
                     </div>
                     <p class="text-[12px] text-muted-foreground">{{ integrationTokenMessage }}</p>
                 </section>
 
-                <section
-                    v-if="canApproveDevice"
-                    class="grid gap-2 border-b border-border pb-4">
-                    <h2 class="text-[14px] font-semibold text-foreground">批准第三方 Web 设备码</h2>
-                    <div class="flex max-w-[680px] flex-wrap gap-2">
-                        <ui-input
-                            v-model="approvalUserCode"
-                            class="w-[180px] font-mono uppercase"
-                            maxlength="9"
-                            placeholder="XXXX-XXXX" />
-                        <button
-                            type="button"
-                            class="h-9 rounded-md bg-primary px-4 text-[13px] text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
-                            :disabled="approvingDevice || !approvalUserCode.trim()"
-                            @click="handleApproveDevice">
-                            {{ approvingDevice ? '批准中' : '批准设备码' }}
-                        </button>
-                    </div>
-                    <p class="text-[12px] text-muted-foreground">{{ approvalMessage }}</p>
-                </section>
-
                 <section class="grid gap-3 lg:grid-cols-2">
                     <div class="grid min-w-0 gap-2">
-                        <h2 class="text-[14px] font-semibold text-foreground">机密客户端换取 Token</h2>
+                        <h2 class="text-[14px] font-semibold text-foreground">请求 App 授权码</h2>
                         <pre class="overflow-x-auto rounded-md bg-muted p-3 text-[11px] leading-5 text-foreground">{{
-                            tokenCurlExample
+                            requestAccessTokenCurlExample
                         }}</pre>
                     </div>
                     <div class="grid min-w-0 gap-2">
-                        <h2 class="text-[14px] font-semibold text-foreground">浏览器设备码授权</h2>
+                        <h2 class="text-[14px] font-semibold text-foreground">系统设置手动创建</h2>
                         <pre class="overflow-x-auto rounded-md bg-muted p-3 text-[11px] leading-5 text-foreground">{{
-                            deviceCurlExample
+                            createAccessTokenCurlExample
                         }}</pre>
                     </div>
                     <div class="grid min-w-0 gap-2">
@@ -285,8 +256,8 @@
                     <div class="grid content-start gap-2">
                         <h2 class="text-[14px] font-semibold text-foreground">容量与当前边界</h2>
                         <p>
-                            最多 200 个项目；每个项目最多 16 个任务和 16 个任务会话；任务聚合业务 JSON 预算 7 MiB，私有
-                            RPC 响应硬上限 8 MiB。达到上限会返回稳定错误，不会截断后伪装成功。
+                            最多 200 个项目；任务和会话历史不按条数设上限；任务聚合业务 JSON 预算 7 MiB，私有 RPC
+                            响应硬上限 8 MiB。达到上限会返回稳定错误，不会截断后伪装成功。
                         </p>
                         <p>
                             CodeX 会话搜索每页 1 到 60 条；项目名最多 100 个 Unicode 字符，任务标题最多 200 个 Unicode
@@ -482,7 +453,6 @@
         AccordionItem as UiAccordionItem,
         AccordionTrigger as UiAccordionTrigger
     } from '@/components/ui/accordion';
-    import { Input as UiInput } from '@/components/ui/input';
     import type {
         HttpApiEndpointModel,
         HttpApiOpenApiDocumentModel,
@@ -490,14 +460,7 @@
         HttpApiResponseModel,
         HttpApiSchemaModel
     } from '@/model/httpApiDoc';
-    import {
-        approvePublicApiDevice,
-        createPublicApiDeviceAuthorization,
-        getPublicApiToken,
-        isTauriRuntime,
-        pollPublicApiDeviceToken,
-        readPublicApiOpenApi
-    } from '@/service/tauri/command';
+    import { getPublicApiToken, readPublicApiOpenApi, requestPublicApiAccessToken } from '@/service/tauri/command';
 
     defineOptions({
         name: 'HttpApiDocView'
@@ -549,15 +512,8 @@
     const apiDocument = ref<HttpApiOpenApiDocumentModel | null>(null);
     const loading = ref(false);
     const errorMessage = ref('');
-    const deviceUserCode = ref('');
     const exchangingToken = ref(false);
-    const approvalUserCode = ref('');
-    const approvingDevice = ref(false);
-    const approvalMessage = ref('输入第三方浏览器展示的设备码后，由本机客户端完成批准。');
-    let devicePollingTimer: number | null = null;
-    let devicePollingGeneration = 0;
-    const integrationTokenMessage = ref('正在检查当前运行会话 Token。');
-    const canApproveDevice = computed(() => isTauriRuntime());
+    const integrationTokenMessage = ref('正在检查当前运行会话授权码。');
 
     const documentDescription = computed(() => {
         return apiDocument.value?.info.description || '读取独立 HTTP 服务当前真实开放的接口。';
@@ -573,46 +529,36 @@
         return groupEndpoints(apiDocument.value, endpoints);
     });
     const documentServerUrl = computed(() => apiDocument.value?.servers?.[0]?.url || 'http://127.0.0.1:18080');
-    const tokenCurlExample = computed(
-        () => `curl -X POST '${documentServerUrl.value}/v1/auth/token' \\
-  -u '<CLIENT_ID>:<CLIENT_SECRET>' \\
-  -H 'Accept: application/json' \\
-  -H 'X-Request-ID: partner-auth-20260810-001'`
+    const requestAccessTokenCurlExample = computed(
+        () => `curl -X POST '${documentServerUrl.value}/v1/access-tokens/request' \\
+  -H 'Content-Type: application/json' \\
+  -H 'X-Request-ID: partner-access-token-request-001' \\
+  -d '{"name":"Chrome 插件","expiresAt":null}'`
     );
-    const deviceCurlExample = computed(
-        () => `# 1. 浏览器创建设备码
-curl -X POST '${documentServerUrl.value}/v1/auth/device' \\
-  -H 'X-Request-ID: browser-device-create-001'
-
-# 2. 默认由桌面 App 的 hub 文档页手工输入 userCode 并批准
-# 独立部署服务端时，已配置的机密 CLI/BFF 才使用自行配置的 Basic 凭据：
-curl -X POST '${documentServerUrl.value}/v1/auth/device/approve' \\
-  -u '<APPROVER_CLIENT_ID>:<APPROVER_CLIENT_SECRET>' \\
+    const createAccessTokenCurlExample = computed(
+        () => `curl -X POST '${documentServerUrl.value}/v1/access-tokens' \\
+  -H 'Authorization: Bearer <APP_ACCESS_TOKEN>' \\
   -H 'Content-Type: application/json' \\
-  -d '{"userCode":"<USER_CODE>"}'
-
-# 3. 浏览器按 interval 轮询 deviceCode；428 继续等待，429 遵循 Retry-After
-curl -X POST '${documentServerUrl.value}/v1/auth/device/token' \\
-  -H 'Content-Type: application/json' \\
-  -d '{"deviceCode":"<DEVICE_CODE>"}'`
+  -H 'X-Request-ID: app-access-token-create-001' \\
+  -d '{"name":"官网后台","expiresAt":null}'`
     );
     const textCurlExample = computed(
         () => `curl -X POST '${documentServerUrl.value}/v1/text/process' \\
-  -H 'Authorization: Bearer <SHORT_LIVED_ACCESS_TOKEN>' \\
+  -H 'Authorization: Bearer <APP_ACCESS_TOKEN>' \\
   -H 'Content-Type: application/json' \\
   -H 'X-Request-ID: partner-order-20260810-001' \\
   -d '{"modelId":"<ENABLED_TEXT_MODEL_ID>","mode":"polish","text":"需要润色的文本","audioDurationMs":0,"dictionary":[],"contextApp":"partner-web","styleInstruction":"表达简洁"}'`
     );
     const audioCurlExample = computed(
         () => `curl -X POST '${documentServerUrl.value}/v1/audio/transcriptions' \\
-  -H 'Authorization: Bearer <SHORT_LIVED_ACCESS_TOKEN>' \\
+  -H 'Authorization: Bearer <APP_ACCESS_TOKEN>' \\
   -H 'Content-Type: application/json' \\
   -H 'X-Request-ID: partner-audio-20260810-001' \\
   -d '{"modelId":"<ENABLED_ASR_MODEL_ID>","audioBase64":"<BASE64_AUDIO>","contentType":"audio/wav","language":"auto"}'`
     );
     const codexSessionCurlExample = computed(
         () => `BASE_URL='${documentServerUrl.value}'
-TOKEN='<SHORT_LIVED_ACCESS_TOKEN>'
+TOKEN='<APP_ACCESS_TOKEN>'
 
 # 1. 从响应选择真实 cwd
 curl "$BASE_URL/v1/codex/workspaces" \\
@@ -633,7 +579,7 @@ curl -X POST "$BASE_URL/v1/codex/threads/<THREAD_ID>/open" \\
     );
     const taskManagementCurlExample = computed(
         () => `BASE_URL='${documentServerUrl.value}'
-TOKEN='<SHORT_LIVED_ACCESS_TOKEN>'
+TOKEN='<APP_ACCESS_TOKEN>'
 
 # 1. 创建项目，并从响应 projects 中取得 PROJECT_ID
 PROJECT_RESPONSE="$(curl -fsS -X POST "$BASE_URL/v1/projects" \\
@@ -670,108 +616,33 @@ curl -X POST "$BASE_URL/v1/tasks/$TASK_ID/complete" \\
     onMounted(async () => {
         try {
             integrationTokenMessage.value = (await getPublicApiToken())
-                ? '当前运行会话已配置 Token；桌面端各窗口可共享，退出 App 或关闭浏览器标签页后清除。'
-                : '尚未配置 Token；健康检查可用，但 AI 请求会返回 401。';
+                ? '当前运行会话已配置 App 授权码；公网来源业务请求会自动携带。'
+                : '尚未配置 App 授权码；内网来源可访问业务接口，公网来源会返回 401。';
         } catch (error) {
             integrationTokenMessage.value = error instanceof Error ? error.message : '读取当前授权状态失败。';
         }
         await loadDocument();
     });
 
-    onUnmounted(() => {
-        stopDevicePolling();
-    });
-
     /**
-     * 启动当前标签页的设备码授权。
-     * 流程：创建 userCode 并展示给机密批准方，按服务端 interval 自动轮询；批准后保存 8 小时工作会话 Token。
+     * 为当前 Web 会话申请 App 授权码。
+     * 流程：调用授权码申请接口，服务端在 App 用户确认后直接返回明文授权码，并保存到当前运行会话。
      * 参数：无。
-     * 返回：无。
-     * 边界：Web/Tauri 永不接收 client secret；设备码过期或错误时停止轮询并要求重新创建。
+     * 返回：申请完成 Promise。
+     * 边界：不生成设备码、不保存 pending、不轮询授权结果。
      */
-    async function startDeviceAuthorization(): Promise<void> {
-        stopDevicePolling();
+    async function handleRequestAccessToken(): Promise<void> {
+        if (exchangingToken.value) return;
         exchangingToken.value = true;
         try {
-            const authorization = await createPublicApiDeviceAuthorization();
-            deviceUserCode.value = authorization.userCode;
-            integrationTokenMessage.value = `${authorization.approvalInstruction} 授权码：${authorization.userCode}。本页将在 ${authorization.expiresIn} 秒内自动等待批准。`;
-            const pollingGeneration = devicePollingGeneration;
-            devicePollingTimer = window.setTimeout(() => {
-                void pollDeviceAuthorization(authorization.deviceCode, authorization.interval, pollingGeneration);
-            }, authorization.interval * 1000);
+            const response = await requestPublicApiAccessToken('HTTP API 文档调试会话', null);
+            integrationTokenMessage.value = response.expiresAt
+                ? `App 授权码已应用到当前运行会话，到期时间：${response.expiresAt}。`
+                : 'App 授权码已应用到当前运行会话，当前授权码为永久有效。';
         } catch (error) {
-            integrationTokenMessage.value = error instanceof Error ? error.message : '设备授权启动失败。';
-            exchangingToken.value = false;
-        }
-    }
-
-    /**
-     * 轮询设备码批准状态。
-     * 流程：每次请求结束后才安排下一次 setTimeout；成功后停止轮询并显示 TTL；其它错误停止并展示 code/requestId。
-     * 参数：deviceCode 为当前页面闭包中的高熵码，intervalSeconds 为服务端间隔，pollingGeneration 用于屏蔽旧轮询响应。
-     * 返回：轮询完成 Promise。
-     * 边界：AUTHORIZATION_PENDING 和 DEVICE_POLLING_TOO_FAST 会串行续轮询；已取消或已成功代次的迟到响应不会覆盖新状态。
-     */
-    async function pollDeviceAuthorization(
-        deviceCode: string,
-        intervalSeconds: number,
-        pollingGeneration: number
-    ): Promise<void> {
-        try {
-            const expiresIn = await pollPublicApiDeviceToken(deviceCode);
-            if (pollingGeneration !== devicePollingGeneration) return;
-            stopDevicePolling();
-            deviceUserCode.value = '';
-            integrationTokenMessage.value = `Token 已应用到当前运行会话，将在 ${expiresIn / 3600} 小时后过期。`;
-            exchangingToken.value = false;
-        } catch (error) {
-            if (pollingGeneration !== devicePollingGeneration) return;
-            const message = error instanceof Error ? error.message : '设备授权轮询失败。';
-            if (message.includes('AUTHORIZATION_PENDING') || message.includes('DEVICE_POLLING_TOO_FAST')) {
-                devicePollingTimer = window.setTimeout(() => {
-                    void pollDeviceAuthorization(deviceCode, intervalSeconds, pollingGeneration);
-                }, intervalSeconds * 1000);
-                return;
-            }
-            stopDevicePolling();
-            integrationTokenMessage.value = message;
-            exchangingToken.value = false;
-        }
-    }
-
-    /**
-     * 停止设备授权轮询。
-     * 流程：递增轮询代次使在途响应失效，清理当前 timeout 并重置句柄，避免重复授权叠加请求。
-     * 返回：无。
-     * 边界：没有活动定时器时保持幂等。
-     */
-    function stopDevicePolling(): void {
-        devicePollingGeneration += 1;
-        if (devicePollingTimer !== null) {
-            window.clearTimeout(devicePollingTimer);
-            devicePollingTimer = null;
-        }
-    }
-
-    /**
-     * 批准第三方浏览器展示的设备授权码。
-     * 流程：规范化为大写 userCode，经 Tauri 私有 IPC 交给 Rust 进程内批准方凭据，再展示可诊断结果。
-     * 参数：无，读取当前 approvalUserCode；返回完成 Promise。
-     * 边界：普通 Web 不展示入口；失败时保留输入，成功后清空，不向 WebView 返回 Basic 凭据或 Token。
-     */
-    async function handleApproveDevice(): Promise<void> {
-        if (approvingDevice.value) return;
-        const userCode = approvalUserCode.value.trim().toUpperCase();
-        if (!userCode) return;
-        approvingDevice.value = true;
-        try {
-            approvalMessage.value = await approvePublicApiDevice(userCode);
-            approvalUserCode.value = '';
-        } catch (error) {
-            approvalMessage.value = error instanceof Error ? error.message : '设备授权批准失败。';
+            integrationTokenMessage.value = error instanceof Error ? error.message : '授权码申请失败。';
         } finally {
-            approvingDevice.value = false;
+            exchangingToken.value = false;
         }
     }
 

@@ -20,8 +20,28 @@
                     <div class="grid gap-2 rounded-md border border-border bg-card p-3">
                         <span class="text-[12px] font-medium text-foreground">任务内容</span>
                         <p class="whitespace-pre-wrap break-words text-[13px] leading-6 text-muted-foreground">
-                            {{ task.prompt || '-' }}
+                            {{ formattedPromptText }}
                         </p>
+                        <div
+                            v-if="promptImages.length"
+                            class="grid grid-cols-2 gap-2">
+                            <button
+                                v-for="image in promptImages"
+                                :key="image.src"
+                                type="button"
+                                class="group relative aspect-video overflow-hidden rounded-md border border-border bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                :title="image.alt || '预览图片'"
+                                @click="handlePreviewImage(image)">
+                                <img
+                                    :src="image.src"
+                                    :alt="image.alt || '任务截图缩略图'"
+                                    class="h-full w-full object-cover transition-transform group-hover:scale-105" />
+                                <span
+                                    class="absolute inset-x-0 bottom-0 bg-overlay/70 px-2 py-1 text-left text-[11px] leading-4 text-white opacity-0 transition-opacity group-hover:opacity-100">
+                                    预览
+                                </span>
+                            </button>
+                        </div>
                     </div>
 
                     <div
@@ -59,10 +79,38 @@
             </div>
         </ui-sheet-content>
     </ui-sheet>
+    <ui-dialog v-model:open="previewDialogOpen">
+        <ui-dialog-content class="max-h-[calc(100vh-2rem)] max-w-[min(960px,calc(100vw-2rem))] gap-3 p-4">
+            <ui-dialog-header class="pr-8">
+                <ui-dialog-title class="text-[15px] leading-6">{{ previewImage?.alt || '图片预览' }}</ui-dialog-title>
+                <ui-dialog-description class="sr-only">预览任务内容中携带的浏览器截图。</ui-dialog-description>
+            </ui-dialog-header>
+            <div class="min-h-0 overflow-auto rounded-md border border-border bg-background">
+                <img
+                    v-if="previewImage"
+                    :src="previewImage.src"
+                    :alt="previewImage.alt || '任务截图预览'"
+                    class="max-h-[calc(100vh-10rem)] w-full object-contain" />
+            </div>
+        </ui-dialog-content>
+    </ui-dialog>
 </template>
 
 <script setup lang="ts">
+    import {
+        attachmentListToPromptImages,
+        extractPromptImages,
+        formatPromptText,
+        type TaskPromptImageModel
+    } from '@/components/taskManage/taskPromptImage';
     import { Badge as UiBadge } from '@/components/ui/badge';
+    import {
+        Dialog as UiDialog,
+        DialogContent as UiDialogContent,
+        DialogDescription as UiDialogDescription,
+        DialogHeader as UiDialogHeader,
+        DialogTitle as UiDialogTitle
+    } from '@/components/ui/dialog';
     import {
         Sheet as UiSheet,
         SheetContent as UiSheetContent,
@@ -82,6 +130,31 @@
     }>();
 
     const open = defineModel<boolean>('open', { default: false });
+    const previewDialogOpen = ref(false);
+    const previewImage = ref<TaskPromptImageModel | null>(null);
+
+    /**
+     * 格式化详情侧窗任务内容。
+     * 流程：移除 Markdown 图片语法，图片改由缩略图区域承载，正文保留完整文本证据。
+     * 参数：无显式参数，依赖当前 task.prompt。
+     * 返回：适合详情侧窗展示的正文内容。
+     * 边界：无任务或仅图片内容时展示短横线。
+     */
+    const formattedPromptText = computed<string>(() => {
+        return formatPromptText(props.task?.prompt ?? '');
+    });
+
+    /**
+     * 解析详情侧窗任务截图列表。
+     * 流程：从当前任务提示词中解析 Markdown 图片，供缩略图和预览弹窗展示。
+     * 参数：无显式参数，依赖当前 task.prompt。
+     * 返回：当前任务内容中的图片列表。
+     * 边界：无任务或无图片时返回空数组，模板不展示缩略图区域。
+     */
+    const promptImages = computed<TaskPromptImageModel[]>(() => {
+        const attachmentImages = attachmentListToPromptImages(props.task?.attachments ?? []);
+        return attachmentImages.length ? attachmentImages : extractPromptImages(props.task?.prompt ?? '');
+    });
 
     const taskMetaRows = computed<{ label: string; value: string }[]>(() => {
         const { task } = props;
@@ -123,6 +196,18 @@
             failed: '失败'
         };
         return labels[status];
+    }
+
+    /**
+     * 打开任务图片预览弹窗。
+     * 流程：保存当前点击的图片资源并打开 Dialog，大图直接复用缩略图 src。
+     * 参数：image 为用户点击的任务提示词图片。
+     * 返回：无返回值。
+     * 边界：预览弹窗独立于详情侧窗，不改变当前任务详情打开状态。
+     */
+    function handlePreviewImage(image: TaskPromptImageModel): void {
+        previewImage.value = image;
+        previewDialogOpen.value = true;
     }
 
     /**
