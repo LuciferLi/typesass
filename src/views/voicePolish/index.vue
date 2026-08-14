@@ -543,7 +543,12 @@
      * 返回：无返回值。
      * 边界：普通 Web 完成录音和 HTTP 处理后在页面展示结果，不执行桌面自动粘贴。
      */
-    function handleStartVoice(mode: VoicePolishRunModeType): void {
+    async function handleStartVoice(mode: VoicePolishRunModeType): Promise<void> {
+        await refreshVoicePermission();
+        if (!isMicrophoneReady.value) {
+            permissionPromptOpen.value = true;
+            return;
+        }
         void store.runVoicePolish('', mode);
     }
 </script>

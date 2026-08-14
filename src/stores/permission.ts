@@ -113,10 +113,7 @@ export const usePermissionStore = defineStore('permission', {
                     return;
                 }
                 const diagnostics = await getRuntimeDiagnostics();
-                const microphoneReady = await navigator.permissions
-                    ?.query({ name: 'microphone' as PermissionName })
-                    .then((permission) => permission.state === 'granted')
-                    .catch(() => false);
+                const microphoneReady = Boolean(diagnostics?.microphoneAuthorized);
                 const publicApiConnected = await checkPublicApiHealth();
                 const publicApiAuthorized = publicApiConnected && (await hasPublicApiToken());
                 this.items = [

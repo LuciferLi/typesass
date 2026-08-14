@@ -8,8 +8,8 @@ import type {
 import { CODEX_DESKTOP_NOT_CONNECTED_ERROR_CODE, CODEX_RESTART_IN_PROGRESS_ERROR_CODE } from '@/model/codexConnection';
 import { getCodexConnectionStatus, isPublicApiRequestErrorCode, restartCodexConnection } from '@/service/tauri/command';
 
-/** 页面可见时的 Codex 连接轮询间隔，满足侧栏近实时反馈。 */
-const VISIBLE_CONNECTION_POLL_INTERVAL_MS = 2_000;
+/** 页面可见时的 Codex 连接轮询间隔，降低首屏和后台 sidecar 启动阶段的连接探测压力。 */
+const VISIBLE_CONNECTION_POLL_INTERVAL_MS = 10_000;
 /** 页面隐藏时的 Codex 连接轮询间隔，降低后台资源消耗。 */
 const HIDDEN_CONNECTION_POLL_INTERVAL_MS = 30_000;
 /** 重启请求被接受后等待 Codex 恢复连接的最长时间，防止网络异常永久锁住弹窗。 */
@@ -239,7 +239,7 @@ export const useCodexConnectionStore = defineStore('codexConnection', {
 
         /**
          * 启动主布局生命周期内的 Codex 连接轮询。
-         * 流程：立即检查一次，注册页面可见性监听，并按前台 2 秒、后台 30 秒持续单飞刷新。
+         * 流程：注册页面可见性监听，并按前台 10 秒、后台 30 秒持续单飞刷新；首屏不立即探测，避免与 sidecar 冷启动抢资源。
          * 参数：无。
          * 返回：无返回值。
          * 边界：重复调用不会注册多个监听器或定时器。
@@ -256,7 +256,6 @@ export const useCodexConnectionStore = defineStore('codexConnection', {
             };
             document.addEventListener('visibilitychange', connectionVisibilityListener);
             resetConnectionPollingTimer();
-            void this.refreshConnection(true);
         },
 
         /**
@@ -287,6 +286,7 @@ export const useCodexConnectionStore = defineStore('codexConnection', {
         openDialog(): void {
             if (!this.restartAwaitingResult) this.dialogResult = 'status';
             this.dialogOpen = true;
+            void this.refreshConnection(false);
         },
 
         /**

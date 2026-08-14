@@ -331,13 +331,16 @@
     const route = useRoute();
     const router = useRouter();
     const isClientRuntime = isTauriRuntime();
-    /** 公共 HTTP 健康检查间隔；30 秒可及时恢复状态，同时避免高频请求淹没业务访问日志。 */
+    /** 公共 HTTP 服务启动期健康检查间隔；用于 sidecar 后台启动后尽快恢复首屏功能。 */
+    const PUBLIC_API_STARTUP_HEALTH_INTERVAL_MS = 1_000;
+    /** 公共 HTTP 健康检查稳定间隔；服务已连接后降低后台请求频率。 */
     const PUBLIC_API_HEALTH_INTERVAL_MS = 30_000;
     const clientBridgeHealthy = ref(false);
     const approvalSubmitting = ref(false);
     const accessTokenApprovalRequest = ref<PublicApiAccessTokenApprovalEventModel | null>(null);
     let clientBridgeHealthTimer: number | undefined;
     let unlistenAccessTokenApproval: (() => void) | undefined;
+    let stopRoutePermissionWatcher: (() => void) | undefined;
 
     const navItems = [
         { routeName: HubRouteName.VoicePolish, label: '语音转文字润色', icon: Microphone },
@@ -440,6 +443,29 @@
     }
 
     /**
+     * 判断当前路由是否需要读取最新权限状态。
+     * 流程：权限管理页展示全部系统授权，语音页直接依赖麦克风授权，两类页面都需要避免使用旧 Store 缓存。
+     * 参数：routeName 为 Vue Router 当前路由名称。
+     * 返回：命中权限敏感页面时返回 true。
+     * 边界：未命名路由或其它页面不触发额外刷新，减少无关页面的系统诊断请求。
+     */
+    function isPermissionSensitiveRoute(routeName: typeof route.name): boolean {
+        return routeName === HubRouteName.Permission || routeName === HubRouteName.VoicePolish;
+    }
+
+    /**
+     * 在权限敏感页面刷新当前系统权限状态。
+     * 流程：仅当当前路由需要权限诊断时调用权限 Store；用于页面切换和窗口重新聚焦。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：刷新失败由 Store 写入 message，不阻塞路由或窗口焦点恢复。
+     */
+    function refreshPermissionsForActiveRoute(): void {
+        if (!isPermissionSensitiveRoute(route.name)) return;
+        void permissionStore.refreshPermissions();
+    }
+
+    /**
      * 跳转到指定 Hub 页面。
      * 流程：根据路由名称执行 router.push，让 URL、选中态和页面内容保持一致。
      * 参数：routeName 为 HubRouteName 中登记的页面名称。
@@ -488,16 +514,22 @@
 
     /**
      * 启动公共 HTTP 服务健康状态轮询。
-     * 流程：页面挂载后立即检查一次，再按固定间隔持续刷新。
+     * 流程：页面挂载后立即检查一次；未连接时按启动期间隔快速恢复，连接后改用稳定间隔。
      * 参数：无。
      * 返回：无返回值。
-     * 边界：组件卸载时清理旧定时器，避免重复轮询。
+     * 边界：组件卸载时清理旧定时器，避免重复轮询；单次失败不会打断页面展示。
      */
     function startClientBridgeHealthPolling(): void {
-        void refreshClientBridgeHealth();
-        clientBridgeHealthTimer = window.setInterval(() => {
-            void refreshClientBridgeHealth();
-        }, PUBLIC_API_HEALTH_INTERVAL_MS);
+        const runPolling = async (): Promise<void> => {
+            await refreshClientBridgeHealth();
+            const intervalMs = clientBridgeHealthy.value
+                ? PUBLIC_API_HEALTH_INTERVAL_MS
+                : PUBLIC_API_STARTUP_HEALTH_INTERVAL_MS;
+            clientBridgeHealthTimer = window.setTimeout(() => {
+                void runPolling();
+            }, intervalMs);
+        };
+        void runPolling();
     }
 
     /**
@@ -551,6 +583,13 @@
         startClientBridgeHealthPolling();
         codexConnectionStore.startPolling();
         await permissionStore.refreshPermissions();
+        window.addEventListener('focus', refreshPermissionsForActiveRoute);
+        stopRoutePermissionWatcher = watch(
+            () => route.name,
+            () => {
+                refreshPermissionsForActiveRoute();
+            }
+        );
         await listenEvent<string>('hub-switch-view', (view) => {
             if (isHubSwitchViewKey(view)) {
                 handleNavigate(routeNameByHubView[view]);
@@ -572,8 +611,10 @@
 
     onUnmounted(() => {
         codexConnectionStore.stopPolling();
+        stopRoutePermissionWatcher?.();
+        window.removeEventListener('focus', refreshPermissionsForActiveRoute);
         if (clientBridgeHealthTimer !== undefined) {
-            window.clearInterval(clientBridgeHealthTimer);
+            window.clearTimeout(clientBridgeHealthTimer);
         }
         unlistenAccessTokenApproval?.();
     });

@@ -19,6 +19,8 @@ export type PermissionKeyType = 'microphone' | 'accessibility' | 'shortcut' | 'h
 
 // Tauri 运行诊断模型，来源于原生 get_runtime_diagnostics 命令。
 export type RuntimeDiagnosticsModel = {
+    // 麦克风权限是否已授权。
+    microphoneAuthorized: boolean;
     // 辅助功能权限是否已授权。
     accessibilityTrusted: boolean;
     // 当前桌面端实际保存的全局快捷键配置。

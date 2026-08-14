@@ -31,7 +31,7 @@ CodexMan 是一款基于 Tauri、Vue 和 FastAPI 的语音输入工具。当前�
 
 Chrome 浏览器插件只维护 `codexManExtension/` 这一份源码。`npm run build:browser-extension` 会生成 `public/downloads/typesass-extension.zip`，前端页面的下载链接和桌面端 Tauri 导出命令都使用这个 ZIP；`npm run dev`、`npm run build`、`npm run tauri:build` 会自动先刷新插件包。
 
-macOS 官网分发使用 Tauri 专用发布流程，不使用 Electron 打包或 Electron 公证流程。执行 `npm run release:mac` 会清理旧 bundle、运行 Tauri dmg 构建、使用 `codexman-notary` 公证、贴票并执行 Gatekeeper 验证，最终输出到 `website/downloads/codexman_版本_架构.dmg`。当前官网固定下载文件为 `website/downloads/codexman_0.0.2_aarch64.dmg`。
+macOS 官网分发使用 Tauri 专用发布流程，不使用 Electron 打包或 Electron 公证流程。执行 `npm run release:mac` 会清理旧 bundle、运行 Tauri dmg 构建、使用 `codexman-notary` 公证、贴票并执行 Gatekeeper 验证，最终输出到 `website/downloads/codexman_版本_架构.dmg`。每次发布前必须先递增 `package.json` 与 `src-tauri/tauri.conf.json` 版本，小修复递增 patch 位，较大功能版本递增 minor 位。
 
 App 启动时自动托管固定地址为 `http://127.0.0.1:18080` 的本机 HTTP 服务，用户无需配置 IP 或域名。HTTP 服务契约见 [server/README.md](server/README.md)：
 

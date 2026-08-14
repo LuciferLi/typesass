@@ -1,8 +1,9 @@
 import { constants } from 'node:fs';
-import { access, cp, mkdir, readFile, rm } from 'node:fs/promises';
+import { access, cp, mkdir, mkdtemp, readFile, rename, rm, symlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import process from 'node:process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 /** 当前脚本目录，用于稳定解析 CodexMan 项目根目录。 */
@@ -17,6 +18,9 @@ const tauriBundleDirectory = join(projectRoot, 'src-tauri', 'target', 'release',
 const websiteDownloadDirectory = join(projectRoot, 'website', 'downloads');
 /** Apple 公证钥匙串 profile，来自本机 notarytool store-credentials。 */
 const notaryProfile = process.env.CODEXMAN_NOTARY_PROFILE || 'codexman-notary';
+/** macOS Developer ID Application 签名身份，用于补签备用流程生成的 DMG。 */
+const macSigningIdentity =
+    process.env.CODEXMAN_MAC_SIGN_IDENTITY || 'Developer ID Application: Tamba Trading Co., Ltd. (9VKQ2P8P6N)';
 
 /**
  * 读取并解析 Tauri 配置。
@@ -78,6 +82,43 @@ function run(command, args, options = {}) {
 }
 
 /**
+ * 执行需要读取 stdout 的发布命令。
+ * 流程：收集 stdout/stderr，成功时返回 stdout；失败时把 stderr 合入错误，便于定位 hdiutil 这类静默失败。
+ * 参数：command 为命令名；args 为参数数组；options 可覆盖工作目录和环境变量。
+ * 返回：命令 stdout 文本。
+ * 异常/边界：不会把 stdout/stderr 写入日志文件；调用方不得传入包含密钥的命令参数。
+ */
+function runCapture(command, args, options = {}) {
+    return new Promise((resolvePromise, reject) => {
+        const child = spawn(command, args, {
+            cwd: options.cwd || projectRoot,
+            env: { ...process.env, ...(options.env || {}) },
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (chunk) => {
+            stdout += chunk.toString();
+        });
+        child.stderr.on('data', (chunk) => {
+            stderr += chunk.toString();
+        });
+        child.once('error', reject);
+        child.once('exit', (code, signal) => {
+            if (code === 0) {
+                resolvePromise(stdout);
+                return;
+            }
+            reject(
+                new Error(
+                    `${command} ${args.join(' ')} 失败：exit=${code ?? 'null'} signal=${signal ?? 'none'}\n${stderr || stdout}`
+                )
+            );
+        });
+    });
+}
+
+/**
  * 解析当前 macOS 架构对应的 Tauri dmg 架构后缀。
  * 流程：把 Node 架构映射为 Tauri dmg 命名使用的后缀。
  * 参数：无。
@@ -120,6 +161,98 @@ async function resolveBuiltDmg(version) {
 }
 
 /**
+ * 解析 hdiutil attach 输出中的设备与挂载目录。
+ * 流程：设备取第一条 `/dev/` 行，挂载目录取包含 Apple_HFS 的最后一列。
+ * 参数：output 为 hdiutil attach stdout。
+ * 返回：设备路径和挂载目录。
+ * 异常/边界：解析不到任一字段时阻止继续写入镜像，避免误操作本机其它目录。
+ */
+function parseAttachOutput(output) {
+    const lines = output.split('\n').map((line) => line.trim()).filter(Boolean);
+    const device = lines.find((line) => line.startsWith('/dev/'))?.split(/\s+/)[0] || '';
+    const hfsLine = lines.find((line) => line.includes('Apple_HFS'));
+    const mountDir = hfsLine?.split(/\s+/).at(-1) || '';
+    if (!device || !mountDir) {
+        throw new Error(`无法解析 hdiutil attach 输出：${output}`);
+    }
+    return { device, mountDir };
+}
+
+/**
+ * 使用同名 App workaround 生成 CodexMan DMG。
+ * 流程：先把已签名 App 复制为临时 Payload.app 规避 hdiutil 对卷名 CodexMan + CodexMan.app 的权限错误，挂载后再改回 CodexMan.app 并压缩为最终 DMG。
+ * 参数：version 为 Tauri 版本号。
+ * 返回：生成的 dmg 绝对路径。
+ * 异常/边界：仅在 Tauri 已成功生成签名 `.app` 后使用；失败时会尽力卸载临时镜像并清理临时目录。
+ */
+async function buildDmgWithSameNameWorkaround(version) {
+    const architecture = resolveDmgArchitecture();
+    const appPath = join(tauriBundleDirectory, 'macos', 'CodexMan.app');
+    if (!(await exists(appPath))) {
+        throw new Error('Tauri DMG 失败后未找到 CodexMan.app，无法执行备用 DMG 生成。');
+    }
+    const dmgDirectory = join(tauriBundleDirectory, 'dmg');
+    const finalDmgPath = join(dmgDirectory, `codexman_${version}_${architecture}.dmg`);
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'codexman-dmg-work-'));
+    const stagingDirectory = join(temporaryDirectory, 'staging');
+    const readWriteDmgPath = join(temporaryDirectory, 'codexman-rw.dmg');
+    let attachedDevice = '';
+    try {
+        await mkdir(dmgDirectory, { recursive: true });
+        await mkdir(stagingDirectory, { recursive: true });
+        await run('ditto', [appPath, join(stagingDirectory, 'Payload.app')]);
+        await symlink('/Applications', join(stagingDirectory, 'Applications'));
+        await run('hdiutil', [
+            'create',
+            '-srcfolder',
+            stagingDirectory,
+            '-volname',
+            'CodexMan',
+            '-fs',
+            'HFS+',
+            '-format',
+            'UDRW',
+            readWriteDmgPath
+        ]);
+        const attachOutput = await runCapture('hdiutil', [
+            'attach',
+            '-mountrandom',
+            tmpdir(),
+            '-readwrite',
+            '-noverify',
+            '-noautoopen',
+            '-nobrowse',
+            readWriteDmgPath
+        ]);
+        const { device, mountDir } = parseAttachOutput(attachOutput);
+        attachedDevice = device;
+        await rename(join(mountDir, 'Payload.app'), join(mountDir, 'CodexMan.app'));
+        await run('hdiutil', ['detach', attachedDevice]);
+        attachedDevice = '';
+        await rm(finalDmgPath, { force: true });
+        await run('hdiutil', ['convert', readWriteDmgPath, '-format', 'UDZO', '-o', finalDmgPath]);
+        return finalDmgPath;
+    } finally {
+        if (attachedDevice) {
+            await run('hdiutil', ['detach', attachedDevice]).catch(() => undefined);
+        }
+        await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+}
+
+/**
+ * 对 DMG 产物执行 Developer ID 签名。
+ * 流程：先强制替换已有签名，再交给 notarytool 公证，确保 Gatekeeper 能识别磁盘镜像自身签名。
+ * 参数：dmgPath 为待发布 DMG 绝对路径。
+ * 返回：签名完成后返回。
+ * 异常/边界：签名身份可通过 CODEXMAN_MAC_SIGN_IDENTITY 覆盖；签名失败会阻止发布，避免上传不可安装产物。
+ */
+async function signDmg(dmgPath) {
+    await run('codesign', ['--force', '--sign', macSigningIdentity, dmgPath]);
+    await run('codesign', ['--verify', '--verbose=4', dmgPath]);
+}
+
+/**
  * 执行 CodexMan Tauri macOS 发布闭环。
  * 流程：清理旧 bundle、构建 dmg、公证、贴票、Gatekeeper 验证，并复制到官网下载目录。
  * 参数：无。
@@ -136,9 +269,16 @@ async function main() {
     await rm(websiteDmgPath, { force: true });
 
     await run('npm', ['run', 'build']);
-    await run('npx', ['tauri', 'build', '--bundles', 'dmg']);
+    try {
+        await run('npx', ['tauri', 'build', '--bundles', 'dmg']);
+    } catch (error) {
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        process.stderr.write('Tauri 原生 DMG 生成失败，尝试使用 CodexMan 同名 App workaround 生成 DMG。\n');
+        await buildDmgWithSameNameWorkaround(version);
+    }
 
     const dmgPath = await resolveBuiltDmg(version);
+    await signDmg(dmgPath);
     await run('xcrun', ['notarytool', 'submit', dmgPath, '--keychain-profile', notaryProfile, '--wait']);
     await run('xcrun', ['stapler', 'staple', dmgPath]);
     await run('xcrun', ['stapler', 'validate', dmgPath]);

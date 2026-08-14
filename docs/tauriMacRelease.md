@@ -8,8 +8,9 @@
 - Tauri 配置：`src-tauri/tauri.conf.json`
 - Developer ID：`Developer ID Application: Tamba Trading Co., Ltd. (9VKQ2P8P6N)`
 - Notary profile：`codexman-notary`
-- 官网下载文件：`website/downloads/codexman_0.0.2_aarch64.dmg`
-- 官网下载链接：`/downloads/codexman_0.0.2_aarch64.dmg`
+- 官网下载文件：`website/downloads/codexman_版本_架构.dmg`
+- 官网下载链接：`/downloads/codexman_版本_架构.dmg`
+- 版本递增：每次打包发布必须先递增 `package.json` 与 `src-tauri/tauri.conf.json` 版本；小修复递增 patch 位（如 `0.0.2` -> `0.0.3`），较大功能版本递增 minor 位（如 `0.0.x` -> `0.1.0`）。
 
 ## 发布命令
 
@@ -29,7 +30,7 @@ npm run release:mac
 
 ## OSS 同步
 
-发布脚本只生成本地官网目录。上传时同步整个 `website/` 目录到官网 OSS Bucket，确保 `index.html`、`assets/` 和 `downloads/codexman_0.0.2_aarch64.dmg` 同时更新。
+发布脚本只生成本地官网目录。上传时同步整个 `website/` 目录到官网 OSS Bucket，确保 `index.html`、`assets/` 和当前版本 `downloads/codexman_版本_架构.dmg` 同时更新。
 
 ```bash
 ossutil sync website oss://<codexman-website-bucket>/ --delete
@@ -39,7 +40,7 @@ ossutil sync website oss://<codexman-website-bucket>/ --delete
 
 ```bash
 curl -I https://typesass.tolern.com/
-curl -I https://typesass.tolern.com/downloads/codexman_0.0.2_aarch64.dmg
+curl -I https://typesass.tolern.com/downloads/codexman_当前版本_aarch64.dmg
 ```
 
 ## 禁止事项

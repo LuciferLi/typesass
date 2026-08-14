@@ -41,6 +41,8 @@ use objc2::runtime::ProtocolObject;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPasteboardWriting};
 #[cfg(target_os = "macos")]
+use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSData, NSString};
 
 const DEFAULT_ASR_TEXT_SHORTCUT: &str = "ctrl+shift+d";
@@ -1411,6 +1413,8 @@ struct ClipboardRestoreStatus {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeDiagnostics {
+    /// macOS 麦克风权限是否已授权。
+    microphone_authorized: bool,
     /// macOS 辅助功能权限是否已授权。
     accessibility_trusted: bool,
     /// 当前 Rust 侧实际保存的快捷键配置。
@@ -1457,15 +1461,6 @@ pub fn run() {
         .manage(RuntimeWebServer::default())
         .manage(RuntimeCodexDesktop::default())
         .setup(|app| {
-            let catalog = private_models::sidecar_catalog_json(app.handle()).map_err(|error| {
-                std::io::Error::other(desktop_error::record_desktop_error(
-                    app.handle(),
-                    "MODEL_CATALOG_LOAD_FAILED",
-                    "app_setup",
-                    None,
-                    &error,
-                ))
-            })?;
             app.state::<RuntimePrivateRpc>()
                 .start(app.handle())
                 .map_err(|error| {
@@ -1477,40 +1472,7 @@ pub fn run() {
                         &error,
                     ))
                 })?;
-            let token = match app.state::<RuntimeSidecar>().start(app.handle(), &catalog) {
-                Ok(token) => token,
-                Err(error) => {
-                    let _ = app.state::<RuntimePrivateRpc>().shutdown();
-                    return Err(std::io::Error::other(desktop_error::record_desktop_error(
-                        app.handle(),
-                        "SIDECAR_START_FAILED",
-                        "app_setup",
-                        None,
-                        &error,
-                    ))
-                    .into());
-                }
-            };
-            let public_api_token_state = app.state::<RuntimePublicApiToken>();
-            let mut public_api_token = match public_api_token_state.token.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let _ = app.state::<RuntimeSidecar>().shutdown();
-                    let _ = app.state::<RuntimePrivateRpc>().shutdown();
-                    return Err(std::io::Error::other(desktop_error::record_desktop_error(
-                        app.handle(),
-                        "SIDECAR_TOKEN_STORE_FAILED",
-                        "app_setup",
-                        None,
-                        "保存 sidecar 短 Token 失败：状态锁已损坏",
-                    ))
-                    .into());
-                }
-            };
-            *public_api_token = token;
-            drop(public_api_token);
             if let Err(error) = app.state::<RuntimeWebServer>().start(app.handle()) {
-                let _ = app.state::<RuntimeSidecar>().shutdown();
                 let _ = app.state::<RuntimePrivateRpc>().shutdown();
                 return Err(std::io::Error::other(desktop_error::record_desktop_error(
                     app.handle(),
@@ -1521,6 +1483,8 @@ pub fn run() {
                 ))
                 .into());
             }
+            let sidecar_app = app.handle().clone();
+            thread::spawn(move || start_sidecar_in_background(sidecar_app));
             let dispatcher_app = app.handle().clone();
             thread::spawn(move || run_codex_task_dispatcher(&dispatcher_app));
             #[cfg(desktop)]
@@ -1888,6 +1852,58 @@ fn emit_hub_notice(app: &AppHandle, message: &str, state: &str) {
     });
 }
 
+/// 后台启动 FastAPI sidecar，避免 PyInstaller/FastAPI 冷启动阻塞 Tauri 首屏。
+/// 流程：读取模型目录后启动 sidecar 并等待健康检查，成功后写入当前短 Token；失败只记录桌面诊断并通知 Hub，不中断 App 主窗口。
+/// 参数：app 为 Tauri App 句柄，可在线程内读取运行状态和发送事件。
+/// 返回：无返回值。
+/// 边界：私有 RPC 仍在 setup 同步启动，确保 sidecar bootstrap 可用；sidecar 失败时功能层通过 HTTP 健康状态继续展示“本机服务启动中/不可用”。
+fn start_sidecar_in_background(app: AppHandle) {
+    let catalog = match private_models::sidecar_catalog_json(&app) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let message = desktop_error::record_desktop_error(
+                &app,
+                "MODEL_CATALOG_LOAD_FAILED",
+                "sidecar_background_start",
+                None,
+                &error,
+            );
+            emit_hub_notice(&app, &message, "error");
+            return;
+        }
+    };
+    let token = match app.state::<RuntimeSidecar>().start(&app, &catalog) {
+        Ok(token) => token,
+        Err(error) => {
+            let message = desktop_error::record_desktop_error(
+                &app,
+                "SIDECAR_START_FAILED",
+                "sidecar_background_start",
+                None,
+                &error,
+            );
+            emit_hub_notice(&app, &message, "error");
+            return;
+        }
+    };
+    let public_api_token_state = app.state::<RuntimePublicApiToken>();
+    match public_api_token_state.token.lock() {
+        Ok(mut public_api_token) => {
+            *public_api_token = token;
+        }
+        Err(_) => {
+            let message = desktop_error::record_desktop_error(
+                &app,
+                "SIDECAR_TOKEN_STORE_FAILED",
+                "sidecar_background_start",
+                None,
+                "保存 sidecar 短 Token 失败：状态锁已损坏",
+            );
+            emit_hub_notice(&app, &message, "error");
+        }
+    };
+}
+
 /// 同步最近口述历史到原生托盘菜单，让托盘子菜单可以直接复制历史输出。
 #[tauri::command]
 fn sync_tray_dictation_history(
@@ -2225,6 +2241,7 @@ fn get_runtime_diagnostics(
         .clone();
 
     Ok(RuntimeDiagnostics {
+        microphone_authorized: is_microphone_authorized(),
         accessibility_trusted: is_accessibility_trusted(),
         shortcuts: profile,
         shortcut_registration_ready: shortcut_registration_status.ready,
@@ -7009,6 +7026,28 @@ fn is_accessibility_trusted() -> bool {
 /// 非 macOS 平台没有当前实现需要的辅助功能权限。
 #[cfg(not(target_os = "macos"))]
 fn is_accessibility_trusted() -> bool {
+    false
+}
+
+/// 查询当前进程是否已获得 macOS 麦克风权限。
+/// 流程：通过 AVFoundation 读取音频媒体类型授权状态，只把 Authorized 视为可录音。
+/// 返回：已授权时返回 true；未决定、受限、拒绝或系统常量不可用时返回 false。
+/// 边界：该方法只读权限状态，不主动弹出系统授权申请，避免刷新页面时打扰用户。
+#[cfg(target_os = "macos")]
+fn is_microphone_authorized() -> bool {
+    autoreleasepool(|_| {
+        let Some(media_type) = (unsafe { AVMediaTypeAudio }) else {
+            return false;
+        };
+        let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) };
+        status == AVAuthorizationStatus::Authorized
+    })
+}
+
+/// 非 macOS 平台当前没有原生麦克风授权检测。
+/// 返回：固定 false，由前端浏览器权限检测负责普通 Web 场景。
+#[cfg(not(target_os = "macos"))]
+fn is_microphone_authorized() -> bool {
     false
 }
 
