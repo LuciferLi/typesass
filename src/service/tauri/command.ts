@@ -355,6 +355,29 @@ function waitForPublicApiRetry(delayMs: number): Promise<void> {
 }
 
 /**
+ * 创建公共 API 请求追踪 ID。
+ * 流程：优先使用安全上下文提供的 randomUUID；不可用时改用随机字节；极端旧环境用时间戳随机片段兜底。
+ * 参数：无。
+ * 返回：可放入 X-Request-Id 的前端追踪字符串。
+ * 边界：HTTP 内网访问可能没有 randomUUID，本方法必须保证文档和公共 API 页面不因此中断。
+ */
+function createPublicApiRequestId(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+        const randomValues = new Uint8Array(16);
+        crypto.getRandomValues(randomValues);
+        return Array.from(randomValues)
+            .map((value) => value.toString(16).padStart(2, '0'))
+            .join('');
+    }
+
+    return `request-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
  * 执行一次公共 API HTTP 尝试。
  * 流程：读取最新 Token、生成独立请求 ID、按显式方法和可选 JSON Body 请求，并解析统一响应。
  * 参数：path 为接口路径，options 为方法与请求体配置，timeoutMs 为当前尝试可使用的最长时间。
@@ -368,7 +391,7 @@ async function performPublicApiAttempt<ResponseModel>(
 ): Promise<PublicApiAttemptResult<ResponseModel>> {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-    const requestId = crypto.randomUUID();
+    const requestId = createPublicApiRequestId();
     try {
         const publicApiToken = await getPublicApiToken();
         const headers: Record<string, string> = { Accept: 'application/json', 'X-Request-Id': requestId };
