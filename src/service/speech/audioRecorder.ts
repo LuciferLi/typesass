@@ -68,6 +68,21 @@ export async function recordAudioOnce(
     });
 }
 
+/**
+ * 主动请求一次麦克风访问权限。
+ * 流程：通过 WebView 的 getUserMedia 触发系统或浏览器授权弹窗，拿到临时音频流后立即停止所有音轨。
+ * 参数：无。
+ * 返回：授权并拿到临时音频流后完成。
+ * 异常/边界：用户拒绝、系统权限受限或当前环境不支持媒体设备时抛错；该方法不录音、不保存音频内容。
+ */
+export async function requestMicrophoneAccess(): Promise<void> {
+    if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('当前运行环境不支持麦克风授权请求。');
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+}
+
 // 将音频 Blob 转成 base64 内容。
 export async function blobToBase64(blob: Blob): Promise<string> {
     const buffer = await blob.arrayBuffer();

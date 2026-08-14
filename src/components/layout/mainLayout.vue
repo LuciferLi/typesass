@@ -218,6 +218,45 @@
                 </transition>
             </div>
         </sidebar-inset>
+        <transition name="startupSplash">
+            <section
+                v-if="showStartupSplash"
+                class="windowDragRegion fixed inset-0 z-50 grid cursor-default select-none place-items-center overflow-hidden bg-background text-foreground"
+                data-tauri-drag-region="deep"
+                aria-live="polite">
+                <div
+                    class="absolute inset-0 bg-[linear-gradient(135deg,hsl(var(--background))_0%,hsl(var(--card))_54%,hsl(var(--muted))_100%)]"></div>
+                <div class="absolute inset-0 border border-white/5"></div>
+                <div
+                    class="relative grid w-full max-w-[360px] place-items-center gap-5 px-8 text-center"
+                    data-tauri-drag-region>
+                    <img
+                        class="h-20 w-20 rounded-2xl border border-border/70 bg-card p-2 shadow-xl shadow-background/35"
+                        :src="brandLogoUrl"
+                        alt="CodexMan"
+                        data-tauri-drag-region />
+                    <div
+                        class="grid gap-2"
+                        data-tauri-drag-region>
+                        <h1
+                            class="text-[23px] font-semibold leading-8 tracking-normal text-foreground"
+                            data-tauri-drag-region>
+                            CodexMan
+                        </h1>
+                        <p
+                            class="text-[13px] leading-6 text-muted-foreground"
+                            data-tauri-drag-region>
+                            正在加载本机服务，请稍后
+                        </p>
+                    </div>
+                    <div
+                        class="h-1 w-36 overflow-hidden rounded-full bg-muted"
+                        data-tauri-drag-region>
+                        <span class="startupSplash__progress block h-full w-1/2 rounded-full bg-primary"></span>
+                    </div>
+                </div>
+            </section>
+        </transition>
         <codex-connection-dialog />
         <Dialog
             :open="approvalDialogVisible"
@@ -336,6 +375,7 @@
     /** 公共 HTTP 健康检查稳定间隔；服务已连接后降低后台请求频率。 */
     const PUBLIC_API_HEALTH_INTERVAL_MS = 30_000;
     const clientBridgeHealthy = ref(false);
+    const hasClientBridgeEverReady = ref(false);
     const approvalSubmitting = ref(false);
     const accessTokenApprovalRequest = ref<PublicApiAccessTokenApprovalEventModel | null>(null);
     let clientBridgeHealthTimer: number | undefined;
@@ -355,6 +395,7 @@
     const showClientBridgeOverlay = computed(() => {
         return !isClientRuntime && !clientBridgeHealthy.value && route.name !== HubRouteName.HttpApiDoc;
     });
+    const showStartupSplash = computed(() => isClientRuntime && !hasClientBridgeEverReady.value);
     const publicApiHealthText = computed(() => (clientBridgeHealthy.value ? 'HTTP 服务已连接' : 'HTTP 服务未连接'));
     const clientBridgeHealthDotClass = computed(() =>
         clientBridgeHealthy.value ? 'bg-emerald-500' : 'bg-sidebar-foreground/35'
@@ -510,6 +551,9 @@
      */
     async function refreshClientBridgeHealth(): Promise<void> {
         clientBridgeHealthy.value = await checkPublicApiHealth();
+        if (clientBridgeHealthy.value) {
+            hasClientBridgeEverReady.value = true;
+        }
     }
 
     /**
@@ -653,5 +697,34 @@
     .clientBridgeOverlay-leave-to {
         opacity: 0;
         transform: scale(0.985);
+    }
+
+    .startupSplash-enter-active,
+    .startupSplash-leave-active {
+        transition: opacity 260ms ease;
+    }
+
+    .startupSplash-enter-from,
+    .startupSplash-leave-to {
+        opacity: 0;
+    }
+
+    .startupSplash__progress {
+        animation: startupSplashProgress 1.15s ease-in-out infinite;
+        transform-origin: left center;
+    }
+
+    @keyframes startupSplashProgress {
+        0% {
+            transform: translateX(-120%) scaleX(0.65);
+        }
+
+        50% {
+            transform: translateX(55%) scaleX(1);
+        }
+
+        100% {
+            transform: translateX(220%) scaleX(0.65);
+        }
     }
 </style>

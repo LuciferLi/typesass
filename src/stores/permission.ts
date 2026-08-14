@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 
 import type { PermissionItemModel } from '@/model/permission';
+import { requestMicrophoneAccess } from '@/service/speech/audioRecorder';
 import {
     checkPublicApiHealth,
     getRuntimeDiagnostics,
@@ -155,14 +156,30 @@ export const usePermissionStore = defineStore('permission', {
 
         /**
          * 打开指定系统权限设置。
-         * 流程：麦克风和辅助功能分别调用受 Tauri capability 保护的 IPC。
+         * 流程：麦克风先通过 WebView 触发系统授权弹窗，失败后再打开系统设置；辅助功能直接打开系统设置。
          * 参数：key 为权限稳定键。
          * 返回：打开完成 Promise。
          * 边界：HTTP 服务与快捷键状态不映射系统设置，因此不会触发命令。
          */
         async openPermission(key: PermissionItemModel['key']): Promise<void> {
-            if (key === 'microphone') await openMicrophoneSettings();
-            if (key === 'accessibility') await openAccessibilitySettings();
+            if (key === 'microphone') {
+                try {
+                    await requestMicrophoneAccess();
+                    this.message = '麦克风授权请求已完成。';
+                } catch (error) {
+                    this.message =
+                        error instanceof Error
+                            ? `未能直接获取麦克风权限：${error.message}`
+                            : '未能直接获取麦克风权限。';
+                    if (isTauriRuntime()) await openMicrophoneSettings();
+                } finally {
+                    await this.refreshPermissions();
+                }
+            }
+            if (key === 'accessibility') {
+                await openAccessibilitySettings();
+                await this.refreshPermissions();
+            }
         }
     }
 });

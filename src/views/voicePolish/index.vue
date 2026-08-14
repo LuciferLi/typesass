@@ -469,10 +469,10 @@
 
     /**
      * 打开麦克风前置条件提示。
-     * 流程：普通 Web 请求浏览器麦克风权限并立即停止临时音轨；客户端弹出系统授权引导。
+     * 流程：普通 Web 请求浏览器麦克风权限并立即停止临时音轨；客户端委托权限 Store 触发系统授权弹窗。
      * 参数：无。
      * 返回：无返回值。
-     * 边界：麦克风已授权时仍允许进入权限管理页查看状态，不直接触发系统授权能力。
+     * 边界：授权后立即刷新当前页权限状态；授权失败时打开提示弹窗，引导用户到权限管理页继续处理。
      */
     async function handleOpenMicrophoneRequirement(): Promise<void> {
         if (!isClientRuntime) {
@@ -487,19 +487,27 @@
             }
             return;
         }
-        permissionPromptOpen.value = true;
+        await permissionStore.openPermission('microphone');
+        await refreshVoicePermission();
+        if (!isMicrophoneReady.value) {
+            permissionPromptOpen.value = true;
+        }
     }
 
     /**
      * 前往权限管理页面。
-     * 流程：关闭当前授权提示弹窗，再跳转到权限管理路由，由权限页负责展示和执行真实授权动作。
+     * 流程：先尝试触发真实麦克风授权，再按最新状态决定是否跳转权限管理路由。
      * 参数：无。
      * 返回：无返回值。
-     * 边界：路由跳转失败不会改变语音润色模型选择状态。
+     * 边界：授权成功时停留在当前页面继续使用；失败时进入权限管理页展示诊断和系统设置入口。
      */
-    function handleGoPermissionPage(): void {
+    async function handleGoPermissionPage(): Promise<void> {
         permissionPromptOpen.value = false;
-        void router.push({ name: HubRouteName.Permission });
+        await permissionStore.openPermission('microphone');
+        await refreshVoicePermission();
+        if (!isMicrophoneReady.value) {
+            void router.push({ name: HubRouteName.Permission });
+        }
     }
 
     /**
@@ -515,7 +523,7 @@
                 void handleOpenMicrophoneRequirement();
                 return;
             }
-            handleGoPermissionPage();
+            void handleGoPermissionPage();
             return;
         }
         if (!store.asrModelId) {
