@@ -96,14 +96,19 @@
                                 variant="outline">
                                 默认
                             </ui-badge>
+                            <ui-badge
+                                v-if="!model.hasApiKey"
+                                variant="destructive">
+                                缺 API Key
+                            </ui-badge>
                         </div>
                     </div>
                     <div class="flex flex-wrap items-center justify-end gap-1">
                         <label class="flex items-center gap-2 text-[12px] text-muted-foreground">
-                            <span>{{ model.enabled ? '已启用' : '已禁用' }}</span>
+                            <span>{{ modelRuntimeStatusLabel(model) }}</span>
                             <ui-switch
                                 :model-value="model.enabled"
-                                :disabled="store.saving"
+                                :disabled="store.saving || !model.hasApiKey"
                                 @update:model-value="handleToggleModel(model, $event)" />
                         </label>
                         <ui-button
@@ -111,7 +116,7 @@
                             variant="ghost"
                             size="sm"
                             type="button"
-                            :disabled="store.saving || !model.enabled"
+                            :disabled="store.saving || !model.enabled || !model.hasApiKey"
                             @click="handleSetDefault(model)">
                             设为默认
                         </ui-button>
@@ -248,6 +253,18 @@
     }
 
     /**
+     * 生成模型运行时状态文案。
+     * 流程：优先识别缺少 API Key 的半配置，再展示启用或禁用状态，避免用户误以为缺密钥模型已经可被业务页选择。
+     * 参数：model 为模型管理页脱敏模型元数据。
+     * 返回：可直接展示在模型开关前的短文案。
+     * 边界：不读取或展示密钥正文，只依赖 hasApiKey 标记。
+     */
+    function modelRuntimeStatusLabel(model: PrivateModelItemModel): string {
+        if (!model.hasApiKey) return '配置不完整';
+        return model.enabled ? '已启用' : '已禁用';
+    }
+
+    /**
      * 打开添加模型弹窗。
      * 流程：保留当前能力 Tab 并打开表单，弹窗据此展示对应厂商预设。
      * 参数：无。
@@ -301,6 +318,12 @@
      * 边界：失败时 Store 保留原列表并展示错误，不做乐观状态切换。
      */
     async function handleToggleModel(model: PrivateModelItemModel, enabled: boolean): Promise<void> {
+        if (enabled && !model.hasApiKey) {
+            toast.error('模型缺少 API Key', {
+                description: '请先编辑模型并保存 API Key，完成后才能启用。'
+            });
+            return;
+        }
         try {
             await store.updateModelStatus(model, { enabled });
             toast.success(enabled ? '模型已启用' : '模型已禁用', {

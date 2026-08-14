@@ -78,6 +78,22 @@ pub struct PrivateModelRecord {
     pub has_api_key: bool,
 }
 
+/// 安全模型目录项；只暴露业务选择所需字段，禁止携带上游地址、模型名或密钥。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicModelCatalogRecord {
+    /// 本地稳定模型 ID，业务调用只传递该不透明 ID。
+    pub id: String,
+    /// 用户可识别名称。
+    pub display_name: String,
+    /// 模型用途能力。
+    pub capability: PrivateModelCapability,
+    /// 是否在运行时可用；只有启用且已有 API Key 的模型才可用。
+    pub enabled: bool,
+    /// 是否为能力默认项；不可用模型不会被标记为默认项。
+    pub is_default: bool,
+}
+
 /// 传入 sidecar 子进程的完整模型项；该类型只用于进程环境序列化，禁止作为 IPC 返回值。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,6 +139,16 @@ pub fn list_private_models(app: &AppHandle) -> Result<Vec<PrivateModelRecord>, S
         record.api_key.clear();
     }
     Ok(records)
+}
+
+/// 列出本机业务页可使用的安全模型目录。
+/// 流程：读取包含密钥状态的私有元数据，按 sidecar 运行时规则计算 enabled/default，再剥离上游连接信息和密钥后返回。
+/// 参数：app 为 Tauri AppHandle。
+/// 返回：只包含不透明 ID、展示名、能力和运行时可用状态的目录。
+/// 异常/边界：JSON 损坏或磁盘读取失败会显式报错；缺少 API Key 的模型保留在目录中但不可选。
+pub fn list_public_model_catalog(app: &AppHandle) -> Result<Vec<PublicModelCatalogRecord>, String> {
+    let records = read_metadata(app)?;
+    Ok(build_public_model_catalog(records))
 }
 
 /// 保存私有模型元数据及可选 API Key。
@@ -410,6 +436,27 @@ fn build_sidecar_catalog(
         });
     }
     Ok(catalog)
+}
+
+/// 构造业务页安全模型目录。
+/// 流程：复用 sidecar 的运行时可用规则，但只保留业务选择字段。
+/// 参数：records 为包含密钥状态的磁盘元数据。
+/// 返回：不包含上游连接参数和密钥的模型目录。
+/// 异常/边界：缺密钥模型返回 enabled=false，默认项也随之失效。
+fn build_public_model_catalog(records: Vec<PrivateModelRecord>) -> Vec<PublicModelCatalogRecord> {
+    records
+        .into_iter()
+        .map(|record| {
+            let is_runtime_enabled = record.enabled && !record.api_key.trim().is_empty();
+            PublicModelCatalogRecord {
+                id: record.id,
+                display_name: record.display_name,
+                capability: record.capability,
+                enabled: is_runtime_enabled,
+                is_default: record.is_default && is_runtime_enabled,
+            }
+        })
+        .collect()
 }
 
 /// 校验模型表单的必填字段和网络边界。
@@ -747,5 +794,44 @@ mod tests {
         assert!(!catalog[0].enabled);
         assert_eq!(catalog[0].api_key, DISABLED_MODEL_API_KEY_PLACEHOLDER);
         assert!(!catalog[0].api_key.contains("secret"));
+    }
+
+    /// 业务页安全目录必须按运行时规则计算可用状态，并且不能暴露上游连接字段或密钥。
+    #[test]
+    fn public_model_catalog_uses_runtime_enabled_state() {
+        let records = vec![
+            PrivateModelRecord {
+                id: "model_550e8400-e29b-41d4-a716-446655440001".to_string(),
+                display_name: "可用文本模型".to_string(),
+                capability: PrivateModelCapability::Text,
+                enabled: true,
+                is_default: true,
+                provider: "openai-compatible".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                model_name: "text-model".to_string(),
+                api_key: "secret-value".to_string(),
+                has_api_key: true,
+            },
+            PrivateModelRecord {
+                id: "model_550e8400-e29b-41d4-a716-446655440002".to_string(),
+                display_name: "缺密钥 ASR 模型".to_string(),
+                capability: PrivateModelCapability::Asr,
+                enabled: true,
+                is_default: true,
+                provider: "openai-compatible".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                model_name: "asr-model".to_string(),
+                api_key: String::new(),
+                has_api_key: false,
+            },
+        ];
+
+        let catalog = build_public_model_catalog(records);
+
+        assert_eq!(catalog.len(), 2);
+        assert!(catalog[0].enabled);
+        assert!(catalog[0].is_default);
+        assert!(!catalog[1].enabled);
+        assert!(!catalog[1].is_default);
     }
 }

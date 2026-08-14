@@ -37,6 +37,17 @@ function describePublicApiStatus(connected: boolean, authorized: boolean): strin
     return authorized ? '已连接并授权' : '已连接，等待授权';
 }
 
+/**
+ * 生成桌面 App 内部 HTTP 服务状态说明。
+ * 流程：桌面端业务请求由 App 主进程和受保护 IPC 协同完成，内部页面只需要确认本机服务连通，外部访问授权仍由普通 Web 分支检查。
+ * 参数：connected 表示健康检查通过。
+ * 返回：未连接或 App 内部已连接的稳定文案。
+ * 边界：该说明只用于 Tauri WebView，不放宽浏览器和局域网访问的设备授权要求。
+ */
+function describeDesktopPublicApiStatus(connected: boolean): string {
+    return connected ? 'App 内部服务已连接' : '未连接';
+}
+
 export const usePermissionStore = defineStore('permission', {
     state: (): PermissionState => {
         return {
@@ -118,14 +129,13 @@ export const usePermissionStore = defineStore('permission', {
                 const diagnostics = await getRuntimeDiagnostics();
                 const microphoneReady = Boolean(diagnostics?.microphoneAuthorized);
                 const publicApiConnected = await checkPublicApiHealth();
-                const publicApiAuthorized = publicApiConnected && (await hasPublicApiToken());
                 this.items = [
                     {
                         key: 'httpApi',
                         name: 'HTTP 服务',
                         description: '语音识别和文本润色通过独立 HTTP 服务执行。',
-                        ready: publicApiAuthorized,
-                        message: describePublicApiStatus(publicApiConnected, publicApiAuthorized)
+                        ready: publicApiConnected,
+                        message: describeDesktopPublicApiStatus(publicApiConnected)
                     },
                     {
                         key: 'microphone',

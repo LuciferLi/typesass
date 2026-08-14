@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, LogicalPosition, Manager, Position, State};
 
 use codex_desktop::{CodexConnectionStatus, CodexRestartAccepted, RuntimeCodexDesktop};
-use private_models::{PrivateModelRecord, SavePrivateModelRequest};
+use private_models::{PrivateModelRecord, PublicModelCatalogRecord, SavePrivateModelRequest};
 use private_rpc::RuntimePrivateRpc;
 use sidecar::RuntimeSidecar;
 use task_store::{
@@ -451,6 +451,26 @@ fn list_private_models(window: tauri::WebviewWindow) -> Result<Vec<PrivateModelR
             &app,
             "MODEL_LIST_FAILED",
             "list_private_models",
+            None,
+            &error,
+        )
+    })
+}
+
+/// 读取本机业务页可使用的安全模型目录。
+/// 流程：只允许 hub 主窗口调用，读取私有模型配置后返回脱敏业务目录；参数为 Tauri 注入的窗口；返回不含上游地址和密钥的列表。
+/// 异常/边界：缺少 API Key 的模型不会作为可用项，磁盘或 JSON 错误会记录脱敏诊断。
+#[tauri::command]
+fn list_public_model_catalog(
+    window: tauri::WebviewWindow,
+) -> Result<Vec<PublicModelCatalogRecord>, String> {
+    ensure_sensitive_management_window(window.label())?;
+    let app = window.app_handle().clone();
+    private_models::list_public_model_catalog(&app).map_err(|error| {
+        desktop_error::record_desktop_error(
+            &app,
+            "MODEL_CATALOG_LIST_FAILED",
+            "list_public_model_catalog",
             None,
             &error,
         )
@@ -1694,6 +1714,7 @@ pub fn run() {
             read_local_config_snapshot,
             start_local_config_watch,
             list_private_models,
+            list_public_model_catalog,
             save_private_model,
             delete_private_model,
             test_private_model,

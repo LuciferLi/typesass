@@ -644,12 +644,13 @@ export async function readPublicApiOpenApi(): Promise<HttpApiOpenApiDocumentMode
 
 /**
  * 读取公共服务模型目录。
- * 流程：GET `/v1/models` 获取不含上游地址和密钥的安全目录，供三个处理流程选择不透明模型 ID。
+ * 流程：桌面端通过受保护 IPC 读取本机安全目录，普通 Web 通过 GET `/v1/models` 读取 HTTP 授权后的安全目录。
  * 参数：无。
- * 返回：服务端当前启用状态、默认项及能力列表。
- * 异常：鉴权、网络或响应错误时透传带 requestId 的公共 API 错误。
+ * 返回：当前启用状态、默认项及能力列表，均不包含上游地址、真实模型名或密钥。
+ * 异常：桌面 IPC、鉴权、网络或响应错误时透传明确错误。
  */
 export async function listPublicModels(): Promise<ModelCatalogItemModel[]> {
+    if (isTauriRuntime()) return invokeModelDesktop<ModelCatalogItemModel[]>('list_public_model_catalog');
     return requestPublicApi<ModelCatalogItemModel[]>('/v1/models', { method: 'GET' });
 }
 
