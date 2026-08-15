@@ -169,10 +169,10 @@ export const useModelManageStore = defineStore('modelManage', {
 
         /**
          * 新增私有模型。
-         * 流程：通过私有 IPC 保存连接配置与安全密钥，再重新读取脱敏管理目录和公共服务目录。
+         * 流程：通过私有 IPC 保存连接配置与安全密钥，再读取本地脱敏管理目录和安全模型目录；sidecar 运行时目录由原生端后台热更新。
          * 参数：form 为已经校验并测试通过的内存表单。
          * 返回：保存后的安全模型元数据。
-         * 异常：保存或刷新失败时透传，前端不缓存含密钥的表单对象。
+         * 异常：保存失败时透传；目录刷新失败只影响当前页面回显，不缓存含密钥的表单对象。
          */
         async saveModel(form: ModelFormModel): Promise<PrivateModelItemModel> {
             this.saving = true;
@@ -185,7 +185,9 @@ export const useModelManageStore = defineStore('modelManage', {
                 }
                 try {
                     await this.refreshServiceModels();
-                    this.message = form.id ? '模型配置已更新。' : '模型配置已安全保存。';
+                    this.message = form.id
+                        ? '模型配置已更新，服务目录正在后台刷新。'
+                        : '模型配置已安全保存，服务目录正在后台刷新。';
                 } catch (error) {
                     const reason = error instanceof Error ? error.message : '公共模型目录刷新失败。';
                     this.message = `模型配置已安全保存，但服务目录暂未刷新：${reason}`;
@@ -204,7 +206,7 @@ export const useModelManageStore = defineStore('modelManage', {
          * 流程：基于脱敏元数据构造不含 API Key 的编辑表单，复用 saveModel；原生端识别为纯状态变更并跳过上游探针，同时按 ID 保留 Keychain 密钥。
          * 参数：model 为当前安全元数据；changes 为需要修改的启用或默认字段。
          * 返回：更新后的安全模型元数据。
-         * 异常：状态约束、原生持久化、sidecar 重启或目录刷新失败时按 saveModel 规则处理；上游暂时不可达不阻止纯启停或设默认。
+         * 异常：状态约束、原生持久化或目录刷新失败时按 saveModel 规则处理；sidecar 热更新不阻塞纯启停或设默认。
          */
         async updateModelStatus(
             model: PrivateModelItemModel,
@@ -226,27 +228,24 @@ export const useModelManageStore = defineStore('modelManage', {
 
         /**
          * 删除私有模型。
-         * 流程：通过原生 IPC 删除配置和安全密钥，再读取真实私有目录与公共服务目录。
+         * 流程：通过原生 IPC 删除本机持久化配置，成功后立即从管理目录和服务目录移除；公共服务目录稍后在后台刷新。
          * 参数：id 为不透明模型 ID。
-         * 返回：删除完成 Promise。
-         * 异常：原生端拒绝或刷新失败时透传，不在前端先行伪造删除结果。
+         * 返回：本机配置删除完成 Promise。
+         * 异常：只有原生端拒绝或持久化删除失败时向上抛出；sidecar 热更新与目录刷新不阻塞删除反馈。
          */
         async removeModel(id: string): Promise<void> {
             this.saving = true;
             try {
                 await deletePrivateModel(id);
-                try {
-                    this.models = await listPrivateModels();
-                } catch {
-                    this.models = this.models.filter((model) => model.id !== id);
-                }
-                try {
-                    await this.refreshServiceModels();
-                    this.message = '模型配置已删除。';
-                } catch (error) {
-                    const reason = error instanceof Error ? error.message : '公共模型目录刷新失败。';
-                    this.message = `模型配置已删除，但服务目录暂未刷新：${reason}`;
-                }
+                this.models = this.models.filter((model) => model.id !== id);
+                this.serviceModels = this.serviceModels.filter((model) => model.id !== id);
+                this.message = '模型配置已删除，服务目录正在后台刷新。';
+                window.setTimeout(() => {
+                    void this.refreshServiceModels().catch((error: unknown) => {
+                        const reason = error instanceof Error ? error.message : '公共模型目录刷新失败。';
+                        this.message = `模型配置已删除，但服务目录暂未刷新：${reason}`;
+                    });
+                }, 2500);
             } catch (error) {
                 this.message = error instanceof Error ? error.message : '删除模型配置失败。';
                 throw error;

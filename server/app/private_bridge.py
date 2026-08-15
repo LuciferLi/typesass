@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
+import hmac
 import json
 import logging
 import os
@@ -117,6 +118,20 @@ class PrivateRpcClient:
         """初始化私有桥接客户端，不执行连接或复制配置到环境变量。"""
 
         self._config = config
+
+    def verify_secret(self, secret: str) -> bool:
+        """校验调用方是否持有当前 sidecar 启动代私有密钥。
+
+        用途：为 Rust -> sidecar 的内部控制接口复用一次性 bootstrap 密钥，避免公开 HTTP Origin 规则放行敏感操作。
+        流程：仅在存在私有 RPC 配置时使用常量时间比较，调用方只得到布尔结果。
+        参数：``secret`` 为 HTTP 内部控制 Header 提供的密钥。
+        返回：密钥是否匹配当前启动代。
+        异常边界：不记录、不回显、不派生密钥；未 bootstrap 的开发直启 sidecar 默认拒绝内部控制调用。
+        """
+
+        if self._config is None:
+            return False
+        return hmac.compare_digest(secret, self._config.secret)
 
     async def call(
         self, method: str, request_id: str, params: Dict[str, object]

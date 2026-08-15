@@ -75,6 +75,10 @@ fn safe_error_metadata(code: &str, operation: &str) -> (&'static str, &'static s
         "MODEL_DELETE_FAILED" => ("MODEL_DELETE_FAILED", "删除模型配置失败。"),
         "MODEL_TEST_INTERNAL_FAILED" => ("MODEL_TEST_INTERNAL_FAILED", "模型连通性测试失败。"),
         "SIDECAR_START_FAILED" => ("SIDECAR_START_FAILED", "本机 AI 服务启动失败。"),
+        "SIDECAR_MODEL_RELOAD_FAILED" => (
+            "SIDECAR_MODEL_RELOAD_FAILED",
+            "本机 AI 服务模型目录刷新失败。",
+        ),
         "SIDECAR_TOKEN_STORE_FAILED" => ("SIDECAR_TOKEN_STORE_FAILED", "本机 AI 服务初始化失败。"),
         "SIDECAR_SHUTDOWN_FAILED" => ("SIDECAR_SHUTDOWN_FAILED", "本机 AI 服务停止失败。"),
         "PRIVATE_RPC_START_FAILED" => ("PRIVATE_RPC_START_FAILED", "本机业务桥接启动失败。"),
@@ -189,6 +193,7 @@ fn safe_error_metadata(code: &str, operation: &str) -> (&'static str, &'static s
         "list_private_models" => "list_private_models",
         "save_private_model" => "save_private_model",
         "delete_private_model" => "delete_private_model",
+        "sidecar_model_catalog_reload" => "sidecar_model_catalog_reload",
         "test_private_model" => "test_private_model",
         "load_session_workspace_data" => "load_session_workspace_data",
         "create_session_project" => "create_session_project",

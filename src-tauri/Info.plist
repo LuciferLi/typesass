@@ -4,6 +4,8 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>CodexMan 需要使用麦克风录制语音并转换成文字。</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>CodexMan 需要监听你设置的全局快捷键，用于在其它应用中触发语音转文字。</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>

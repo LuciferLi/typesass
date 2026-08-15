@@ -721,6 +721,28 @@ export async function openMicrophoneSettings(): Promise<void> {
 }
 
 /**
+ * 主动请求 CodexMan App 输入监控权限。
+ * 流程：通过 IOKit 触发 macOS 输入监控授权记录，用于全局键盘快捷键监听。
+ * 参数：无。
+ * 返回：系统当前允许时 true；未允许或需要用户手动开启时 false。
+ * 异常：普通 Web 或系统调用失败时透传 IPC 错误。
+ */
+export async function requestInputMonitoringAccess(): Promise<boolean> {
+    return invokeDesktop<boolean>('request_input_monitoring_access');
+}
+
+/**
+ * 打开 macOS 输入监控权限设置。
+ * 流程：通过受限桌面 IPC 打开系统对应设置页。
+ * 参数：无。
+ * 返回：打开请求完成 Promise。
+ * 异常：普通 Web 或系统调用失败时透传 IPC 错误。
+ */
+export async function openInputMonitoringSettings(): Promise<void> {
+    await invokeDesktop<void>('open_input_monitoring_settings');
+}
+
+/**
  * 打开 macOS 辅助功能设置。
  * 流程：通过受限桌面 IPC 打开系统对应设置页。
  * 参数：无。

@@ -1,6 +1,6 @@
 [package]
 name = "ai-tool"
-version = "0.1.1"
+version = "0.1.10"
 description = "轻量语音转写工具"
 authors = ["aijob"]
 edition = "2021"
@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 cpal = "0.15"
 core-graphics = "0.25"
+core-foundation = "0.9"
 hound = "3"
 libc = "0.2"
 objc2 = "0.6"

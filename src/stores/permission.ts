@@ -7,7 +7,9 @@ import {
     hasPublicApiToken,
     isTauriRuntime,
     openAccessibilitySettings,
+    openInputMonitoringSettings,
     openMicrophoneSettings,
+    requestInputMonitoringAccess,
     requestMicrophoneAccess
 } from '@/service/tauri/command';
 
@@ -117,6 +119,13 @@ export const usePermissionStore = defineStore('permission', {
                             message: '仅桌面自动粘贴需要'
                         },
                         {
+                            key: 'inputMonitoring',
+                            name: '输入监控',
+                            description: '在其它应用中响应语音快捷键需要。',
+                            ready: false,
+                            message: '请在 CodexMan App 中授权'
+                        },
+                        {
                             key: 'shortcut',
                             name: '全局快捷键',
                             description: '后台触发语音和润色动作需要。',
@@ -150,6 +159,13 @@ export const usePermissionStore = defineStore('permission', {
                         description: '润色读取选中文本和自动粘贴需要。',
                         ready: Boolean(diagnostics?.accessibilityTrusted),
                         message: diagnostics?.accessibilityTrusted ? '已授权' : '未授权'
+                    },
+                    {
+                        key: 'inputMonitoring',
+                        name: '输入监控',
+                        description: '在其它应用中响应语音快捷键需要。',
+                        ready: Boolean(diagnostics?.inputMonitoringTrusted),
+                        message: diagnostics?.inputMonitoringTrusted ? '已授权' : '未授权'
                     },
                     {
                         key: 'shortcut',
@@ -189,6 +205,19 @@ export const usePermissionStore = defineStore('permission', {
             }
             if (key === 'accessibility') {
                 await openAccessibilitySettings();
+                await this.refreshPermissions();
+            }
+            if (key === 'inputMonitoring') {
+                if (!isTauriRuntime()) {
+                    this.message = '请在 CodexMan App 中开启输入监控。';
+                    await this.refreshPermissions();
+                    return;
+                }
+                const granted = await requestInputMonitoringAccess();
+                this.message = granted
+                    ? '输入监控权限已开启。'
+                    : '未获得输入监控权限，已打开系统设置，请在列表中允许 CodexMan。';
+                if (!granted) await openInputMonitoringSettings();
                 await this.refreshPermissions();
             }
         }

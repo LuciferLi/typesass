@@ -15,7 +15,7 @@ export type PermissionItemModel = {
 };
 
 // 权限键类型，用于区分当前本地能力。
-export type PermissionKeyType = 'microphone' | 'accessibility' | 'shortcut' | 'httpApi';
+export type PermissionKeyType = 'microphone' | 'accessibility' | 'inputMonitoring' | 'shortcut' | 'httpApi';
 
 // Tauri 运行诊断模型，来源于原生 get_runtime_diagnostics 命令。
 export type RuntimeDiagnosticsModel = {
@@ -23,6 +23,8 @@ export type RuntimeDiagnosticsModel = {
     microphoneAuthorized: boolean;
     // 辅助功能权限是否已授权。
     accessibilityTrusted: boolean;
+    // 输入监控权限是否已授权。
+    inputMonitoringTrusted: boolean;
     // 当前桌面端实际保存的全局快捷键配置。
     shortcuts: ShortcutProfileModel;
     // 当前快捷键是否注册成功。

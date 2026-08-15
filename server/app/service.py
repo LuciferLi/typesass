@@ -8,7 +8,7 @@ from typing import Dict, Literal, Tuple
 
 import httpx
 
-from .config import ModelCatalogItem, Settings
+from .config import ModelCatalogItem, Settings, parse_model_catalog_payload
 from .errors import ApiError
 from .models import AudioTranscriptionRequest, TextProcessRequest
 
@@ -43,6 +43,7 @@ class ModelService:
 
         self.settings = settings
         self.client = client
+        self._model_catalog = settings.model_catalog
 
     def list_models(self) -> Tuple[ModelCatalogItem, ...]:
         """读取当前不可变模型目录。
@@ -54,7 +55,21 @@ class ModelService:
         异常边界：空目录合法并返回空元组，不触发上游访问或配置错误。
         """
 
-        return self.settings.model_catalog
+        return self._model_catalog
+
+    def reload_models(self, payload: object) -> int:
+        """热更新运行时模型目录。
+
+        用途：让桌面 App 在新增、编辑、启停、删除模型后无需重启 sidecar 即可更新业务调用目录。
+        流程：复用配置层严格校验受信 payload，成功后原子替换内存目录。
+        参数：``payload`` 为 Rust 注入的模型目录数组。
+        返回：热更新后的目录项数量。
+        异常边界：校验失败时保持旧目录不变，错误不包含上游 URL、模型名或 API Key。
+        """
+
+        model_catalog = parse_model_catalog_payload(payload)
+        self._model_catalog = model_catalog
+        return len(model_catalog)
 
     def _resolve_model(
         self, model_id: str, capability: Literal["asr", "text"]
@@ -69,10 +84,11 @@ class ModelService:
         错误消息和日志不包含 URL、上游模型名或密钥。
         """
 
-        if not self.settings.model_catalog:
+        model_catalog = self._model_catalog
+        if not model_catalog:
             raise ApiError(503, "MODEL_NOT_CONFIGURED", "服务尚未配置模型。")
         model = next(
-            (item for item in self.settings.model_catalog if item.id == model_id), None
+            (item for item in model_catalog if item.id == model_id), None
         )
         if model is None:
             raise ApiError(404, "MODEL_NOT_FOUND", "模型不存在。")

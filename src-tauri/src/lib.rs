@@ -40,6 +40,11 @@ use web_server::RuntimeWebServer;
 #[cfg(target_os = "macos")]
 use block2::StackBlock;
 #[cfg(target_os = "macos")]
+use core_graphics::event::{
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CallbackResult, EventField, KeyCode,
+};
+#[cfg(target_os = "macos")]
 use objc2::rc::{autoreleasepool, Retained};
 #[cfg(target_os = "macos")]
 use objc2::runtime::Bool;
@@ -74,10 +79,13 @@ const PASTE_TARGET_REFOCUS_DELAY_MS: u64 = 160;
 const PASTE_FOCUS_RETRY_COUNT: usize = 4;
 const PASTE_FOCUS_RETRY_DELAY_MS: u64 = 75;
 const LOCAL_CONFIG_FILE_NAME: &str = "codexman-config.json";
+const SHORTCUT_DIAGNOSTIC_LOG_FILE_NAME: &str = "shortcut-diagnostics.log";
 /// 系统设置分区 key；必须与前端 `StorageKey.settings` 保持一致。
 const LOCAL_CONFIG_SETTINGS_KEY: &str = "codexman.settings.v1";
 /// 语音润色分区 key；必须与前端 `StorageKey.voicePolish` 保持一致。
 const LOCAL_CONFIG_VOICE_POLISH_KEY: &str = "codexman.voicePolish.v1";
+/// 快捷键配置分区 key；必须与前端 `StorageKey.shortcuts` 保持一致。
+const LOCAL_CONFIG_SHORTCUTS_KEY: &str = "codexman.shortcuts.v1";
 /// 首发客户端配置格式版本；未知版本必须拒绝，禁止静默兼容历史结构。
 const LOCAL_CONFIG_VERSION: u32 = 1;
 const LOCAL_CONFIG_WATCH_INTERVAL_MS: u64 = 500;
@@ -152,6 +160,7 @@ const APP_VOICE_AUDIO_MAX_BYTES: usize = 25 * 1024 * 1024;
 const APP_VOICE_PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(65);
 const APP_VOICE_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const APP_VOICE_TOKEN_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+const VOICE_SHORTCUT_DEDUP_WINDOW: Duration = Duration::from_millis(800);
 const BROWSER_EXTENSION_ZIP_BYTES: &[u8] =
     include_bytes!("../../public/downloads/typesass-extension.zip");
 const BROWSER_EXTENSION_ZIP_FILE_NAME: &str = "typesass-extension.zip";
@@ -317,6 +326,13 @@ struct RuntimeAppVoiceRecorder {
     running: Mutex<bool>,
 }
 
+/// 运行期间的语音快捷键短时间去重状态。
+#[derive(Default)]
+struct RuntimeVoiceShortcutDebounce {
+    /// 最近一次触发的语音模式与时间，用于合并全局快捷键和 event tap 双通道事件。
+    last_trigger: Mutex<Option<(String, Instant)>>,
+}
+
 /// App 原生语音处理并发门禁；离开作用域时自动释放运行态。
 struct AppVoiceRunGuard {
     /// 需要在 Drop 中复位运行状态的 App 句柄。
@@ -477,10 +493,10 @@ fn list_public_model_catalog(
     })
 }
 
-/// 保存私有模型并重启 sidecar 使注册表立即生效。
-/// 流程：新增或上游关键参数变化时先执行真实探针；纯启停、设默认或改显示名直接写入本地配置，再重启 sidecar 并通过健康检查。
-/// 参数：window 为可信调用窗口，request 为模型表单；返回保存项；异常时显式返回，绝不把未生效配置伪装成功。
-/// 异常/边界：完整探针和最长 45 秒的 sidecar 健康检查均在线程池执行，不阻塞 Tauri 异步调度线程。
+/// 保存私有模型并在后台刷新 sidecar 注册表。
+/// 流程：新增或上游关键参数变化时先执行真实探针；本地配置保存成功即返回安全元数据，sidecar 注册表刷新交给后台任务。
+/// 参数：window 为可信调用窗口，request 为模型表单；返回保存项。
+/// 异常/边界：只有探针、校验或持久化失败才阻止保存；sidecar 刷新失败只记录诊断，不回滚已经提交的本地配置。
 #[tauri::command]
 async fn save_private_model(
     window: tauri::WebviewWindow,
@@ -489,10 +505,12 @@ async fn save_private_model(
     ensure_sensitive_management_window(window.label())?;
     let app = window.app_handle().clone();
     let diagnostic_context = request.id.clone();
+    let refresh_context = request
+        .id
+        .clone()
+        .unwrap_or_else(|| request.display_name.trim().to_string());
     let worker_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let sidecar = worker_app.state::<RuntimeSidecar>();
-        let token_state = worker_app.state::<RuntimePublicApiToken>();
         let existing = if let Some(request_id) = request.id.as_deref() {
             let existing = private_models::list_private_models(&worker_app)?
                 .into_iter()
@@ -509,29 +527,8 @@ async fn save_private_model(
             private_models::test_private_model(Some(&worker_app), request.clone())
                 .map_err(|failure| failure.message)?;
         }
-        let snapshot = private_models::capture_snapshot(&worker_app)?;
         let requested_id = request.id.clone();
         let records = private_models::save_private_model(&worker_app, request)?;
-        let catalog = match private_models::sidecar_catalog_json(&worker_app) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                private_models::restore_snapshot(&worker_app, snapshot)?;
-                return Err(format!(
-                    "生成 sidecar 模型注册表失败，配置已回滚：{}",
-                    error
-                ));
-            }
-        };
-        coordinate_sidecar_apply(
-            "模型保存",
-            || sidecar.restart(&worker_app, &catalog),
-            || private_models::restore_snapshot(&worker_app, snapshot),
-            || {
-                let rollback_catalog = private_models::sidecar_catalog_json(&worker_app)?;
-                sidecar.restart(&worker_app, &rollback_catalog)
-            },
-            |token| store_public_api_token(&token_state, token),
-        )?;
         requested_id
             .as_deref()
             .and_then(|id| records.iter().find(|record| record.id == id))
@@ -541,7 +538,7 @@ async fn save_private_model(
     })
     .await
     .map_err(|_| "模型保存后台任务异常退出".to_string())?;
-    result.map_err(|error| {
+    let saved_model = result.map_err(|error| {
         desktop_error::record_desktop_error(
             &app,
             "MODEL_SAVE_FAILED",
@@ -549,7 +546,9 @@ async fn save_private_model(
             diagnostic_context.as_deref(),
             &error,
         )
-    })
+    })?;
+    refresh_sidecar_model_catalog_in_background(app, refresh_context);
+    Ok(saved_model)
 }
 
 /// 判断模型保存前是否必须执行真实上游探针。
@@ -570,10 +569,10 @@ fn private_model_save_requires_probe(
         || existing.model_name != request.model_name.trim()
 }
 
-/// 删除私有模型并重启 sidecar 使注册表立即生效。
-/// 流程：校验 hub 后在线程池删除本地模型配置，生成新目录，重启 sidecar 并更新短 Token。
+/// 删除私有模型并在后台刷新 sidecar 注册表。
+/// 流程：校验 hub 后在线程池删除本地模型配置，删除成功即返回；sidecar 运行时目录热更新交给后台任务尽力完成。
 /// 参数：window 为可信调用窗口，model_id 为模型 ID；成功返回空值。
-/// 异常/边界：sidecar 未通过健康检查会补偿配置和旧进程；最长 45 秒检查不阻塞异步调度线程。
+/// 异常/边界：删除持久化配置失败才向前端报错；服务刷新失败只记录诊断，不回滚已删除配置，避免 UI 状态反复。
 #[tauri::command]
 async fn delete_private_model(
     window: tauri::WebviewWindow,
@@ -584,31 +583,8 @@ async fn delete_private_model(
     let diagnostic_context = model_id.clone();
     let worker_app = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let sidecar = worker_app.state::<RuntimeSidecar>();
-        let token_state = worker_app.state::<RuntimePublicApiToken>();
-        let snapshot = private_models::capture_snapshot(&worker_app)?;
         private_models::delete_private_model(&worker_app, &model_id)?;
-        let catalog = match private_models::sidecar_catalog_json(&worker_app) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                private_models::restore_snapshot(&worker_app, snapshot)?;
-                return Err(format!(
-                    "生成 sidecar 模型注册表失败，配置已回滚：{}",
-                    error
-                ));
-            }
-        };
-        coordinate_sidecar_apply(
-            "模型删除",
-            || sidecar.restart(&worker_app, &catalog),
-            || private_models::restore_snapshot(&worker_app, snapshot),
-            || {
-                let rollback_catalog = private_models::sidecar_catalog_json(&worker_app)?;
-                sidecar.restart(&worker_app, &rollback_catalog)
-            },
-            |token| store_public_api_token(&token_state, token),
-        )?;
-        Ok(())
+        Ok::<(), String>(())
     })
     .await
     .map_err(|_| "模型删除后台任务异常退出".to_string())?;
@@ -620,7 +596,67 @@ async fn delete_private_model(
             Some(&diagnostic_context),
             &error,
         )
-    })
+    })?;
+    refresh_sidecar_model_catalog_in_background(app, diagnostic_context);
+    Ok(())
+}
+
+/// 后台热更新 sidecar 模型注册表。
+/// 流程：重新生成公共模型目录，通过内部控制接口替换 sidecar 内存目录；失败写入桌面诊断日志，不影响已经提交的模型管理配置。
+/// 参数：app 为 Tauri App 句柄，context_id 为触发刷新模型 ID，便于内部调用保持诊断关联。
+/// 返回：无返回值。
+/// 异常/边界：后台任务不向前端抛错；用户后续业务请求会通过公共服务健康状态感知服务是否可用。
+fn refresh_sidecar_model_catalog_in_background(app: AppHandle, context_id: String) {
+    thread::spawn(move || {
+        let result = (|| {
+            let catalog = private_models::sidecar_catalog_json(&app)?;
+            reload_sidecar_model_catalog(&app, &catalog)
+        })();
+        if let Err(error) = result {
+            desktop_error::record_desktop_error(
+                &app,
+                "SIDECAR_MODEL_RELOAD_FAILED",
+                "sidecar_model_catalog_reload",
+                Some(&context_id),
+                &error,
+            );
+        }
+    });
+}
+
+/// 调用 sidecar 内部控制接口热更新模型目录。
+/// 流程：读取当前启动代私有控制密钥，POST 到回环地址内部 reload endpoint，成功时 sidecar 原子替换运行时目录。
+/// 参数：app 为 Tauri App 句柄，catalog 为不落盘的 sidecar 模型目录 JSON 字符串。
+/// 返回：热更新成功返回空值。
+/// 异常/边界：密钥只放在单次 Header 中，不记录、不持久化；非 2xx 响应只返回状态和安全错误摘要。
+fn reload_sidecar_model_catalog(app: &AppHandle, catalog: &str) -> Result<(), String> {
+    let control_secret = app.state::<RuntimePrivateRpc>().control_secret()?;
+    let model_catalog = serde_json::from_str::<Value>(catalog)
+        .map_err(|error| format!("解析 sidecar 模型注册表失败：{}", error))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("创建 sidecar 热更新客户端失败：{}", error))?;
+    let response = client
+        .post(format!(
+            "{}/internal/model-catalog/reload",
+            PUBLIC_API_BASE_URL
+        ))
+        .header("Accept", "application/json")
+        .header("X-CodexMan-Internal-Secret", control_secret)
+        .json(&json!({ "modelCatalog": model_catalog }))
+        .send()
+        .map_err(|error| format!("sidecar 模型目录热更新请求失败：{}", error))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status().as_u16();
+    let response_text = response.text().unwrap_or_default();
+    Err(format!(
+        "sidecar 模型目录热更新失败：{}；{}",
+        status,
+        trim_error_message(&response_text)
+    ))
 }
 
 /// 对未保存模型表单执行真实上游测试且不落盘。
@@ -672,51 +708,6 @@ async fn test_private_model(
         }
     };
     Ok(response)
-}
-
-/// 统一协调 sidecar 配置应用与补偿，保证磁盘状态、进程配置和短 Token 同步提交或回滚。
-/// 流程：执行新配置重启并保存新 Token；任一步失败时先恢复持久化状态，再按旧状态重启 sidecar 并保存回滚 Token。
-/// 参数：action 为稳定业务动作名，apply/restore_state/restore_sidecar/store_token 分别封装新进程启动、配置恢复、旧进程恢复和 Token 写入；成功返回空值。
-/// 异常/边界：闭包底层错误不会进入 IPC 文案；配置或 sidecar 任一补偿失败均返回固定失败阶段，避免泄漏路径、凭据或上游响应。
-fn coordinate_sidecar_apply<Apply, RestoreState, RestoreSidecar, StoreToken>(
-    action: &str,
-    apply: Apply,
-    restore_state: RestoreState,
-    restore_sidecar: RestoreSidecar,
-    mut store_token: StoreToken,
-) -> Result<(), String>
-where
-    Apply: FnOnce() -> Result<String, String>,
-    RestoreState: FnOnce() -> Result<(), String>,
-    RestoreSidecar: FnOnce() -> Result<String, String>,
-    StoreToken: FnMut(String) -> Result<(), String>,
-{
-    if let Ok(token) = apply() {
-        if store_token(token).is_ok() {
-            return Ok(());
-        }
-    }
-    if restore_state().is_err() {
-        return Err(format!("{}失败，配置回滚未完成", action));
-    }
-    let rollback_token =
-        restore_sidecar().map_err(|_| format!("{}失败，sidecar 回滚未完成", action))?;
-    store_token(rollback_token).map_err(|_| format!("{}失败，回滚 Token 未更新", action))?;
-    Err(format!("{}未生效，配置已回滚", action))
-}
-
-/// 原子替换运行时公共 API 短 Token。
-/// 流程：取得单一 Token 锁后覆盖旧值；参数为运行状态和只存在于内存的新 Token；成功返回空值。
-/// 异常/边界：锁中毒时返回稳定错误，不记录或回显 Token。
-fn store_public_api_token(
-    token_state: &RuntimePublicApiToken,
-    token: String,
-) -> Result<(), String> {
-    *token_state
-        .token
-        .lock()
-        .map_err(|_| "公共 API Token 状态不可用".to_string())? = token;
-    Ok(())
 }
 
 /// 限制模型、配置和系统设置等敏感管理 IPC 只能由 hub 主窗口调用。
@@ -1272,6 +1263,32 @@ fn parse_local_config_document(content: &str) -> Result<LocalConfigDocument, Str
     Ok(document)
 }
 
+/// 从客户端 JSON 配置文档中提取快捷键配置。
+/// 流程：读取固定快捷键分区，存在时按 ShortcutProfile 结构解析并走统一规范化。
+/// 参数：document 为已通过版本校验的客户端 JSON 配置文档。
+/// 返回：存在有效保存配置时返回 Some；未保存时返回 None。
+/// 异常/边界：字段结构损坏、快捷键冲突或 App 绑定路径非法时返回错误，禁止静默退回半可信配置。
+fn shortcut_profile_from_local_config(
+    document: &LocalConfigDocument,
+) -> Result<Option<ShortcutProfile>, String> {
+    let Some(value) = document.items.get(LOCAL_CONFIG_SHORTCUTS_KEY) else {
+        return Ok(None);
+    };
+    let profile = serde_json::from_value::<ShortcutProfile>(value.clone())
+        .map_err(|error| format!("解析快捷键配置失败：{}", error))?;
+    normalize_shortcut_profile(profile).map(Some)
+}
+
+/// 读取启动时应注册的快捷键配置。
+/// 流程：从客户端 JSON 的快捷键分区读取用户已保存配置，再复用统一规范化逻辑校验冲突和路径。
+/// 参数：app 为 Tauri AppHandle，用于定位应用数据目录。
+/// 返回：存在有效保存配置时返回 Some；未保存时返回 None，由调用方继续使用默认快捷键。
+/// 异常/边界：配置文件损坏、快捷键字段非法或 App 绑定路径非法时显式返回错误，避免注册半可信配置。
+fn read_startup_shortcut_profile(app: &AppHandle) -> Result<Option<ShortcutProfile>, String> {
+    let document = read_local_config_document(app)?;
+    shortcut_profile_from_local_config(&document)
+}
+
 /// 写入客户端 JSON 配置文件；目录不存在时自动创建。
 fn write_local_config_document(
     app: &AppHandle,
@@ -1339,7 +1356,7 @@ struct TrayHistoryItem {
 }
 
 /// 前端提交的全局模式快捷键。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 struct ShortcutProfile {
     /// ASR 仅转文本模式快捷键。
@@ -1353,7 +1370,7 @@ struct ShortcutProfile {
 }
 
 /// 用户创建的打开应用快捷键绑定。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct AppShortcutBinding {
     /// 绑定唯一 ID，用于前端渲染和后续删除。
@@ -1568,6 +1585,8 @@ struct RuntimeDiagnostics {
     microphone_authorized: bool,
     /// macOS 辅助功能权限是否已授权。
     accessibility_trusted: bool,
+    /// macOS 输入监控权限是否已授权；纯 Ctrl 快捷键兜底监听依赖该能力。
+    input_monitoring_trusted: bool,
     /// 当前 Rust 侧实际保存的快捷键配置。
     shortcuts: ShortcutProfile,
     /// 当前全局快捷键是否已成功注册。
@@ -1607,6 +1626,7 @@ pub fn run() {
         .manage(RuntimeDictationHistory::default())
         .manage(RuntimePasteFocusSnapshot::default())
         .manage(RuntimeAppVoiceRecorder::default())
+        .manage(RuntimeVoiceShortcutDebounce::default())
         .manage(RuntimeLocalConfigWatcher::default())
         .manage(RuntimePrivateRpc::default())
         .manage(RuntimeSidecar::default())
@@ -1653,10 +1673,65 @@ pub fn run() {
                         .build(),
                 )?;
                 let default_profile = ShortcutProfile::default();
-                let shortcut_result = register_shortcut_profile(app.handle(), &default_profile);
+                let (startup_profile, startup_config_error) =
+                    match read_startup_shortcut_profile(app.handle()) {
+                        Ok(Some(profile)) => (profile, None),
+                        Ok(None) => (default_profile.clone(), None),
+                        Err(error) => (
+                            default_profile.clone(),
+                            Some(format!(
+                                "读取已保存快捷键失败，已使用默认快捷键：{}",
+                                trim_error_message(&error)
+                            )),
+                        ),
+                    };
+                let mut active_profile = startup_profile.clone();
+                let mut shortcut_ready = false;
+                let mut shortcut_message =
+                    startup_config_error.unwrap_or_else(|| "快捷键已注册".to_string());
+                match register_shortcut_profile(app.handle(), &startup_profile) {
+                    Ok(()) => {
+                        shortcut_ready = true;
+                    }
+                    Err(error) if startup_profile != default_profile => {
+                        match register_shortcut_profile(app.handle(), &default_profile) {
+                            Ok(()) => {
+                                active_profile = default_profile.clone();
+                                shortcut_ready = true;
+                                shortcut_message = format!(
+                                    "已保存快捷键注册失败，已恢复默认快捷键：{}",
+                                    trim_error_message(&error)
+                                );
+                            }
+                            Err(default_error) => {
+                                shortcut_message = format!(
+                                    "已保存快捷键注册失败：{}；默认快捷键注册也失败：{}",
+                                    trim_error_message(&error),
+                                    trim_error_message(&default_error)
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        shortcut_message =
+                            format!("快捷键注册失败：{}", trim_error_message(&error));
+                    }
+                }
+                if !shortcut_ready
+                    && active_profile == default_profile
+                    && shortcut_message == "快捷键已注册"
+                {
+                    shortcut_message = "快捷键注册失败".to_string();
+                }
                 let shortcut_state = app.state::<RuntimeShortcuts>();
-                let _ =
-                    set_shortcut_runtime(&shortcut_state, default_profile, shortcut_result.err());
+                let _ = set_shortcut_runtime_status(
+                    &shortcut_state,
+                    active_profile,
+                    shortcut_ready,
+                    shortcut_message,
+                );
+                #[cfg(target_os = "macos")]
+                start_macos_ctrl_only_shortcut_monitor(app.handle().clone());
                 configure_tray(app)?;
             }
 
@@ -1700,6 +1775,8 @@ pub fn run() {
             request_microphone_access,
             open_accessibility_settings,
             open_microphone_settings,
+            request_input_monitoring_access,
+            open_input_monitoring_settings,
             set_login_launch,
             get_login_launch,
             set_dock_visible,
@@ -2416,7 +2493,7 @@ fn sync_native_dictation_history(app: &tauri::AppHandle, history: &[VoicePolishH
 }
 
 /// 调用本机公共 HTTP 服务并解析 JSON。
-/// 流程：等待 sidecar Token 就绪，发送 Bearer JSON 请求；401 时尝试续签一次。
+/// 流程：先等待 sidecar 健康，再用受信内网 Origin 发起 JSON 请求。
 /// 参数：app 为 Tauri 句柄，path 为接口路径，payload 为空表示 GET，否则 POST JSON。
 /// 返回：反序列化后的响应模型。
 /// 异常/边界：服务未启动、超时、响应格式错误或业务错误均带可读诊断。
@@ -2428,33 +2505,19 @@ fn request_public_api_json<T>(
 where
     T: DeserializeOwned,
 {
-    let token = wait_for_public_api_token(app)?;
-    match perform_public_api_json_request(app, path, payload.clone(), &token) {
-        Ok(value) => Ok(value),
-        Err(error) if error.contains("错误码：401") => {
-            let refreshed_token = app
-                .state::<RuntimeSidecar>()
-                .refresh_access_token()
-                .and_then(|token| {
-                    store_public_api_token(&app.state::<RuntimePublicApiToken>(), token.clone())?;
-                    Ok(token)
-                })?;
-            perform_public_api_json_request(app, path, payload, &refreshed_token)
-        }
-        Err(error) => Err(error),
-    }
+    wait_for_public_api_health()?;
+    perform_public_api_json_request(app, path, payload)
 }
 
 /// 执行一次公共 HTTP JSON 请求。
-/// 流程：按 payload 判断 GET/POST，使用固定本机地址和短期 Bearer Token。
-/// 参数：app 为诊断上下文，path 为接口路径，payload 为可选 JSON，token 为当前会话 Token。
+/// 流程：按 payload 判断 GET/POST，使用固定本机地址并声明受信 Tauri 内网 Origin。
+/// 参数：app 为诊断上下文，path 为接口路径，payload 为可选 JSON。
 /// 返回：反序列化响应。
 /// 异常/边界：非 2xx 响应会尝试解析统一错误 envelope。
 fn perform_public_api_json_request<T>(
     app: &tauri::AppHandle,
     path: &str,
     payload: Option<Value>,
-    token: &str,
 ) -> Result<T, String>
 where
     T: DeserializeOwned,
@@ -2470,7 +2533,7 @@ where
         client.get(url)
     }
     .header("Accept", "application/json")
-    .bearer_auth(token);
+    .header("Origin", "http://tauri.localhost");
     let response = request
         .send()
         .map_err(|error| format!("CodexMan HTTP 服务暂时不可用：{}", error))?;
@@ -2529,22 +2592,26 @@ fn parse_public_api_error_message(
     }
 }
 
-/// 等待 sidecar 写入公共 HTTP 短期 Token。
-/// 流程：在启动窗口内轮询内存 Token，避免 App 首屏先显示后 sidecar 仍在冷启动导致语音立即失败。
-/// 参数：app 为 Tauri 句柄。
-/// 返回：非空 Token。
+/// 等待本机公共 HTTP 服务进入健康状态。
+/// 流程：在启动窗口内轮询 `/health`，让快捷键触发的 App 原生录音链路等到 sidecar 可响应后再调用业务接口。
+/// 参数：无。
+/// 返回：健康时返回空值。
 /// 异常/边界：超时后提示本机服务仍在启动或不可用。
-fn wait_for_public_api_token(app: &tauri::AppHandle) -> Result<String, String> {
+fn wait_for_public_api_health() -> Result<(), String> {
     let deadline = Instant::now() + APP_VOICE_TOKEN_WAIT_TIMEOUT;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(900))
+        .build()
+        .map_err(|error| format!("创建本机 HTTP 健康检查客户端失败：{}", error))?;
     while Instant::now() < deadline {
-        let token = app
-            .state::<RuntimePublicApiToken>()
-            .token
-            .lock()
-            .map_err(|_| "读取本机 HTTP 会话失败：状态锁已损坏".to_string())?
-            .clone();
-        if !token.trim().is_empty() {
-            return Ok(token);
+        let healthy = client
+            .get(format!("{}/health", PUBLIC_API_BASE_URL))
+            .header("Accept", "application/json")
+            .send()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+        if healthy {
+            return Ok(());
         }
         thread::sleep(APP_VOICE_TOKEN_WAIT_INTERVAL);
     }
@@ -2649,6 +2716,250 @@ fn is_window_visible(app: &tauri::AppHandle, label: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 启动 macOS Ctrl-only 快捷键兜底监听。
+/// 流程：安装只读 Session event tap，只处理 Tauri 全局快捷键插件在 macOS 上不可靠的 `ctrl+字母/数字` 组合。
+/// 参数：app 为 Tauri AppHandle，用于读取运行时快捷键配置并触发语音模式。
+/// 返回：无返回值，监听线程随 App 进程退出而结束。
+/// 异常/边界：未授予输入监控权限或系统拒绝 event tap 时后台重试，不影响常规 Tauri 全局快捷键。
+#[cfg(target_os = "macos")]
+fn start_macos_ctrl_only_shortcut_monitor(app: tauri::AppHandle) {
+    thread::spawn(move || {
+        let mut retry_count = 0_u64;
+        loop {
+            if !is_input_monitoring_trusted() {
+                let _ = request_input_monitoring_access_platform();
+                retry_count += 1;
+                if retry_count == 1 || retry_count % 12 == 0 {
+                    let message = desktop_error::record_desktop_error(
+                        &app,
+                        "MACOS_CTRL_SHORTCUT_INPUT_MONITORING_MISSING",
+                        "macos_ctrl_only_shortcut_monitor",
+                        None,
+                        "CodexMan 尚未获得输入监控权限，已请求系统授权；授权后会自动重试 Ctrl-only 快捷键监听。",
+                    );
+                    emit_hub_notice(&app, &message, "error");
+                }
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+            let tap_app = app.clone();
+            append_shortcut_diagnostic(&app, "ctrl-only event tap starting");
+            let tap_result = CGEventTap::with_enabled(
+                CGEventTapLocation::Session,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::ListenOnly,
+                vec![CGEventType::KeyDown],
+                move |_proxy, event_type, event| {
+                    handle_macos_ctrl_only_key_event(&tap_app, event_type, event)
+                },
+                || core_foundation::runloop::CFRunLoop::run_current(),
+            );
+            let diagnostic_message = if tap_result.is_err() {
+                "启动 Ctrl-only 快捷键兜底监听失败，请确认 CodexMan 已获得输入监控权限。"
+            } else {
+                "Ctrl-only 快捷键兜底监听已停止，正在尝试重新启动。"
+            };
+            append_shortcut_diagnostic(&app, diagnostic_message);
+            retry_count += 1;
+            if retry_count == 1 || retry_count % 12 == 0 {
+                let message = desktop_error::record_desktop_error(
+                    &app,
+                    "MACOS_CTRL_SHORTCUT_TAP_FAILED",
+                    "macos_ctrl_only_shortcut_monitor",
+                    None,
+                    diagnostic_message,
+                );
+                emit_hub_notice(&app, &message, "error");
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
+/// 处理 macOS event tap 捕获到的 Ctrl-only 键盘事件。
+/// 流程：只在 KeyDown 且不是自动重复时，将 keyCode/flags 转成快捷键并匹配语音模式。
+/// 参数：app 为 Tauri 句柄，event_type 为事件类型，event 为系统键盘事件。
+/// 返回：只读 event tap 始终保持原事件，命中语音快捷键时异步触发 App 录音。
+/// 异常/边界：无法读取快捷键运行态、非 Ctrl-only 或未知键位时一律放行。
+#[cfg(target_os = "macos")]
+fn handle_macos_ctrl_only_key_event(
+    app: &tauri::AppHandle,
+    event_type: CGEventType,
+    event: &CGEvent,
+) -> CallbackResult {
+    if event_type as u32 != CGEventType::KeyDown as u32 {
+        return CallbackResult::Keep;
+    }
+    let Some(shortcut) = macos_ctrl_only_shortcut_from_event(event) else {
+        return CallbackResult::Keep;
+    };
+    append_shortcut_diagnostic(app, &format!("ctrl-only captured {}", shortcut));
+    let Some(mode) = ctrl_only_voice_mode_from_shortcut(app, &shortcut) else {
+        append_shortcut_diagnostic(app, &format!("ctrl-only ignored {}", shortcut));
+        return CallbackResult::Keep;
+    };
+    if event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
+        return CallbackResult::Drop;
+    }
+    append_shortcut_diagnostic(app, &format!("ctrl-only matched {} {}", shortcut, mode));
+    let trigger_app = app.clone();
+    thread::spawn(move || trigger_voice_mode(trigger_app, &mode));
+    CallbackResult::Drop
+}
+
+/// 追加快捷键诊断日志，帮助定位 macOS 全局键盘监听是否创建、捕获和匹配。
+/// 流程：写入应用数据目录下的 logs/shortcut-diagnostics.log；失败时静默忽略，避免诊断影响主流程。
+/// 参数：app 为 Tauri AppHandle，message 为不包含敏感内容的诊断文本。
+/// 返回：无返回值。
+/// 异常/边界：目录创建或文件写入失败时不向用户报错，快捷键主链路继续执行。
+fn append_shortcut_diagnostic(app: &tauri::AppHandle, message: &str) {
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let log_dir = app_dir.join("logs");
+    if fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    let log_path = log_dir.join(SHORTCUT_DIAGNOSTIC_LOG_FILE_NAME);
+    let timestamp = system_time_to_millis(SystemTime::now())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "{} {}", timestamp, message);
+    }
+}
+
+/// 从 macOS 键盘事件提取 Ctrl-only 快捷键。
+/// 流程：要求 Control 已按下且 Shift/Option/Command 均未按下，再把 ANSI keyCode 映射为稳定小写键名。
+/// 参数：event 为 CoreGraphics 键盘事件。
+/// 返回：形如 `ctrl+d` 的快捷键；不符合 Ctrl-only 条件时返回 None。
+/// 异常/边界：CapsLock、Fn、数字键盘等额外标记不影响组合判断，未知键位不匹配。
+#[cfg(target_os = "macos")]
+fn macos_ctrl_only_shortcut_from_event(event: &CGEvent) -> Option<String> {
+    macos_ctrl_only_shortcut_from_parts(
+        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
+        event.get_flags(),
+    )
+}
+
+/// 根据 macOS keyCode 和 flags 生成 Ctrl-only 快捷键。
+/// 流程：先校验修饰键，再映射 ANSI 字母/数字键。
+/// 参数：key_code 为虚拟键码，flags 为事件修饰键。
+/// 返回：形如 `ctrl+d` 的快捷键。
+/// 异常/边界：只支持产品快捷键录制会产生的字母和数字主键，复杂符号键继续交给 Tauri 插件处理。
+#[cfg(target_os = "macos")]
+fn macos_ctrl_only_shortcut_from_parts(key_code: u16, flags: CGEventFlags) -> Option<String> {
+    if !flags.contains(CGEventFlags::CGEventFlagControl)
+        || flags.contains(CGEventFlags::CGEventFlagShift)
+        || flags.contains(CGEventFlags::CGEventFlagAlternate)
+        || flags.contains(CGEventFlags::CGEventFlagCommand)
+    {
+        return None;
+    }
+    macos_key_code_to_shortcut_key(key_code).map(|key| format!("ctrl+{}", key))
+}
+
+/// 判断 Ctrl-only 快捷键对应的语音模式。
+/// 流程：只匹配 ASR、听写和文本润色中的 Ctrl-only 配置，避免和 App 打开绑定重复触发。
+/// 参数：app 为 Tauri 句柄，shortcut 为规范化快捷键。
+/// 返回：匹配到的语音模式。
+/// 异常/边界：配置锁损坏或快捷键不是 Ctrl-only 时返回 None。
+#[cfg(target_os = "macos")]
+fn ctrl_only_voice_mode_from_shortcut(app: &tauri::AppHandle, shortcut: &str) -> Option<String> {
+    let normalized = normalize_shortcut(shortcut);
+    if !is_ctrl_only_shortcut(&normalized) {
+        return None;
+    }
+    let profile = app
+        .state::<RuntimeShortcuts>()
+        .profile
+        .lock()
+        .ok()
+        .map(|profile| profile.clone())?;
+    ctrl_only_voice_mode_from_profile(&profile, &normalized)
+}
+
+/// 从快捷键配置中匹配 Ctrl-only 语音模式。
+/// 流程：按 ASR、文本润色、听写的既有优先级进行比较，保持和 `shortcut_to_mode` 一致。
+/// 参数：profile 为运行时快捷键配置，shortcut 为规范化快捷键。
+/// 返回：匹配到的语音模式。
+/// 异常/边界：非 Ctrl-only 快捷键不会由 event tap 兜底处理。
+#[cfg(target_os = "macos")]
+fn ctrl_only_voice_mode_from_profile(profile: &ShortcutProfile, shortcut: &str) -> Option<String> {
+    if !is_ctrl_only_shortcut(shortcut) {
+        return None;
+    }
+    if shortcut == normalize_shortcut(&profile.asr) {
+        Some("asr".to_string())
+    } else if shortcut == normalize_shortcut(&profile.polish) {
+        Some("polish".to_string())
+    } else if shortcut == normalize_shortcut(&profile.dictate) {
+        Some("dictate".to_string())
+    } else {
+        None
+    }
+}
+
+/// 判断快捷键是否为 macOS 需要兜底的 Ctrl-only 组合。
+/// 流程：规范化后要求只有 `ctrl` 修饰键和一个主键。
+/// 参数：shortcut 为任意快捷键文本。
+/// 返回：符合 Ctrl-only 条件时为 true。
+/// 异常/边界：Ctrl+Shift、Cmd、Alt 或缺少主键都返回 false。
+#[cfg(target_os = "macos")]
+fn is_ctrl_only_shortcut(shortcut: &str) -> bool {
+    let normalized = normalize_shortcut(shortcut);
+    let parts = normalized.split('+').collect::<Vec<_>>();
+    parts.len() == 2 && parts[0] == "ctrl" && !parts[1].is_empty()
+}
+
+/// 将 macOS ANSI keyCode 映射为 CodexMan 快捷键主键。
+/// 流程：覆盖常见字母和数字键，和前端录制展示使用同一套小写 key。
+/// 参数：key_code 为 macOS 虚拟键码。
+/// 返回：可参与快捷键比较的小写主键。
+/// 异常/边界：非 ANSI 主键返回 None，避免键盘布局差异导致误触发。
+#[cfg(target_os = "macos")]
+fn macos_key_code_to_shortcut_key(key_code: u16) -> Option<&'static str> {
+    match key_code {
+        KeyCode::ANSI_A => Some("a"),
+        KeyCode::ANSI_B => Some("b"),
+        KeyCode::ANSI_C => Some("c"),
+        KeyCode::ANSI_D => Some("d"),
+        KeyCode::ANSI_E => Some("e"),
+        KeyCode::ANSI_F => Some("f"),
+        KeyCode::ANSI_G => Some("g"),
+        KeyCode::ANSI_H => Some("h"),
+        KeyCode::ANSI_I => Some("i"),
+        KeyCode::ANSI_J => Some("j"),
+        KeyCode::ANSI_K => Some("k"),
+        KeyCode::ANSI_L => Some("l"),
+        KeyCode::ANSI_M => Some("m"),
+        KeyCode::ANSI_N => Some("n"),
+        KeyCode::ANSI_O => Some("o"),
+        KeyCode::ANSI_P => Some("p"),
+        KeyCode::ANSI_Q => Some("q"),
+        KeyCode::ANSI_R => Some("r"),
+        KeyCode::ANSI_S => Some("s"),
+        KeyCode::ANSI_T => Some("t"),
+        KeyCode::ANSI_U => Some("u"),
+        KeyCode::ANSI_V => Some("v"),
+        KeyCode::ANSI_W => Some("w"),
+        KeyCode::ANSI_X => Some("x"),
+        KeyCode::ANSI_Y => Some("y"),
+        KeyCode::ANSI_Z => Some("z"),
+        KeyCode::ANSI_0 => Some("0"),
+        KeyCode::ANSI_1 => Some("1"),
+        KeyCode::ANSI_2 => Some("2"),
+        KeyCode::ANSI_3 => Some("3"),
+        KeyCode::ANSI_4 => Some("4"),
+        KeyCode::ANSI_5 => Some("5"),
+        KeyCode::ANSI_6 => Some("6"),
+        KeyCode::ANSI_7 => Some("7"),
+        KeyCode::ANSI_8 => Some("8"),
+        KeyCode::ANSI_9 => Some("9"),
+        _ => None,
+    }
+}
+
 /// 根据全局快捷键字符串判断目标模式，并通知悬浮窗开始或停止。
 fn trigger_voice_shortcut(app: tauri::AppHandle, shortcut: String) {
     if trigger_app_shortcut(app.clone(), &shortcut) {
@@ -2695,6 +3006,10 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
     if mode.trim().is_empty() {
         return;
     }
+    if should_skip_duplicate_voice_shortcut(&app, mode) {
+        append_shortcut_diagnostic(&app, &format!("voice trigger deduplicated {}", mode));
+        return;
+    }
     if mode == "polish" {
         present_hub_view(&app, "textPolish");
         emit_hub_event(app, "hub-start-mode", "polish".to_string());
@@ -2723,6 +3038,10 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
     let target_app = context.target_app;
     thread::spawn(move || {
         if let Err(error) = run_app_voice_polish_core(&app, &mode, &target_app) {
+            append_shortcut_diagnostic(
+                &app,
+                &format!("voice pipeline failed {}", trim_error_message(&error)),
+            );
             let message = desktop_error::record_desktop_error(
                 &app,
                 "APP_VOICE_PIPELINE_FAILED",
@@ -2736,6 +3055,29 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
             }
         }
     });
+}
+
+/// 判断语音快捷键是否属于短窗口内的重复触发。
+/// 流程：同一模式在 800ms 内重复触发时合并，避免 macOS 全局快捷键插件和 Ctrl-only event tap 同时命中。
+/// 参数：app 为 Tauri 句柄，mode 为待触发的语音模式。
+/// 返回：需要跳过本次触发时返回 true。
+/// 异常/边界：状态锁异常时不跳过，优先保证用户快捷键仍可用。
+fn should_skip_duplicate_voice_shortcut(app: &tauri::AppHandle, mode: &str) -> bool {
+    let debounce_state = app.state::<RuntimeVoiceShortcutDebounce>();
+    let Ok(mut last_trigger) = debounce_state.last_trigger.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    let normalized_mode = mode.trim().to_string();
+    if let Some((last_mode, last_time)) = last_trigger.as_ref() {
+        if last_mode == &normalized_mode
+            && now.duration_since(*last_time) < VOICE_SHORTCUT_DEDUP_WINDOW
+        {
+            return true;
+        }
+    }
+    *last_trigger = Some((normalized_mode, now));
+    false
 }
 
 /// 把快捷键字符串转换成 CodexMan 的语音模式。
@@ -2867,6 +3209,7 @@ fn get_runtime_diagnostics(
     Ok(RuntimeDiagnostics {
         microphone_authorized: is_microphone_authorized(),
         accessibility_trusted: is_accessibility_trusted(),
+        input_monitoring_trusted: is_input_monitoring_trusted(),
         shortcuts: profile,
         shortcut_registration_ready: shortcut_registration_status.ready,
         shortcut_registration_message: shortcut_registration_status.message,
@@ -5656,6 +5999,26 @@ fn open_microphone_settings(window: tauri::WebviewWindow) -> Result<(), String> 
     open_microphone_preferences()
 }
 
+/// 主动请求 macOS 输入监控权限，用于让纯 Ctrl 全局快捷键兜底监听进入系统授权列表。
+/// 流程：校验 hub/main 窗口后调用 CoreGraphics ListenEvent 授权 API；系统可能弹出输入监控授权提示。
+/// 参数：window 为调用窗口。
+/// 返回：系统认为当前进程已获授权时返回 true。
+/// 异常/边界：非 macOS 平台由平台实现返回明确错误，不伪造授权成功。
+#[tauri::command]
+fn request_input_monitoring_access(window: tauri::WebviewWindow) -> Result<bool, String> {
+    ensure_app_voice_window(window.label())?;
+    request_input_monitoring_access_platform()
+}
+
+/// 打开 macOS 输入监控设置，用于授予全局键盘监听权限。
+/// 流程：校验 hub 后调用平台设置入口；参数为调用窗口；成功返回空值。
+/// 异常/边界：非 hub 默认拒绝，非 macOS 平台由既有平台实现返回对应结果。
+#[tauri::command]
+fn open_input_monitoring_settings(window: tauri::WebviewWindow) -> Result<(), String> {
+    ensure_sensitive_management_window(window.label())?;
+    open_input_monitoring_preferences()
+}
+
 /// 读取当前运行时保存的快捷键，用于新配置注册失败后恢复旧快捷键。
 fn read_shortcut_runtime_profile(state: &RuntimeShortcuts) -> Result<ShortcutProfile, String> {
     state
@@ -7695,6 +8058,21 @@ fn is_accessibility_trusted() -> bool {
     false
 }
 
+/// 查询当前进程是否已获得 macOS 输入监控权限。
+/// 流程：通过 CoreGraphics 读取 ListenEvent 授权状态，供权限页展示真实系统结果。
+/// 返回：系统返回 Granted 时为 true。
+/// 边界：该方法只读权限状态，不主动弹窗，避免刷新页面时打扰用户。
+#[cfg(target_os = "macos")]
+fn is_input_monitoring_trusted() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
+}
+
+/// 非 macOS 平台没有当前实现需要的输入监控权限。
+#[cfg(not(target_os = "macos"))]
+fn is_input_monitoring_trusted() -> bool {
+    false
+}
+
 /// 查询当前进程是否已获得 macOS 麦克风权限。
 /// 流程：通过 AVFoundation 读取音频媒体类型授权状态，只把 Authorized 视为可录音。
 /// 返回：已授权时返回 true；未决定、受限、拒绝或系统常量不可用时返回 false。
@@ -7755,6 +8133,25 @@ fn request_microphone_access_platform() -> Result<bool, String> {
     Err("当前版本只支持在 macOS 请求麦克风授权".to_string())
 }
 
+/// 主动请求 macOS 输入监控权限。
+/// 流程：已授权直接返回 true；未授权时调用 CGRequestListenEventAccess 让系统记录本 App 并触发授权提示。
+/// 返回：系统当前授权状态。
+/// 边界：CGRequestListenEventAccess 返回 false 时需要用户到系统设置中手动允许 CodexMan。
+#[cfg(target_os = "macos")]
+fn request_input_monitoring_access_platform() -> Result<bool, String> {
+    if is_input_monitoring_trusted() {
+        return Ok(true);
+    }
+    let requested = unsafe { CGRequestListenEventAccess() && is_input_monitoring_trusted() };
+    Ok(requested)
+}
+
+/// 非 macOS 平台暂不支持主动请求输入监控授权。
+#[cfg(not(target_os = "macos"))]
+fn request_input_monitoring_access_platform() -> Result<bool, String> {
+    Err("当前版本只支持在 macOS 请求输入监控授权".to_string())
+}
+
 /// 打开 macOS 辅助功能设置页。
 #[cfg(target_os = "macos")]
 fn open_accessibility_preferences() -> Result<(), String> {
@@ -7785,6 +8182,22 @@ fn open_microphone_preferences() -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn open_microphone_preferences() -> Result<(), String> {
     Err("当前版本只支持在 macOS 打开麦克风设置".to_string())
+}
+
+/// 打开 macOS 输入监控隐私设置页。
+#[cfg(target_os = "macos")]
+fn open_input_monitoring_preferences() -> Result<(), String> {
+    Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+        .spawn()
+        .map_err(|error| format!("打开输入监控设置失败：{}", error))?;
+    Ok(())
+}
+
+/// 非 macOS 平台暂不支持打开对应输入监控权限页。
+#[cfg(not(target_os = "macos"))]
+fn open_input_monitoring_preferences() -> Result<(), String> {
+    Err("当前版本只支持在 macOS 打开输入监控设置".to_string())
 }
 
 /// 扫描 macOS 常见应用目录并返回 .app bundle。
@@ -7877,6 +8290,13 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7915,6 +8335,109 @@ mod tests {
         let error = parse_local_config_document(r#"{"version":2,"updatedAt":"","items":{}}"#)
             .expect_err("未知配置版本必须被拒绝");
         assert!(error.contains("版本不受支持"));
+    }
+
+    /// 启动注册链路必须能从客户端 JSON 读取用户保存的快捷键，而不是只注册默认快捷键。
+    #[test]
+    fn startup_shortcut_profile_uses_saved_local_config() {
+        let document = parse_local_config_document(
+            r#"{
+                "version": 1,
+                "updatedAt": "2026-08-15T00:00:00.000Z",
+                "items": {
+                    "codexman.shortcuts.v1": {
+                        "asr": "Ctrl + Shift + D",
+                        "dictate": "Ctrl + D",
+                        "polish": "Ctrl + Shift + P",
+                        "appBindings": []
+                    }
+                }
+            }"#,
+        )
+        .expect("测试配置应可解析");
+        let profile = shortcut_profile_from_local_config(&document)
+            .expect("保存的快捷键配置应可读取")
+            .expect("保存的快捷键配置应存在");
+
+        assert_eq!(profile.asr, "ctrl+shift+d");
+        assert_eq!(profile.dictate, "ctrl+d");
+        assert_eq!(profile.polish, "ctrl+shift+p");
+    }
+
+    /// 启动注册链路读取到冲突快捷键时必须显式失败，避免注册出前后端不一致的半成品状态。
+    #[test]
+    fn startup_shortcut_profile_rejects_conflict_local_config() {
+        let document = parse_local_config_document(
+            r#"{
+                "version": 1,
+                "updatedAt": "2026-08-15T00:00:00.000Z",
+                "items": {
+                    "codexman.shortcuts.v1": {
+                        "asr": "Ctrl + D",
+                        "dictate": "Ctrl + D",
+                        "polish": "Ctrl + Shift + P",
+                        "appBindings": []
+                    }
+                }
+            }"#,
+        )
+        .expect("测试配置应可解析");
+        let error =
+            shortcut_profile_from_local_config(&document).expect_err("冲突快捷键必须被拒绝");
+
+        assert!(error.contains("不能使用同一个快捷键"));
+    }
+
+    /// macOS Ctrl-only 兜底监听必须能识别用户当前配置的 Ctrl+D 听写快捷键。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ctrl_only_shortcut_maps_saved_dictate_mode() {
+        let profile = ShortcutProfile {
+            asr: "ctrl+p".to_string(),
+            dictate: "ctrl+d".to_string(),
+            polish: "ctrl+shift+p".to_string(),
+            app_bindings: Vec::new(),
+        };
+        let shortcut =
+            macos_ctrl_only_shortcut_from_parts(KeyCode::ANSI_D, CGEventFlags::CGEventFlagControl)
+                .expect("Ctrl+D 应被识别为 Ctrl-only 快捷键");
+
+        assert_eq!(shortcut, "ctrl+d");
+        assert_eq!(
+            ctrl_only_voice_mode_from_profile(&profile, &shortcut).as_deref(),
+            Some("dictate")
+        );
+    }
+
+    /// macOS Ctrl-only 兜底监听不能抢走带 Shift/Option/Command 的常规全局快捷键。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ctrl_only_shortcut_ignores_modified_shortcuts() {
+        assert!(macos_ctrl_only_shortcut_from_parts(
+            KeyCode::ANSI_D,
+            CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagShift,
+        )
+        .is_none());
+        assert!(macos_ctrl_only_shortcut_from_parts(
+            KeyCode::ANSI_D,
+            CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagAlternate,
+        )
+        .is_none());
+        assert!(macos_ctrl_only_shortcut_from_parts(
+            KeyCode::ANSI_D,
+            CGEventFlags::CGEventFlagControl | CGEventFlags::CGEventFlagCommand,
+        )
+        .is_none());
+    }
+
+    /// macOS Ctrl-only 兜底监听只匹配语音快捷键，不把普通 Ctrl-only 文本误判为模式。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ctrl_only_shortcut_rejects_unknown_voice_mode() {
+        let profile = ShortcutProfile::default();
+
+        assert!(ctrl_only_voice_mode_from_profile(&profile, "ctrl+x").is_none());
+        assert!(ctrl_only_voice_mode_from_profile(&profile, "ctrl+shift+p").is_none());
     }
 
     /// app-server completed turn 才能解析为待验收输入，并保留最终助手文本。
@@ -8697,76 +9220,6 @@ mod tests {
         assert!(ensure_sensitive_management_window("toast").is_err());
         assert!(ensure_sensitive_management_window("result").is_err());
         assert!(ensure_sensitive_management_window("").is_err());
-    }
-
-    /// sidecar 新配置成功时只保存新 Token，不应触发任何补偿步骤。
-    #[test]
-    fn sidecar_apply_success_skips_rollback() {
-        let events = std::cell::RefCell::new(Vec::new());
-        let result = coordinate_sidecar_apply(
-            "测试配置",
-            || {
-                events.borrow_mut().push("apply");
-                Ok("new-token".to_string())
-            },
-            || {
-                events.borrow_mut().push("restore-state");
-                Ok(())
-            },
-            || {
-                events.borrow_mut().push("restore-sidecar");
-                Ok("old-token".to_string())
-            },
-            |token| {
-                events.borrow_mut().push(if token == "new-token" {
-                    "store-new-token"
-                } else {
-                    "store-old-token"
-                });
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert_eq!(*events.borrow(), vec!["apply", "store-new-token"]);
-    }
-
-    /// sidecar 应用失败时必须严格先恢复配置、再恢复旧进程、最后保存回滚 Token。
-    #[test]
-    fn sidecar_apply_failure_rolls_back_in_order() {
-        let events = std::cell::RefCell::new(Vec::new());
-        let result = coordinate_sidecar_apply(
-            "测试配置",
-            || {
-                events.borrow_mut().push("apply");
-                Err("含敏感详情的启动错误".to_string())
-            },
-            || {
-                events.borrow_mut().push("restore-state");
-                Ok(())
-            },
-            || {
-                events.borrow_mut().push("restore-sidecar");
-                Ok("old-token".to_string())
-            },
-            |token| {
-                events.borrow_mut().push(if token == "old-token" {
-                    "store-old-token"
-                } else {
-                    "store-new-token"
-                });
-                Ok(())
-            },
-        );
-        assert_eq!(result, Err("测试配置未生效，配置已回滚".to_string()));
-        assert_eq!(
-            *events.borrow(),
-            vec![
-                "apply",
-                "restore-state",
-                "restore-sidecar",
-                "store-old-token"
-            ]
-        );
     }
 
     /// 启停、默认态和展示名编辑不得触发上游探针；连接关键参数或密钥变化必须触发。

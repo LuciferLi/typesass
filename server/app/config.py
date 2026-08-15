@@ -201,6 +201,19 @@ def _model_catalog() -> Tuple[ModelCatalogItem, ...]:
     _MODEL_CATALOG_BOOTSTRAP = None
     if payload is None:
         return ()
+    return parse_model_catalog_payload(payload)
+
+
+def parse_model_catalog_payload(payload: object) -> Tuple[ModelCatalogItem, ...]:
+    """校验并转换受信模型目录 payload。
+
+    用途：复用启动 bootstrap 和运行时 reload 的同一套模型目录校验规则，避免热更新路径绕过安全边界。
+    流程：校验数组、字段全集、ID 唯一性、能力、状态、provider、baseUrl、模型名和密钥后构造不可变目录。
+    参数：``payload`` 为 Rust 注入的模型目录原始 JSON 对象。
+    返回：可原子替换到运行时服务的不可变模型目录元组。
+    异常边界：错误只包含数组序号和字段名，不包含 URL、模型名或 API Key 原文。
+    """
+
     if not isinstance(payload, list):
         raise RuntimeError("sidecar bootstrap modelCatalog 必须是 JSON 数组")
     items = []

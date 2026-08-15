@@ -39,11 +39,21 @@ ORDINARY_SECRET = "fake-ordinary-client-secret-000000000001"
 class FakeAccessTokenApprovalRpcClient:
     """记录授权申请私有 RPC 调用并返回固定审批结果。"""
 
-    def __init__(self, approved: bool) -> None:
+    def __init__(
+        self,
+        approved: bool,
+        control_secret: str = "test-control-secret-000000000000000000",
+    ) -> None:
         """初始化审批结果和调用列表。"""
 
         self.approved = approved
+        self.control_secret = control_secret
         self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def verify_secret(self, secret: str) -> bool:
+        """校验测试用内部控制密钥。"""
+
+        return secret == self.control_secret
 
     async def call(
         self, method: str, request_id: str, params: dict[str, object]
@@ -429,6 +439,61 @@ async def test_tc_api_003a_safe_model_catalog_and_empty_catalog(
     )
     assert "fake-local" not in configured.text
     assert empty.json() == []
+
+
+@pytest.mark.asyncio
+async def test_tc_api_003a2_internal_model_catalog_reload_requires_secret() -> None:
+    """TC-API-003A2 内部模型目录热更新必须校验私有密钥，成功后公开目录读取新内存状态。"""
+
+    async with api_client() as client:
+        main.app.state.private_rpc = FakeAccessTokenApprovalRpcClient(True)
+        missing_secret = await client.post(
+            "/internal/model-catalog/reload",
+            json={"modelCatalog": []},
+        )
+        wrong_secret = await client.post(
+            "/internal/model-catalog/reload",
+            headers={"X-CodexMan-Internal-Secret": "wrong-secret"},
+            json={"modelCatalog": []},
+        )
+        reloaded = await client.post(
+            "/internal/model-catalog/reload",
+            headers={
+                "X-CodexMan-Internal-Secret": "test-control-secret-000000000000000000"
+            },
+            json={
+                "modelCatalog": [
+                    {
+                        "id": "hot-text-id",
+                        "displayName": "Hot Text",
+                        "capability": "text",
+                        "enabled": True,
+                        "isDefault": True,
+                        "provider": "openai-compatible",
+                        "baseUrl": "https://example.com/v1",
+                        "modelName": "hot-text-model",
+                        "apiKey": "hot-key",
+                    }
+                ]
+            },
+        )
+        headers = await session_headers(client)
+        models = await client.get("/v1/models", headers=headers)
+    assert_error(missing_secret, 401, "UNAUTHORIZED")
+    assert_error(wrong_secret, 401, "UNAUTHORIZED")
+    assert reloaded.status_code == 200
+    assert reloaded.json() == {"ok": True}
+    assert models.status_code == 200
+    assert models.json() == [
+        {
+            "id": "hot-text-id",
+            "displayName": "Hot Text",
+            "capability": "text",
+            "enabled": True,
+            "isDefault": True,
+        }
+    ]
+    assert "hot-key" not in models.text
 
 
 @pytest.mark.parametrize(

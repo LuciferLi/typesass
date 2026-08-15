@@ -8,7 +8,7 @@ import logging
 from typing import Annotated, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Path, Request
+from fastapi import Depends, FastAPI, Header, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -514,6 +514,24 @@ async def require_api_access(
     return client_id
 
 
+async def require_internal_control_secret(
+    request: Request,
+    control_secret: str = Header(default="", alias="X-CodexMan-Internal-Secret"),
+) -> None:
+    """校验桌面 App 内部控制接口密钥。
+
+    用途：保护 sidecar 运行时热更新等敏感内部接口，避免普通内网 Origin 或公网授权码触发控制操作。
+    流程：读取 Rust 通过 Header 传入的当前启动代私有密钥，交给 private RPC 配置做常量时间比较。
+    参数：``request`` 提供 sidecar 应用状态，``control_secret`` 为内部控制 Header。
+    返回：校验通过无返回。
+    异常边界：缺失、错误或未 bootstrap 的 sidecar 均返回 401，不泄露内部密钥状态。
+    """
+
+    client: PrivateRpcClient = request.app.state.private_rpc
+    if not control_secret or not client.verify_secret(control_secret):
+        raise ApiError(401, "UNAUTHORIZED", "内部控制密钥无效。")
+
+
 async def limit_client_rate(
     request: Request,
     client_id: str = Depends(require_api_access),
@@ -947,6 +965,46 @@ async def list_models(request: Request) -> List[ModelCatalogResponse]:
         )
         for model in service.list_models()
     ]
+
+
+@app.post(
+    "/internal/model-catalog/reload",
+    response_model=OperationResponse,
+    responses={
+        200: success_response_documentation({"ok": True}),
+        **build_error_responses(
+            {
+                401: ("内部控制密钥缺失或无效。", "UNAUTHORIZED"),
+                422: ("模型目录结构无效。", "VALIDATION_ERROR"),
+            }
+        ),
+    },
+    dependencies=[Depends(require_internal_control_secret)],
+    tags=["内部"],
+    include_in_schema=False,
+)
+async def reload_model_catalog(request: Request) -> OperationResponse:
+    """热更新 sidecar 运行时模型目录。
+
+    用途：让桌面 App 保存、启停或删除模型后无需重启 PyInstaller/FastAPI 进程即可让业务请求使用新目录。
+    流程：校验内部控制密钥后读取 ``modelCatalog`` envelope，复用配置层安全校验并原子替换模型服务目录。
+    参数：``request`` 提供原始 JSON 和模型服务状态。
+    返回：固定 ``ok=true``。
+    异常边界：只接受 Rust 生成的目录数组；校验失败保持旧目录不变，不返回 URL、模型名或 API Key。
+    """
+
+    try:
+        payload = await request.json()
+    except ValueError as error:
+        raise ApiError(422, "VALIDATION_ERROR", "模型目录结构无效。") from error
+    if not isinstance(payload, dict) or set(payload) != {"modelCatalog"}:
+        raise ApiError(422, "VALIDATION_ERROR", "模型目录结构无效。")
+    service: ModelService = request.app.state.model_service
+    try:
+        service.reload_models(payload["modelCatalog"])
+    except RuntimeError as error:
+        raise ApiError(422, "VALIDATION_ERROR", "模型目录结构无效。") from error
+    return OperationResponse(ok=True)
 
 
 @app.post(

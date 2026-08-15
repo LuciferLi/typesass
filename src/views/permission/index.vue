@@ -99,7 +99,9 @@
                                     <ui-button
                                         v-if="
                                             isClientRuntime &&
-                                            (item.key === 'microphone' || item.key === 'accessibility')
+                                            (item.key === 'microphone' ||
+                                                item.key === 'accessibility' ||
+                                                item.key === 'inputMonitoring')
                                         "
                                         variant="outline"
                                         size="sm"
@@ -108,7 +110,11 @@
                                         打开系统设置
                                     </ui-button>
                                     <ui-tooltip
-                                        v-else-if="item.key === 'microphone' || item.key === 'accessibility'"
+                                        v-else-if="
+                                            item.key === 'microphone' ||
+                                            item.key === 'accessibility' ||
+                                            item.key === 'inputMonitoring'
+                                        "
                                         :open="disabledPermissionTipKey === item.key">
                                         <ui-tooltip-trigger as-child>
                                             <span
@@ -308,12 +314,13 @@
     const disabledPermissionTipKey = ref<PermissionDisplayKeyType | null>(null);
     const isClientRuntime = isTauriRuntime();
     const permissionGroups: PermissionGroupModel[] = [
-        { title: '系统权限', keys: ['microphone', 'accessibility'] },
+        { title: '系统权限', keys: ['microphone', 'accessibility', 'inputMonitoring'] },
         { title: '运行能力', keys: ['shortcut'] }
     ];
     const permissionIconByKey: Record<PermissionDisplayKeyType, Component> = {
         microphone: Microphone,
         accessibility: Permissions,
+        inputMonitoring: KeyboardOne,
         shortcut: KeyboardOne
     };
     const permissionInfoSections: PermissionInfoSectionModel[] = [
@@ -333,6 +340,12 @@
             description:
                 '用于读取选中文本、恢复输入焦点和自动粘贴结果。没有辅助功能权限时，文字润色和自动写回能力会受限。',
             icon: TextRecognition
+        },
+        {
+            title: '输入监控权限',
+            description:
+                '用于在其它应用处于前台时监听你设置的语音快捷键。没有输入监控权限时，Ctrl+D 这类快捷键可能不会触发录音。',
+            icon: KeyboardOne
         },
         {
             title: '全局快捷键',

@@ -330,6 +330,22 @@ impl RuntimePrivateRpc {
         })
     }
 
+    /// 读取当前 sidecar 启动代私有控制密钥。
+    /// 流程：在状态锁内克隆已 bootstrap 给 sidecar 的高熵 secret，供 Rust 主进程调用内部控制接口。
+    /// 参数：无。
+    /// 返回：当前启动代 secret。
+    /// 异常/边界：私有 RPC 未启动时返回稳定错误；调用方不得记录、回显或持久化该密钥。
+    pub fn control_secret(&self) -> Result<String, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "私有 RPC 状态锁已损坏".to_string())?;
+        let managed = state
+            .as_ref()
+            .ok_or_else(|| "私有 RPC 尚未启动，无法读取内部控制密钥".to_string())?;
+        Ok(managed.secret.clone())
+    }
+
     /// 停止当前 App 持有的私有 RPC listener 并删除精确 socket 文件。
     /// 流程：从状态中取出当前代资源、置停止标志并用本机连接唤醒 accept，join 工作线程后清除 secret 和 socket。
     /// 参数：无；幂等返回清理结果。
@@ -1167,7 +1183,7 @@ mod tests {
     /// 连接状态和显式重启必须属于固定 allowlist，且不能出现通用命令入口。
     #[test]
     fn codex_connection_methods_are_explicitly_allowlisted() {
-        assert_eq!(ALLOWED_METHODS.len(), 14);
+        assert_eq!(ALLOWED_METHODS.len(), 15);
         assert!(ALLOWED_METHODS.contains(&"getCodexConnection"));
         assert!(ALLOWED_METHODS.contains(&"restartCodex"));
         assert!(!ALLOWED_METHODS.contains(&"command"));

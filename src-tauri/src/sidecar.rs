@@ -400,14 +400,6 @@ impl RuntimeSidecar {
     pub fn approve_device_authorization(&self, _user_code: &str) -> Result<String, String> {
         Err("设备码授权已下线，请在系统设置中创建或申请 App 授权码。".to_string())
     }
-
-    /// 使用新模型注册表重启 sidecar 并换取全新短 Token。
-    /// 流程：只停止本 App 持有的子进程，再复用完整启动门禁；参数同 start；返回新 Token。
-    /// 异常/边界：重启失败不恢复旧进程，调用方必须向 UI 返回清晰错误，禁止继续使用失效 Token。
-    pub fn restart(&self, app: &AppHandle, model_catalog_json: &str) -> Result<String, String> {
-        self.shutdown()?;
-        self.start(app, model_catalog_json)
-    }
 }
 
 impl Drop for RuntimeSidecar {
