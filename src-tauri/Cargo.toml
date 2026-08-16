@@ -1,6 +1,6 @@
 [package]
 name = "ai-tool"
-version = "0.1.12"
+version = "0.1.13"
 description = "轻量语音转写工具"
 authors = ["aijob"]
 edition = "2021"

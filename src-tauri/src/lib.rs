@@ -2209,7 +2209,7 @@ fn ensure_app_voice_window(window_label: &str) -> Result<(), String> {
 }
 
 /// 执行 App 原生语音处理核心流程。
-/// 流程：串行门禁、刷新服务模型、主进程录音、ASR、可选文本整理、写入历史、自动粘贴或结果兜底。
+/// 流程：串行门禁、主进程录音、刷新服务模型、ASR、可选文本整理、写入历史、自动粘贴或结果兜底。
 /// 参数：app 为 Tauri 句柄，mode 为 asr/dictate，target_app 为触发时前台应用。
 /// 返回：本次结构化结果。
 /// 异常/边界：全链路只通过稳定错误返回失败，不在失败时写入伪历史或伪粘贴成功。
@@ -2225,6 +2225,26 @@ fn run_app_voice_polish_core(
     emit_floating_voice_state(app, "preparing", "正在准备录音，出现录音状态后再开始说话。");
     emit_hub_notice(app, "正在录音，请稍后。", "running");
     ensure_microphone_access_for_voice()?;
+
+    emit_floating_voice_state(app, "recording", "正在录音，再按一次快捷键停止。");
+    let audio = app_audio::record_microphone_wav(APP_VOICE_RECORD_MAX_DURATION_MS, stop_requested)?;
+    clear_app_voice_recording_stop(app);
+    append_shortcut_diagnostic(
+        app,
+        &format!(
+            "voice audio captured duration_ms={} bytes={} samples={} peak={} rms={:.2} active_ratio={:.4} stopped_by_request={}",
+            audio.duration_ms,
+            audio.bytes.len(),
+            audio.diagnostics.sample_count,
+            audio.diagnostics.peak_amplitude,
+            audio.diagnostics.rms_amplitude,
+            audio.diagnostics.active_sample_ratio,
+            audio.diagnostics.stopped_by_request
+        ),
+    );
+    if audio.bytes.len() > APP_VOICE_AUDIO_MAX_BYTES {
+        return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
+    }
 
     let mut persisted = read_voice_polish_persisted_state(app)?;
     let catalog = request_public_api_json::<Vec<PublicModelCatalogItem>>(app, "/v1/models", None)?;
@@ -2251,13 +2271,6 @@ fn run_app_voice_polish_core(
         persisted.text_model_id = selection.model_id.clone();
     }
 
-    emit_floating_voice_state(app, "recording", "正在录音，再按一次快捷键停止。");
-    let audio = app_audio::record_microphone_wav(APP_VOICE_RECORD_MAX_DURATION_MS, stop_requested)?;
-    clear_app_voice_recording_stop(app);
-    if audio.bytes.len() > APP_VOICE_AUDIO_MAX_BYTES {
-        return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
-    }
-
     emit_floating_voice_state(app, "transcribing", "正在转文字。");
     emit_hub_notice(app, "正在识别语音。", "running");
     let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio.bytes);
@@ -2273,6 +2286,12 @@ fn run_app_voice_polish_core(
     )?;
     let source_text = transcribed.text.trim().to_string();
     if source_text.is_empty() {
+        if is_app_voice_audio_effectively_silent(&audio.diagnostics) {
+            return Err(
+                "CodexMan 已开始录音，但麦克风几乎没有收到声音。请确认系统输入设备、麦克风音量和当前麦克风开关后重试。"
+                    .to_string(),
+            );
+        }
         return Err("没有识别到有效语音内容，请靠近麦克风后重试。".to_string());
     }
 
@@ -2356,6 +2375,16 @@ fn run_app_voice_polish_core(
         paste,
         message: completed_message.to_string(),
     })
+}
+
+/// 判断本次 App 原生录音是否接近静音。
+/// 流程：同时检查峰值、RMS 和有效样本占比，避免单个噪点把静音误判成有人声。
+/// 参数：diagnostics 为录音阶段生成的波形统计。
+/// 返回：明显低于正常人声音量时返回 true。
+/// 异常/边界：该判断只用于改善 ASR 空结果提示，不会阻止有波形的音频送往模型。
+fn is_app_voice_audio_effectively_silent(diagnostics: &app_audio::AppAudioDiagnostics) -> bool {
+    diagnostics.active_sample_ratio < 0.02
+        || (diagnostics.peak_amplitude < 800 && diagnostics.rms_amplitude < 80.0)
 }
 
 /// 归一化 App 原生语音模式。

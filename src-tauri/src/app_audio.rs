@@ -17,6 +17,22 @@ pub struct AppAudioRecord {
     pub content_type: String,
     /// 实际采样得到的时长，毫秒。
     pub duration_ms: u64,
+    /// 录音波形诊断摘要；不包含原始音频内容。
+    pub diagnostics: AppAudioDiagnostics,
+}
+
+/// App 录音波形诊断信息，用于判断是否真的收到了麦克风声音。
+pub struct AppAudioDiagnostics {
+    /// 单声道样本数。
+    pub sample_count: usize,
+    /// 样本峰值，范围为 0 到 32768。
+    pub peak_amplitude: i16,
+    /// 均方根音量，范围约为 0 到 32768。
+    pub rms_amplitude: f64,
+    /// 超过人声粗略阈值的样本占比，范围为 0 到 1。
+    pub active_sample_ratio: f64,
+    /// 本次录音是否由用户再次按快捷键停止。
+    pub stopped_by_request: bool,
 }
 
 /// 使用 CodexMan 主进程录制一段可被外部停止的麦克风 WAV。
@@ -87,8 +103,10 @@ pub fn record_microphone_wav(
     let poll_interval = Duration::from_millis(30);
     let max_duration = Duration::from_millis(max_duration_ms);
     let started_at = std::time::Instant::now();
+    let mut stopped_by_request = false;
     while started_at.elapsed() < max_duration {
         if stop_requested.load(Ordering::Acquire) {
+            stopped_by_request = true;
             break;
         }
         thread::sleep(poll_interval);
@@ -113,12 +131,42 @@ pub fn record_microphone_wav(
         );
     }
     let duration_ms = (captured_samples.len() as u64 * 1_000) / u64::from(sample_rate);
+    let diagnostics = build_audio_diagnostics(&captured_samples, stopped_by_request);
     let bytes = write_wav_bytes(sample_rate, &captured_samples)?;
     Ok(AppAudioRecord {
         bytes,
         content_type: "audio/wav".to_string(),
         duration_ms,
+        diagnostics,
     })
+}
+
+/// 生成录音质量诊断，只记录波形统计，不记录或落盘音频内容。
+/// 流程：计算峰值、RMS 和有效样本占比，辅助判断用户侧是权限问题、设备静音还是上游识别空结果。
+/// 参数：samples 为单声道 PCM 样本，stopped_by_request 表示是否由第二次快捷键停止。
+/// 返回：可安全写入诊断日志的音频统计信息。
+/// 异常/边界：空样本由调用方提前拦截；这里仍用 1 作为分母兜底，避免除零。
+fn build_audio_diagnostics(samples: &[i16], stopped_by_request: bool) -> AppAudioDiagnostics {
+    const ACTIVE_SAMPLE_THRESHOLD: i32 = 500;
+    let mut peak_amplitude = 0_i32;
+    let mut square_sum = 0_f64;
+    let mut active_sample_count = 0_usize;
+    for sample in samples {
+        let amplitude = i32::from(*sample).abs();
+        peak_amplitude = peak_amplitude.max(amplitude);
+        square_sum += f64::from(amplitude * amplitude);
+        if amplitude >= ACTIVE_SAMPLE_THRESHOLD {
+            active_sample_count += 1;
+        }
+    }
+    let sample_count = samples.len().max(1);
+    AppAudioDiagnostics {
+        sample_count: samples.len(),
+        peak_amplitude: peak_amplitude.min(i32::from(i16::MAX)) as i16,
+        rms_amplitude: (square_sum / sample_count as f64).sqrt(),
+        active_sample_ratio: active_sample_count as f64 / sample_count as f64,
+        stopped_by_request,
+    }
 }
 
 /// 构建类型化输入流，把多声道音频实时混合为单声道 i16。
