@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CodexMan",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "identifier": "asia.aijob.aitool",
   "build": {
     "beforeDevCommand": "npm run dev:frontend",
@@ -14,6 +14,7 @@
     "windows": [
       {
         "label": "main",
+        "url": "index.html?mode=main",
         "title": "CodexMan",
         "width": 132,
         "height": 46,
