@@ -8,6 +8,13 @@
   </head>
   <body>
     <div id="app"></div>
+    <script>
+      (() => {
+        const mode = new URLSearchParams(window.location.search).get('mode');
+        document.documentElement.dataset.windowMode =
+          mode === 'main' || mode === 'toast' || mode === 'result' ? mode : 'hub';
+      })();
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -88,6 +88,20 @@ body,
   margin: 0;
 }
 
+html[data-window-mode='main'],
+html[data-window-mode='main'] body,
+html[data-window-mode='main'] #app,
+html[data-window-mode='toast'],
+html[data-window-mode='toast'] body,
+html[data-window-mode='toast'] #app,
+html[data-window-mode='result'],
+html[data-window-mode='result'] body,
+html[data-window-mode='result'] #app {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
 body {
   overflow: hidden;
   background:

@@ -23,10 +23,10 @@
 
     const params = new URLSearchParams(window.location.search);
     const mode = params.get('mode');
+    const initialWindowMode: AppWindowModeType =
+        mode === 'main' || mode === 'toast' || mode === 'result' ? mode : 'hub';
+    document.documentElement.dataset.windowMode = initialWindowMode;
     const windowMode = computed<AppWindowModeType>(() => {
-        if (mode === 'main' || mode === 'toast' || mode === 'result') {
-            return mode;
-        }
-        return 'hub';
+        return initialWindowMode;
     });
 </script>
