@@ -1,5 +1,8 @@
 use std::fs;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -16,12 +19,15 @@ pub struct AppAudioRecord {
     pub duration_ms: u64,
 }
 
-/// 使用 CodexMan 主进程录制一段麦克风 WAV。
-/// 流程：打开系统默认输入设备，采集固定时长 PCM，混合为单声道 16-bit WAV 后返回内存字节。
-/// 参数：max_duration_ms 为单次最长录音时长。
+/// 使用 CodexMan 主进程录制一段可被外部停止的麦克风 WAV。
+/// 流程：打开系统默认输入设备，持续采集 PCM；达到最长时长或收到停止信号后，混合为单声道 16-bit WAV 返回。
+/// 参数：max_duration_ms 为单次最长录音时长，stop_requested 为快捷键停止信号。
 /// 返回：包含 WAV 字节、MIME 和实际时长的录音结果。
 /// 异常/边界：无输入设备、系统拒绝麦克风、采样流错误、空音频或临时文件写入失败都会显式返回错误。
-pub fn record_microphone_wav(max_duration_ms: u64) -> Result<AppAudioRecord, String> {
+pub fn record_microphone_wav(
+    max_duration_ms: u64,
+    stop_requested: Arc<AtomicBool>,
+) -> Result<AppAudioRecord, String> {
     if max_duration_ms == 0 || max_duration_ms > 120_000 {
         return Err("录音时长必须在 1 毫秒到 120 秒之间。".to_string());
     }
@@ -78,7 +84,15 @@ pub fn record_microphone_wav(max_duration_ms: u64) -> Result<AppAudioRecord, Str
             error
         )
     })?;
-    thread::sleep(Duration::from_millis(max_duration_ms));
+    let poll_interval = Duration::from_millis(30);
+    let max_duration = Duration::from_millis(max_duration_ms);
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < max_duration {
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+        thread::sleep(poll_interval);
+    }
     drop(stream);
 
     if let Some(error) = stream_error

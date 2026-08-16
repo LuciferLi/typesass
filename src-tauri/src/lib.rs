@@ -16,7 +16,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Mutex, Once};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex, Once,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -324,6 +327,8 @@ struct RuntimePublicApiToken {
 struct RuntimeAppVoiceRecorder {
     /// 是否已有一次录音、识别或粘贴流程正在运行。
     running: Mutex<bool>,
+    /// 当前录音阶段的停止信号；第二次快捷键会置位该标记。
+    stop_requested: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// 运行期间的语音快捷键短时间去重状态。
@@ -345,7 +350,20 @@ impl Drop for AppVoiceRunGuard {
         if let Ok(mut running) = state.running.lock() {
             *running = false;
         };
+        if let Ok(mut stop_requested) = state.stop_requested.lock() {
+            *stop_requested = None;
+        };
     }
+}
+
+/// 悬浮录音窗状态事件载荷。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FloatingVoiceStatePayload {
+    /// 当前展示阶段，用于前端切换旧静态页胶囊状态。
+    phase: String,
+    /// 面向用户的简短状态文案；悬浮窗主要用视觉表达，文案用于无障碍和 tooltip。
+    message: String,
 }
 
 /// 私有模型连通性测试 IPC 响应。
@@ -2201,8 +2219,10 @@ fn run_app_voice_polish_core(
     target_app: &str,
 ) -> Result<AppVoicePolishResponse, String> {
     let normalized_mode = normalize_app_voice_mode(mode)?;
-    let _guard = begin_app_voice_run(app)?;
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let _guard = begin_app_voice_run(app, Arc::clone(&stop_requested))?;
     let normalized_target_app = normalize_target_app_name(target_app);
+    emit_floating_voice_state(app, "preparing", "正在准备录音，出现录音状态后再开始说话。");
     emit_hub_notice(app, "正在录音，请稍后。", "running");
     ensure_microphone_access_for_voice()?;
 
@@ -2231,11 +2251,14 @@ fn run_app_voice_polish_core(
         persisted.text_model_id = selection.model_id.clone();
     }
 
-    let audio = app_audio::record_microphone_wav(APP_VOICE_RECORD_MAX_DURATION_MS)?;
+    emit_floating_voice_state(app, "recording", "正在录音，再按一次快捷键停止。");
+    let audio = app_audio::record_microphone_wav(APP_VOICE_RECORD_MAX_DURATION_MS, stop_requested)?;
+    clear_app_voice_recording_stop(app);
     if audio.bytes.len() > APP_VOICE_AUDIO_MAX_BYTES {
         return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
     }
 
+    emit_floating_voice_state(app, "transcribing", "正在转文字。");
     emit_hub_notice(app, "正在识别语音。", "running");
     let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio.bytes);
     let transcribed = request_public_api_json::<AppVoiceTranscribeResponse>(
@@ -2254,6 +2277,7 @@ fn run_app_voice_polish_core(
     }
 
     let output_text = if let Some(selection) = text_selection {
+        emit_floating_voice_state(app, "polishing", "正在整理文字。");
         emit_hub_notice(app, "正在润色文本。", "running");
         let dictionary = persisted
             .dictionary
@@ -2320,6 +2344,7 @@ fn run_app_voice_polish_core(
     } else {
         "语音润色已完成。"
     };
+    emit_floating_voice_state(app, "success", completed_message);
     emit_hub_notice(app, completed_message, "success");
 
     Ok(AppVoicePolishResponse {
@@ -2348,11 +2373,14 @@ fn normalize_app_voice_mode(mode: &str) -> Result<String, String> {
 }
 
 /// 开始一次 App 原生语音处理并获取并发门禁。
-/// 流程：检查运行态，空闲时置为运行中并返回 Drop guard。
-/// 参数：app 为 Tauri 句柄，用于读取运行状态。
+/// 流程：检查运行态，空闲时置为运行中并登记本次录音停止信号，最后返回 Drop guard。
+/// 参数：app 为 Tauri 句柄，用于读取运行状态；stop_requested 为本次录音停止标记。
 /// 返回：自动释放的运行门禁。
 /// 异常/边界：已有任务运行时拒绝新任务，避免同时抢占麦克风和粘贴目标。
-fn begin_app_voice_run(app: &tauri::AppHandle) -> Result<AppVoiceRunGuard, String> {
+fn begin_app_voice_run(
+    app: &tauri::AppHandle,
+    stop_requested: Arc<AtomicBool>,
+) -> Result<AppVoiceRunGuard, String> {
     let state = app.state::<RuntimeAppVoiceRecorder>();
     let mut running = state
         .running
@@ -2363,7 +2391,67 @@ fn begin_app_voice_run(app: &tauri::AppHandle) -> Result<AppVoiceRunGuard, Strin
     }
     *running = true;
     drop(running);
+    let mut stored_stop = state
+        .stop_requested
+        .lock()
+        .map_err(|_| "写入录音停止信号失败：状态锁已损坏".to_string())?;
+    *stored_stop = Some(stop_requested);
     Ok(AppVoiceRunGuard { app: app.clone() })
+}
+
+/// 请求停止当前 App 原生录音。
+/// 流程：读取运行期停止标记并置位；录音循环会在下一个短轮询周期结束采集并进入转写阶段。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：已发出停止信号时为 true，没有录音进行中时为 false。
+/// 异常/边界：状态锁损坏时按未停止处理，并让最长录音时长兜底。
+fn request_app_voice_recording_stop(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<RuntimeAppVoiceRecorder>();
+    let Ok(stop_requested) = state.stop_requested.lock() else {
+        return false;
+    };
+    let Some(flag) = stop_requested.as_ref() else {
+        return false;
+    };
+    !flag.swap(true, Ordering::AcqRel)
+}
+
+/// 清理当前录音停止信号。
+/// 流程：录音采样结束后移除停止标记，让后续 ASR/AI 处理阶段不会被误判为仍可停止。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：无。
+/// 异常/边界：锁损坏时忽略，Drop guard 仍会最终清理运行态。
+fn clear_app_voice_recording_stop(app: &tauri::AppHandle) {
+    let state = app.state::<RuntimeAppVoiceRecorder>();
+    if let Ok(mut stop_requested) = state.stop_requested.lock() {
+        *stop_requested = None;
+    };
+}
+
+/// 读取当前是否存在 App 原生语音流程。
+/// 流程：只读运行态门禁，供快捷键决定是开始还是停止录音。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：正在录音、识别、润色或粘贴时为 true。
+/// 异常/边界：状态锁损坏时按正在运行处理，避免重复启动多条录音链路。
+fn is_app_voice_running(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<RuntimeAppVoiceRecorder>();
+    state.running.lock().map(|running| *running).unwrap_or(true)
+}
+
+/// 向悬浮录音窗发送当前语音状态。
+/// 流程：只投递到 main 临时窗口；窗口未加载时忽略事件，由默认待机样式兜底。
+/// 参数：app 为 Tauri 句柄，phase 为阶段标识，message 为简短说明。
+/// 返回：无。
+/// 异常/边界：事件发送失败不阻断录音主链路，避免 UI 反馈问题影响语音输入。
+fn emit_floating_voice_state(app: &tauri::AppHandle, phase: &str, message: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit(
+            "floating-voice-state",
+            FloatingVoiceStatePayload {
+                phase: phase.to_string(),
+                message: message.to_string(),
+            },
+        );
+    }
 }
 
 /// 确保语音任务开始前已经获得麦克风权限。
@@ -3015,6 +3103,15 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
         emit_hub_event(app, "hub-start-mode", "polish".to_string());
         return;
     }
+    if is_app_voice_running(&app) {
+        if request_app_voice_recording_stop(&app) {
+            append_shortcut_diagnostic(&app, &format!("voice recording stop requested {}", mode));
+            emit_floating_voice_state(&app, "stopping", "正在停止录音并准备转文字。");
+        } else {
+            emit_floating_voice_state(&app, "processing", "上一段语音正在处理中，请稍候。");
+        }
+        return;
+    }
     let frontmost_app = get_frontmost_app().unwrap_or_default();
     let context = resolve_voice_trigger_context(&frontmost_app);
     let main_is_visible = is_window_visible(&app, "main");
@@ -3049,7 +3146,9 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
                 None,
                 &error,
             );
+            emit_floating_voice_state(&app, "error", &message);
             emit_hub_notice(&app, &message, "error");
+            thread::sleep(Duration::from_millis(900));
             if let Some(main) = app.get_webview_window("main") {
                 let _ = main.hide();
             }
