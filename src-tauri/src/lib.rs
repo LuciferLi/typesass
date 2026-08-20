@@ -4,6 +4,7 @@ mod app_audio;
 mod codex_cdp;
 mod codex_desktop;
 mod desktop_error;
+mod my_apps;
 mod private_models;
 mod private_rpc;
 mod realtime_asr;
@@ -33,6 +34,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, LogicalPosition, Manager, Position, State};
 
 use codex_desktop::{CodexConnectionStatus, CodexRestartAccepted, RuntimeCodexDesktop};
+use my_apps::RuntimeMyApps;
 use private_models::{PrivateModelRecord, PublicModelCatalogRecord, SavePrivateModelRequest};
 use private_rpc::RuntimePrivateRpc;
 use sidecar::RuntimeSidecar;
@@ -1695,6 +1697,7 @@ pub fn run() {
         .manage(RuntimeAppVoiceRecorder::default())
         .manage(RuntimeVoiceShortcutDebounce::default())
         .manage(RuntimeLocalConfigWatcher::default())
+        .manage(RuntimeMyApps::default())
         .manage(RuntimePrivateRpc::default())
         .manage(RuntimeSidecar::default())
         .manage(RuntimeWebServer::default())
@@ -1721,6 +1724,15 @@ pub fn run() {
                     &error,
                 ))
                 .into());
+            }
+            if let Err(error) = app.state::<RuntimeMyApps>().initialize(app.handle()) {
+                let _ = desktop_error::record_desktop_error(
+                    app.handle(),
+                    "MY_APPS_INITIALIZE_FAILED",
+                    "app_setup",
+                    None,
+                    &error,
+                );
             }
             let sidecar_app = app.handle().clone();
             thread::spawn(move || start_sidecar_in_background(sidecar_app));
@@ -1889,6 +1901,15 @@ pub fn run() {
                     let _ = desktop_error::record_desktop_error(
                         app,
                         "PRIVATE_RPC_SHUTDOWN_FAILED",
+                        "app_exit",
+                        None,
+                        &error,
+                    );
+                }
+                if let Err(error) = app.state::<RuntimeMyApps>().shutdown() {
+                    let _ = desktop_error::record_desktop_error(
+                        app,
+                        "MY_APPS_SHUTDOWN_FAILED",
                         "app_exit",
                         None,
                         &error,

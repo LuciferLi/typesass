@@ -11,6 +11,13 @@ import type {
     SavePrivateModelRequestModel,
     TestPrivateModelRequestModel
 } from '@/model/modelManage';
+import type {
+    CreateMyAppRequestModel,
+    MyAppModel,
+    MyAppOpenTargetType,
+    MyAppPortResponseModel,
+    UpdateMyAppRequestModel
+} from '@/model/myApp';
 import type { RuntimeDiagnosticsModel, ShortcutProfileModel } from '@/model/permission';
 import type {
     CodexThreadListRequestModel,
@@ -1112,6 +1119,111 @@ export async function queueSessionTask(taskId: string): Promise<SessionWorkspace
 export async function completeSessionTask(taskId: string): Promise<SessionWorkspaceDataModel> {
     return requestPublicApi<SessionWorkspaceDataModel>(`/v1/tasks/${encodeURIComponent(taskId)}/complete`, {
         method: 'POST'
+    });
+}
+
+/**
+ * 读取我的应用列表。
+ * 流程：通过公共 HTTP 服务请求 `/v1/my-apps`，由 Rust 返回配置、访问地址和服务状态。
+ * 参数：无。
+ * 返回：我的应用列表。
+ * 异常：HTTP、鉴权、私有桥接或配置读取失败时透传稳定错误码和 requestId。
+ */
+export async function listMyApps(): Promise<MyAppModel[]> {
+    return requestPublicApi<MyAppModel[]>('/v1/my-apps', { method: 'GET', timeoutMs: 5_000 });
+}
+
+/**
+ * 自动分配我的应用端口。
+ * 流程：通过 HTTP 请求 Rust 在固定端口段查找当前可绑定端口。
+ * 参数：无。
+ * 返回：当前检测可用端口。
+ * 异常：没有可用端口或 HTTP 服务不可用时透传错误。
+ */
+export async function allocateMyAppPort(): Promise<MyAppPortResponseModel> {
+    return requestPublicApi<MyAppPortResponseModel>('/v1/my-apps/allocate-port', {
+        method: 'POST',
+        timeoutMs: 5_000
+    });
+}
+
+/**
+ * 创建我的应用。
+ * 流程：只通过公共 HTTP 提交表单和可选 zip data URL，Rust 负责落盘、解压和服务启动。
+ * 参数：request 为新增应用配置。
+ * 返回：创建后的应用列表项。
+ * 异常：字段、zip、端口、URL 或本地服务启动失败时透传错误。
+ */
+export async function createMyApp(request: CreateMyAppRequestModel): Promise<MyAppModel> {
+    return requestPublicApi<MyAppModel>('/v1/my-apps', {
+        method: 'POST',
+        payload: request,
+        timeoutMs: 70_000
+    });
+}
+
+/**
+ * 修改我的应用。
+ * 流程：通过 HTTP 路径传应用 ID，正文传新配置；端口或 zip 变化由 Rust 原子处理。
+ * 参数：request 为编辑后的完整配置。
+ * 返回：更新后的应用列表项。
+ * 异常：应用不存在、端口冲突、zip 无效或服务启动失败时透传错误。
+ */
+export async function updateMyApp(request: UpdateMyAppRequestModel): Promise<MyAppModel> {
+    return requestPublicApi<MyAppModel>(`/v1/my-apps/${encodeURIComponent(request.id)}/update`, {
+        method: 'POST',
+        payload: {
+            name: request.name,
+            logoDataUrl: request.logoDataUrl,
+            accessType: request.accessType,
+            port: request.port,
+            remoteUrl: request.remoteUrl,
+            zipDataUrl: request.zipDataUrl
+        },
+        timeoutMs: 70_000
+    });
+}
+
+/**
+ * 删除我的应用。
+ * 流程：通过 HTTP 请求 Rust 停止受管服务、删除记录和本地站点目录。
+ * 参数：appId 为待删除应用 ID。
+ * 返回：删除完成 Promise。
+ * 异常：应用不存在、服务停止或文件删除失败时透传错误。
+ */
+export async function deleteMyApp(appId: string): Promise<void> {
+    await requestPublicApi<{ ok: true }>(`/v1/my-apps/${encodeURIComponent(appId)}/delete`, {
+        method: 'POST',
+        timeoutMs: 20_000
+    });
+}
+
+/**
+ * 启动或重启我的应用本地服务。
+ * 流程：通过 HTTP 请求 Rust 停止当前受管线程并按固定端口重新启动。
+ * 参数：appId 为本地托管应用 ID。
+ * 返回：最新应用列表项。
+ * 异常：远程 URL、站点目录缺失或端口被占用时透传错误。
+ */
+export async function restartMyApp(appId: string): Promise<MyAppModel> {
+    return requestPublicApi<MyAppModel>(`/v1/my-apps/${encodeURIComponent(appId)}/start`, {
+        method: 'POST',
+        timeoutMs: 20_000
+    });
+}
+
+/**
+ * 打开我的应用。
+ * 流程：通过 HTTP 请求 Rust 使用 CodexMan 新窗口或默认浏览器打开；本地应用先确保服务已启动。
+ * 参数：appId 为应用 ID，target 为打开目标。
+ * 返回：打开完成 Promise。
+ * 异常：服务启动失败或 URL 无效时透传错误。
+ */
+export async function openMyApp(appId: string, target: MyAppOpenTargetType): Promise<void> {
+    await requestPublicApi<{ ok: true }>(`/v1/my-apps/${encodeURIComponent(appId)}/open`, {
+        method: 'POST',
+        payload: { target },
+        timeoutMs: 20_000
     });
 }
 

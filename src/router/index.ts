@@ -14,6 +14,7 @@ export const HubRouteName = {
     TaskManage: 'TaskManage',
     Permission: 'Permission',
     ModelManage: 'ModelManage',
+    MyApp: 'MyApp',
     HttpApiDoc: 'HttpApiDoc',
     Settings: 'Settings'
 } as const;
@@ -74,6 +75,12 @@ const hubRoutes: RouteRecordRaw[] = [
         name: HubRouteName.ModelManage,
         component: () => import('@/views/modelManage/index.vue'),
         meta: { title: '模型管理' }
+    },
+    {
+        path: '/my-app',
+        name: HubRouteName.MyApp,
+        component: () => import('@/views/myApp/index.vue'),
+        meta: { title: '我的应用' }
     },
     {
         path: '/http-api-doc',

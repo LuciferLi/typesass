@@ -309,6 +309,7 @@
 
 <script setup lang="ts">
     import {
+        ApplicationMenu,
         Keyboard,
         KeyboardOne,
         LinkBreak,
@@ -389,7 +390,8 @@
         { routeName: HubRouteName.SessionManage, label: '会话管理', icon: Terminal },
         { routeName: HubRouteName.TaskManage, label: '任务管理', icon: List },
         { routeName: HubRouteName.Permission, label: '权限管理', icon: Permissions },
-        { routeName: HubRouteName.ModelManage, label: '模型管理', icon: KeyboardOne }
+        { routeName: HubRouteName.ModelManage, label: '模型管理', icon: KeyboardOne },
+        { routeName: HubRouteName.MyApp, label: '我的应用', icon: ApplicationMenu }
     ] as const;
 
     const showClientBridgeOverlay = computed(() => {

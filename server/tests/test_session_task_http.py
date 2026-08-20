@@ -82,6 +82,28 @@ class FakePrivateRpcClient:
             return [{"id": "thread-1", "title": "会话", "updatedAt": "1786406400000"}]
         if method == "openCodexThread":
             return None
+        if method == "listMyApps":
+            return []
+        if method == "allocateMyAppPort":
+            return {"port": 18123}
+        if method in {"createMyApp", "updateMyApp", "restartMyApp"}:
+            return {
+                "id": "app-1",
+                "name": "应用",
+                "logoDataUrl": "",
+                "accessType": "local",
+                "port": 18123,
+                "remoteUrl": None,
+                "localUrl": "http://127.0.0.1:18123",
+                "lanUrl": "http://192.168.1.2:18123",
+                "openUrl": "http://127.0.0.1:18123",
+                "serviceStatus": "running",
+                "serviceMessage": "服务已启动。",
+                "createdAt": "2026-08-20T00:00:00Z",
+                "updatedAt": "2026-08-20T00:00:00Z",
+            }
+        if method in {"deleteMyApp", "openMyApp"}:
+            return {"ok": True}
         if method == "createTask":
             return {"createdTaskId": "task-created-1", **EMPTY_WORKSPACE}
         return EMPTY_WORKSPACE
@@ -137,6 +159,7 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
             await client.get("/v1/codex/connection"),
             await client.post("/v1/codex/connection/restart"),
             await client.get("/v1/codex/workspaces"),
+            await client.get("/v1/my-apps"),
         ]
         for unauthorized in unauthorized_responses:
             assert_error(unauthorized, 401, "ORIGIN_REQUIRED")
@@ -178,6 +201,21 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
             ("POST", "/v1/tasks/task-1/delete", None),
             ("POST", "/v1/tasks/task-1/queue", None),
             ("POST", "/v1/tasks/task-1/complete", None),
+            ("GET", "/v1/my-apps", None),
+            ("POST", "/v1/my-apps/allocate-port", None),
+            (
+                "POST",
+                "/v1/my-apps",
+                {"name": "应用", "logoDataUrl": "", "accessType": "remote", "remoteUrl": "https://example.com"},
+            ),
+            (
+                "POST",
+                "/v1/my-apps/app-1/update",
+                {"name": "应用", "logoDataUrl": "", "accessType": "remote", "remoteUrl": "https://example.com"},
+            ),
+            ("POST", "/v1/my-apps/app-1/delete", None),
+            ("POST", "/v1/my-apps/app-1/start", None),
+            ("POST", "/v1/my-apps/app-1/open", {"target": "codexman"}),
         ]
         responses = []
         for method, path, payload in requests:
@@ -187,7 +225,7 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
     assert [response.status_code for response in responses] == [
         200,
         202,
-        *([200] * 12),
+        *([200] * 19),
     ]
     assert [call[0] for call in fake.calls] == [
         "getCodexConnection",
@@ -204,6 +242,13 @@ async def test_tc_session_http_001_all_routes_require_bearer_and_map_rpc(
         "deleteTask",
         "queueTask",
         "completeTask",
+        "listMyApps",
+        "allocateMyAppPort",
+        "createMyApp",
+        "updateMyApp",
+        "deleteMyApp",
+        "restartMyApp",
+        "openMyApp",
     ]
     assert all(call[1] == "session-http-001" for call in fake.calls)
     assert fake.calls[3][2] == {
@@ -403,6 +448,39 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
         ("/v1/tasks/{taskId}/delete", "post"): ("TASK_DELETE_FAILED", None, None),
         ("/v1/tasks/{taskId}/queue", "post"): ("TASK_QUEUE_FAILED", None, None),
         ("/v1/tasks/{taskId}/complete", "post"): ("TASK_ACCEPTANCE_FAILED", None, None),
+        ("/v1/my-apps", "get"): (
+            "MY_APP_LIST_FAILED",
+            None,
+            {
+                "id",
+                "name",
+                "logoDataUrl",
+                "accessType",
+                "port",
+                "remoteUrl",
+                "localUrl",
+                "lanUrl",
+                "openUrl",
+                "serviceStatus",
+                "serviceMessage",
+                "createdAt",
+                "updatedAt",
+            },
+        ),
+        ("/v1/my-apps/allocate-port", "post"): ("MY_APP_PORT_ALLOCATE_FAILED", None, {"port"}),
+        ("/v1/my-apps", "post"): (
+            "MY_APP_CREATE_FAILED",
+            {"name", "logoDataUrl", "accessType", "port", "remoteUrl", "zipDataUrl"},
+            None,
+        ),
+        ("/v1/my-apps/{appId}/update", "post"): (
+            "MY_APP_UPDATE_FAILED",
+            {"name", "logoDataUrl", "accessType", "port", "remoteUrl", "zipDataUrl"},
+            None,
+        ),
+        ("/v1/my-apps/{appId}/delete", "post"): ("MY_APP_NOT_FOUND", None, {"ok"}),
+        ("/v1/my-apps/{appId}/start", "post"): ("MY_APP_RESTART_FAILED", None, None),
+        ("/v1/my-apps/{appId}/open", "post"): ("MY_APP_OPEN_FAILED", {"target"}, {"ok"}),
     }
     forbidden_generic_codes = {
         "INVALID_REQUEST",
@@ -455,6 +533,21 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
         "createdAt",
         "updatedAt",
     }
+    my_app_item_fields = {
+        "id",
+        "name",
+        "logoDataUrl",
+        "accessType",
+        "port",
+        "remoteUrl",
+        "localUrl",
+        "lanUrl",
+        "openUrl",
+        "serviceStatus",
+        "serviceMessage",
+        "createdAt",
+        "updatedAt",
+    }
 
     for (path, method), (
         endpoint_code,
@@ -484,31 +577,34 @@ async def test_tc_session_http_003_route_specific_errors_and_examples() -> None:
             if path.endswith("/open") or path in {
                 "/v1/codex/connection",
                 "/v1/codex/connection/restart",
+                "/v1/my-apps/allocate-port",
+                "/v1/my-apps/{appId}/delete",
             }:
                 assert set(success_example) == list_item_fields
             else:
                 assert success_example and set(success_example[0]) == list_item_fields
-        else:
-            expected_root_fields = {"projects", "tasks", "sessions"}
-            if path == "/v1/tasks":
-                expected_root_fields.add("createdTaskId")
-                assert (
-                    success_example["createdTaskId"]
-                    == success_example["tasks"][0]["id"]
-                )
-            assert set(success_example) == expected_root_fields
-            assert (
-                success_example["projects"]
-                and set(success_example["projects"][0]) == workspace_item_fields
-            )
-            assert (
-                success_example["tasks"]
-                and set(success_example["tasks"][0]) == task_item_fields
-            )
-            assert (
-                success_example["sessions"]
-                and set(success_example["sessions"][0]) == session_item_fields
-            )
+            continue
+        if (path, method) in {
+            ("/v1/my-apps", "post"),
+            ("/v1/my-apps/{appId}/update", "post"),
+            ("/v1/my-apps/{appId}/start", "post"),
+        }:
+            assert set(success_example) == my_app_item_fields
+            continue
+        if path == "/v1/my-apps/allocate-port":
+            assert set(success_example) == {"port"}
+            continue
+        if path in {"/v1/my-apps/{appId}/delete", "/v1/my-apps/{appId}/open"}:
+            assert set(success_example) == {"ok"}
+            continue
+        expected_root_fields = {"projects", "tasks", "sessions"}
+        if path == "/v1/tasks":
+            expected_root_fields.add("createdTaskId")
+            assert success_example["createdTaskId"] == success_example["tasks"][0]["id"]
+        assert set(success_example) == expected_root_fields
+        assert success_example["projects"] and set(success_example["projects"][0]) == workspace_item_fields
+        assert success_example["tasks"] and set(success_example["tasks"][0]) == task_item_fields
+        assert success_example["sessions"] and set(success_example["sessions"][0]) == session_item_fields
 
     public_contract = json.dumps(
         [schema["paths"][path][method] for path, method in route_contracts],

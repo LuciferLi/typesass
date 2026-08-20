@@ -611,6 +611,110 @@ class OperationResponse(BaseModel):
     )
 
 
+class MyAppCreateRequest(StrictRequestModel):
+    """创建我的应用请求。
+
+    流程：HTTP 严格校验展示字段和访问方式后原样转交 Rust；本地托管 zip 由 Rust 解码、解压和启动服务。
+    边界：本地托管必须传端口和 zipDataUrl；远程 URL 只允许 http/https，不接收本地文件路径。
+    """
+
+    name: StrictText = Field(
+        max_length=80,
+        description="应用名称，去除首尾空白后不可为空，最多 80 个 Unicode 字符。",
+        examples=["数据看板"],
+    )
+    logo_data_url: str = Field(
+        default="",
+        alias="logoDataUrl",
+        max_length=400_000,
+        description="可选 logo data URL；支持 png、jpeg、webp、svg，前端为空时展示默认图标。",
+        examples=["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."],
+    )
+    access_type: Literal["local", "remote"] = Field(
+        alias="accessType",
+        description="访问方式：local 为本地静态资源托管，remote 为远程 URL。",
+        examples=["local"],
+    )
+    port: Optional[int] = Field(
+        default=None,
+        ge=1024,
+        le=65535,
+        description="本地托管服务端口；remote 类型不需要传。",
+        examples=[18123],
+    )
+    remote_url: Optional[str] = Field(
+        default=None,
+        alias="remoteUrl",
+        max_length=4096,
+        description="远程 URL；仅 remote 类型使用，必须是 http 或 https。",
+        examples=["https://example.com/dashboard"],
+    )
+    zip_data_url: Optional[str] = Field(
+        default=None,
+        alias="zipDataUrl",
+        max_length=12_000_000,
+        description="本地托管静态页面 zip 的 data URL；受公开 HTTP 12 MiB body 上限约束。",
+        examples=["data:application/zip;base64,UEsDBBQAAAA..."],
+    )
+
+
+class MyAppUpdateRequest(MyAppCreateRequest):
+    """更新我的应用请求。
+
+    流程：路径 appId 指定被修改应用；正文覆盖名称、logo、类型、端口或 URL；zipDataUrl 为空时复用既有本地站点目录。
+    边界：从远程 URL 改为本地托管且没有历史站点目录时必须重新上传 zipDataUrl。
+    """
+
+
+class MyAppOpenRequest(StrictRequestModel):
+    """打开我的应用请求。
+
+    流程：HTTP 校验打开目标后交给 Rust；本地应用会先确保静态服务已启动。
+    边界：codexman 表示新建或复用 App 内普通窗口，browser 表示系统默认浏览器。
+    """
+
+    target: Literal["codexman", "browser"] = Field(
+        description="打开目标：codexman 使用 CodexMan 新窗口，browser 使用系统默认浏览器。",
+        examples=["codexman"],
+    )
+
+
+class MyAppPortResponse(BaseModel):
+    """我的应用自动端口响应。
+
+    流程：Rust 避开已配置应用端口并尝试绑定本机端口后返回当前可用值。
+    边界：该端口不会被 HTTP 层预占用，保存时仍可能因外部进程抢占而启动失败。
+    """
+
+    port: int = Field(ge=1024, le=65535, description="当前检测可用的端口。", examples=[18123])
+
+
+class MyAppResponse(BaseModel):
+    """我的应用列表项响应。
+
+    流程：Rust 合并持久化配置、运行时服务状态、本地访问地址和局域网访问地址后返回。
+    边界：远程 URL 应用没有本地服务，serviceStatus 固定表达为 unavailable。
+    """
+
+    id: str = Field(description="应用稳定 ID。", examples=["app_01J00000000000000000000000"])
+    name: str = Field(description="应用名称。", examples=["数据看板"])
+    logo_data_url: str = Field(alias="logoDataUrl", description="logo data URL；可能为空。")
+    access_type: Literal["local", "remote"] = Field(alias="accessType", description="访问方式。")
+    port: Optional[int] = Field(default=None, description="本地托管端口。", examples=[18123])
+    remote_url: Optional[str] = Field(default=None, alias="remoteUrl", description="远程 URL。")
+    local_url: str = Field(alias="localUrl", description="本机访问地址；远程 URL 应用为空。")
+    lan_url: str = Field(alias="lanUrl", description="局域网访问地址；远程 URL 应用为空。")
+    open_url: str = Field(alias="openUrl", description="默认打开地址。")
+    service_status: Literal["starting", "running", "paused", "failed", "unavailable"] = Field(
+        alias="serviceStatus",
+        description="本地服务状态；远程 URL 应用为 unavailable。",
+        examples=["running"],
+    )
+    service_message: str = Field(alias="serviceMessage", description="服务状态说明或最近错误。")
+    created_at: str = Field(alias="createdAt", description="创建时间。")
+    updated_at: str = Field(alias="updatedAt", description="更新时间。")
+
+
 class AudioTranscriptionRequest(StrictRequestModel):
     """音频转写请求。
 

@@ -13,7 +13,7 @@ from typing import Dict, Optional
 from .errors import ApiError
 
 
-PRIVATE_RPC_REQUEST_MAX_BYTES = 1024 * 1024
+PRIVATE_RPC_REQUEST_MAX_BYTES = 12 * 1024 * 1024
 PRIVATE_RPC_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 PRIVATE_RPC_TIMEOUT_SECONDS = 70.0
 _PRIVATE_RPC_BOOTSTRAP: Optional[object] = None
@@ -295,6 +295,8 @@ class PrivateRpcClient:
             "TASK_PROMPT_TOO_LONG",
             "TASK_TITLE_REQUIRED",
             "TASK_TITLE_TOO_LONG",
+            "MY_APP_CREATE_FAILED",
+            "MY_APP_UPDATE_FAILED",
         } or code.startswith("INVALID_"):
             status_code = 400
         elif code.endswith("_NOT_FOUND"):

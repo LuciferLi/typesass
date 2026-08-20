@@ -41,6 +41,11 @@ from .models import (
     CodexThreadResponse,
     CodexThreadSearchRequest,
     CodexWorkspaceResponse,
+    MyAppCreateRequest,
+    MyAppOpenRequest,
+    MyAppPortResponse,
+    MyAppResponse,
+    MyAppUpdateRequest,
     OperationResponse,
     ProjectWriteRequest,
     SafeBusinessId,
@@ -1840,6 +1845,127 @@ TASK_COMPLETE_ERROR_CODES = {
     ],
     **TASK_AGGREGATE_INVARIANT_ERROR_CODES,
 }
+MY_APP_COMMON_ERROR_CODES = {
+    "409": [
+        {
+            "code": "MY_APP_OPERATION_FAILED",
+            "retryable": False,
+            "action": "刷新我的应用列表并检查端口、zip 包或 URL；禁止结束非 CodexMan 持有的系统进程。",
+        }
+    ],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "按请求 schema 修正名称、端口、URL、zipDataUrl、打开目标或额外字段。",
+        }
+    ],
+}
+MY_APP_LIST_ERROR_CODES = {
+    "500": [
+        {
+            "code": "MY_APP_LIST_FAILED",
+            "retryable": False,
+            "action": "携带 requestId 检查桌面日志和我的应用配置文件，禁止把读取失败当作空列表。",
+        }
+    ]
+}
+MY_APP_PORT_ERROR_CODES = {
+    "409": [
+        {
+            "code": "MY_APP_PORT_ALLOCATE_FAILED",
+            "retryable": False,
+            "action": "当前端口段没有可用端口；让用户手动填写并在保存时再次校验。",
+        }
+    ]
+}
+MY_APP_CREATE_ERROR_CODES = {
+    "400": [
+        {
+            "code": "MY_APP_CREATE_FAILED",
+            "retryable": False,
+            "action": "检查名称、端口、远程 URL 或静态站点 zip；本地托管必须包含 index.html。",
+        }
+    ],
+    **MY_APP_COMMON_ERROR_CODES,
+}
+MY_APP_UPDATE_ERROR_CODES = {
+    "400": [
+        {
+            "code": "MY_APP_UPDATE_FAILED",
+            "retryable": False,
+            "action": "检查名称、端口、远程 URL 或 zip；端口变化只会重启 CodexMan 当前持有的服务。",
+        }
+    ],
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    **MY_APP_COMMON_ERROR_CODES,
+}
+MY_APP_DELETE_ERROR_CODES = {
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    **MY_APP_COMMON_ERROR_CODES,
+}
+MY_APP_RESTART_ERROR_CODES = {
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    "409": [
+        {
+            "code": "MY_APP_RESTART_FAILED",
+            "retryable": False,
+            "action": "端口被占用、站点目录缺失或 zip 内容无效；不要结束未知进程，修改端口或重新上传后再启动。",
+        }
+    ],
+    "422": MY_APP_COMMON_ERROR_CODES["422"],
+}
+MY_APP_OPEN_ERROR_CODES = {
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    "409": [
+        {
+            "code": "MY_APP_OPEN_FAILED",
+            "retryable": False,
+            "action": "本地服务启动失败或目标 URL 无效；修复后由用户重新打开。",
+        }
+    ],
+    "422": MY_APP_COMMON_ERROR_CODES["422"],
+}
+
+MY_APP_EXAMPLE = {
+    "id": "app_01J00000000000000000000000",
+    "name": "数据看板",
+    "logoDataUrl": "",
+    "accessType": "local",
+    "port": 18123,
+    "remoteUrl": "",
+    "localUrl": "http://127.0.0.1:18123",
+    "lanUrl": "http://192.168.1.23:18123",
+    "openUrl": "http://127.0.0.1:18123",
+    "serviceStatus": "running",
+    "serviceMessage": "服务已启动。",
+    "createdAt": "2026-08-20T00:00:00Z",
+    "updatedAt": "2026-08-20T00:00:00Z",
+}
 
 
 def _private_route_error_codes(
@@ -1928,6 +2054,221 @@ async def _call_private(
 
     client: PrivateRpcClient = request.app.state.private_rpc
     return await client.call(method, _request_id(request), params)
+
+
+@app.get(
+    "/v1/my-apps",
+    response_model=List[MyAppResponse],
+    responses=private_route_responses([MY_APP_EXAMPLE], MY_APP_LIST_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="读取我的应用列表",
+    description=(
+        "读取本机保存的本地托管和远程 URL 应用，并返回静态服务状态、本机地址和局域网地址。"
+        "HTTP 层不读取站点目录、不启动端口服务，所有运行时状态均来自桌面业务核心。"
+    ),
+    openapi_extra=private_route_openapi(MY_APP_LIST_ERROR_CODES),
+)
+async def list_my_apps(request: Request) -> object:
+    """读取我的应用列表。
+
+    流程：Bearer 依赖先完成鉴权，再以空参数调用 Rust ``listMyApps``。
+    参数：``request`` 提供 requestId 和私有 RPC 客户端。
+    返回：我的应用列表；无应用时为空数组。
+    异常边界：读取配置失败返回统一错误，不伪装为空列表。
+    """
+
+    return await _call_private(request, "listMyApps", {})
+
+
+@app.post(
+    "/v1/my-apps/allocate-port",
+    response_model=MyAppPortResponse,
+    responses=private_route_responses({"port": 18123}, MY_APP_PORT_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="自动分配我的应用本地端口",
+    description="请求桌面业务核心在固定端口段内寻找当前可绑定端口；返回值不预占端口，保存时仍会再次校验。",
+    openapi_extra=private_route_openapi(MY_APP_PORT_ERROR_CODES),
+)
+async def allocate_my_app_port(request: Request) -> object:
+    """自动分配可用端口。
+
+    流程：调用 Rust ``allocateMyAppPort``，由 Rust 避开已配置端口并尝试绑定检测。
+    参数：``request`` 提供 requestId 和私有 RPC 客户端。
+    返回：当前检测可用端口。
+    异常边界：HTTP 不自行扫描端口，也不保留端口占用。
+    """
+
+    return await _call_private(request, "allocateMyAppPort", {})
+
+
+@app.post(
+    "/v1/my-apps",
+    response_model=MyAppResponse,
+    responses=private_route_responses(MY_APP_EXAMPLE, MY_APP_CREATE_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="创建我的应用",
+    description=(
+        "创建本地托管或远程 URL 应用。本地托管需要 zipDataUrl 和端口，Rust 会安全解压到 App 数据目录，"
+        "随后绑定 0.0.0.0:<port> 以允许局域网访问。"
+    ),
+    openapi_extra=private_route_openapi(
+        MY_APP_CREATE_ERROR_CODES,
+        {
+            "name": "数据看板",
+            "logoDataUrl": "",
+            "accessType": "local",
+            "port": 18123,
+            "remoteUrl": "",
+            "zipDataUrl": "data:application/zip;base64,UEsDBBQAAAA...",
+        },
+    ),
+)
+async def create_my_app(request: Request, payload: MyAppCreateRequest) -> object:
+    """创建我的应用。
+
+    流程：Pydantic 严格校验请求体后调用 Rust ``createMyApp``；Rust 负责 zip 解压、持久化和本地服务启动。
+    参数：``request`` 提供 RPC 上下文；``payload`` 为应用配置和可选 zip。
+    返回：创建后的应用列表项。
+    异常边界：HTTP 不保存 zip、不触碰文件系统，也不启动端口服务。
+    """
+
+    return await _call_private(request, "createMyApp", payload.model_dump(by_alias=True))
+
+
+@app.post(
+    "/v1/my-apps/{appId}/update",
+    response_model=MyAppResponse,
+    responses=private_route_responses(MY_APP_EXAMPLE, MY_APP_UPDATE_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="修改我的应用",
+    description=(
+        "修改名称、logo、访问方式、端口或远程 URL。端口变化时 Rust 只停止 CodexMan 当前持有的旧服务并重启新端口；"
+        "zipDataUrl 为空时复用现有站点目录。"
+    ),
+    openapi_extra=private_route_openapi(
+        MY_APP_UPDATE_ERROR_CODES,
+        {
+            "name": "数据看板 v2",
+            "logoDataUrl": "",
+            "accessType": "local",
+            "port": 18124,
+            "remoteUrl": "",
+            "zipDataUrl": "",
+        },
+    ),
+)
+async def update_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待修改应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+    payload: MyAppUpdateRequest,
+) -> object:
+    """修改我的应用。
+
+    流程：把路径 appId 与严格正文合并后调用 Rust ``updateMyApp``。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID；``payload`` 为新配置。
+    返回：更新后的应用列表项。
+    异常边界：HTTP 不杀端口进程；Rust 只管理当前 App 持有的静态服务线程。
+    """
+
+    params = payload.model_dump(by_alias=True, exclude_none=True)
+    params["id"] = app_id
+    return await _call_private(request, "updateMyApp", params)
+
+
+@app.post(
+    "/v1/my-apps/{appId}/delete",
+    response_model=OperationResponse,
+    responses=private_route_responses({"ok": True}, MY_APP_DELETE_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="删除我的应用",
+    description="删除应用记录；本地托管应用会停止 CodexMan 受管静态服务并删除解压目录，不会结束未知系统进程。",
+    openapi_extra=private_route_openapi(MY_APP_DELETE_ERROR_CODES),
+)
+async def delete_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待删除应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+) -> OperationResponse:
+    """删除我的应用。
+
+    流程：校验 appId 后调用 Rust ``deleteMyApp``，由 Rust 停止受管服务、删除配置和站点目录。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID。
+    返回：固定成功对象。
+    异常边界：HTTP 不直接删除文件，也不结束任何端口进程。
+    """
+
+    await _call_private(request, "deleteMyApp", {"appId": app_id})
+    return OperationResponse()
+
+
+@app.post(
+    "/v1/my-apps/{appId}/start",
+    response_model=MyAppResponse,
+    responses=private_route_responses(MY_APP_EXAMPLE, MY_APP_RESTART_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="启动或重启我的应用本地服务",
+    description="仅本地托管应用可调用；Rust 停止当前 App 持有的旧服务后重新绑定记录中的固定端口。",
+    openapi_extra=private_route_openapi(MY_APP_RESTART_ERROR_CODES),
+)
+async def restart_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待启动或重启应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+) -> object:
+    """启动或重启我的应用本地服务。
+
+    流程：校验 appId 后调用 Rust ``restartMyApp``，由 Rust 停止受管线程并重新启动静态 HTTP 服务。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID。
+    返回：最新应用列表项和服务状态。
+    异常边界：远程 URL 应用没有本地服务，端口被其它进程占用时返回失败而不杀未知进程。
+    """
+
+    return await _call_private(request, "restartMyApp", {"appId": app_id})
+
+
+@app.post(
+    "/v1/my-apps/{appId}/open",
+    response_model=OperationResponse,
+    responses=private_route_responses({"ok": True}, MY_APP_OPEN_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="打开我的应用",
+    description="按 target 使用 CodexMan 新窗口或默认浏览器打开；本地托管应用会先确保静态服务启动成功。",
+    openapi_extra=private_route_openapi(MY_APP_OPEN_ERROR_CODES, {"target": "codexman"}),
+)
+async def open_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待打开应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+    payload: MyAppOpenRequest,
+) -> OperationResponse:
+    """打开我的应用。
+
+    流程：校验 appId 和打开目标后调用 Rust ``openMyApp``，本地应用由 Rust 先启动静态服务。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID；``payload`` 为打开目标。
+    返回：固定成功对象。
+    异常边界：服务启动失败或 URL 无效时不打开空窗口。
+    """
+
+    params = payload.model_dump(by_alias=True)
+    params["appId"] = app_id
+    await _call_private(request, "openMyApp", params)
+    return OperationResponse()
 
 
 @app.get(

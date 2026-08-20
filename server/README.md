@@ -15,6 +15,13 @@
 - `GET /v1/codex/workspaces`
 - `POST /v1/codex/threads/search`
 - `POST /v1/codex/threads/{threadId}/open`
+- `GET /v1/my-apps`
+- `POST /v1/my-apps/allocate-port`
+- `POST /v1/my-apps`
+- `POST /v1/my-apps/{appId}/update`
+- `POST /v1/my-apps/{appId}/delete`
+- `POST /v1/my-apps/{appId}/start`
+- `POST /v1/my-apps/{appId}/open`
 - `POST /v1/task-workspace/query`
 - `POST /v1/projects`
 - `POST /v1/projects/{projectId}/update`
@@ -34,6 +41,13 @@ HTTP 服务不按浏览器 `Origin` 做 CORS 拦截，CORS 预检允许任意来
 3. 业务接口必须带 `Origin`。`localhost`、`127.0.0.1`、`::1`、私有网段 IP 和 `tauri.localhost` 视为内网来源，可免授权码；其它公网 IP 或域名必须携带 `Authorization: Bearer <App 授权码>`。
 4. 授权码不做 scope、refresh token、短期 session token 或 Basic 换 token。撤销或过期后再次访问业务接口统一返回 `401 UNAUTHORIZED`。
 5. 开发环境可启用固定授权码，使用 `AITOOL_ENABLE_DEV_BEARER_TOKEN=1` 和 `AITOOL_DEV_ACCESS_TOKEN=<至少 32 字符>`；该固定授权码不写入授权码列表，生产环境不得启用。
+
+以下示例默认已设置：
+
+```bash
+BASE_URL='http://127.0.0.1:18080'
+TOKEN='<APP_ACCESS_TOKEN>'
+```
 
 示例：
 
@@ -89,6 +103,58 @@ uvicorn app.main:app --host 127.0.0.1 --port 18080 --workers 1
 ```
 
 直接 Uvicorn 启动不具备桌面 App 注入的运行配置，因此模型目录为空、健康检查和鉴权可用，会话/任务接口返回 `503 PRIVATE_SERVICE_UNAVAILABLE`。生产桌面模式必须由 App 启动 sidecar；第三方只使用公开 HTTP 地址和 App 授权码，不需要也不能配置内部业务桥接。
+
+## 我的应用 HTTP 流程
+
+我的应用管理也必须调用公共 HTTP 路由。FastAPI 只负责 Origin 与授权码鉴权、严格 DTO、requestId、CORS、统一错误 envelope 和 OpenAPI；本地 zip 解码、解压目录、配置持久化、端口绑定、服务启停、删除清理和窗口打开全部由桌面 Rust 业务核心执行。第三方不得绕过 HTTP 入口直接写 App 数据目录，也不得自行结束端口进程。
+
+本地托管应用使用用户指定端口绑定 `0.0.0.0:<port>`，因此同局域网电脑可通过 `lanUrl` 访问。创建或修改端口时只会停止 CodexMan 当前持有的静态服务线程，不会 kill 未知进程；如果端口被其它程序占用，接口返回失败并在列表中展示 `failed`。App 启动进入主界面时会自动启动已保存的本地托管服务。
+
+zip 上传通过 JSON 字段 `zipDataUrl` 传递，受公开 HTTP body 12 MiB 和私有 RPC 12 MiB 上限约束。zip 根目录或第一层唯一目录必须包含 `index.html`；服务会安全解压到 App data 的隔离目录，并对静态请求做路径穿越防护和 SPA `index.html` 回退。远程 URL 应用只保存 `remoteUrl`，没有本地服务，也没有启动或重启动作。
+
+示例：
+
+```bash
+curl -X POST "$BASE_URL/v1/my-apps/allocate-port" \
+  -H 'Origin: http://127.0.0.1:1420' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'X-Request-ID: my-app-port-001'
+```
+
+创建远程 URL 应用：
+
+```bash
+curl -X POST "$BASE_URL/v1/my-apps" \
+  -H 'Origin: http://127.0.0.1:1420' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Request-ID: my-app-create-remote-001' \
+  -d '{"name":"远程看板","logoDataUrl":"","accessType":"remote","remoteUrl":"https://example.com/dashboard"}'
+```
+
+创建本地托管应用时，客户端先把 zip 文件读取为 `data:application/zip;base64,...`：
+
+```bash
+curl -X POST "$BASE_URL/v1/my-apps" \
+  -H 'Origin: http://127.0.0.1:1420' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Request-ID: my-app-create-local-001' \
+  -d '{"name":"本地看板","logoDataUrl":"","accessType":"local","port":18123,"zipDataUrl":"data:application/zip;base64,UEsDBBQAAAA..."}'
+```
+
+列表响应会包含 `localUrl`、`lanUrl`、`openUrl`、`serviceStatus` 和 `serviceMessage`。`serviceStatus` 固定为 `starting`、`running`、`paused`、`failed` 或 `unavailable`；远程 URL 应用为 `unavailable`。打开应用时传 `target=codexman` 或 `target=browser`：
+
+```bash
+curl -X POST "$BASE_URL/v1/my-apps/app_01J00000000000000000000000/open" \
+  -H 'Origin: http://127.0.0.1:1420' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Request-ID: my-app-open-001' \
+  -d '{"target":"codexman"}'
+```
+
+删除本地托管应用会停止受管服务并删除解压目录；删除远程 URL 应用只删除配置记录。调用方遇到 `MY_APP_CREATE_FAILED`、`MY_APP_UPDATE_FAILED`、`MY_APP_RESTART_FAILED` 或 `MY_APP_OPEN_FAILED` 时，应展示错误和 requestId，让用户修改端口、重新上传 zip 或修正 URL，禁止自动结束未知端口进程。
 
 ## 会话与任务 HTTP 流程
 
