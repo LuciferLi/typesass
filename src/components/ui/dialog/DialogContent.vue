@@ -1,0 +1,50 @@
+<script setup lang="ts">
+    import { reactiveOmit } from '@vueuse/core';
+    import { X } from 'lucide-vue-next';
+    import type { DialogContentEmits, DialogContentProps } from 'reka-ui';
+    import { DialogClose, DialogContent, DialogOverlay, DialogPortal, useForwardPropsEmits } from 'reka-ui';
+    import type { HTMLAttributes } from 'vue';
+
+    import { cn } from '@/lib/utils';
+
+    const props = defineProps<DialogContentProps & { class?: HTMLAttributes['class'] }>();
+    const emits = defineEmits<DialogContentEmits>();
+
+    const delegatedProps = reactiveOmit(props, 'class');
+
+    const forwarded = useForwardPropsEmits(delegatedProps, emits);
+
+    /**
+     * 阻止点击遮罩层关闭弹窗。
+     * 流程：Reka Dialog 触发外部点击事件时取消默认关闭行为，让用户只能通过关闭、取消或保存按钮退出。
+     * 参数：event 为 DialogContent 的外部指针事件。
+     * 返回：无返回值；边界为所有表单弹窗可保留已填写内容，避免误触遮罩丢失。
+     */
+    function preventOutsidePointerClose(event: Event): void {
+        event.preventDefault();
+    }
+</script>
+
+<template>
+    <DialogPortal>
+        <DialogOverlay
+            class="fixed inset-0 z-50 bg-overlay/80 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
+        <DialogContent
+            v-bind="forwarded"
+            :class="
+                cn(
+                    'fixed left-1/2 top-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 border bg-popover p-6 text-popover-foreground shadow-sm duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] sm:rounded-lg',
+                    props.class
+                )
+            "
+            @pointer-down-outside="preventOutsidePointerClose">
+            <slot />
+
+            <DialogClose
+                class="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground">
+                <X class="w-4 h-4" />
+                <span class="sr-only">Close</span>
+            </DialogClose>
+        </DialogContent>
+    </DialogPortal>
+</template>

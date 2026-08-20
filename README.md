@@ -1,126 +1,58 @@
-# typesass
+# CodexMan
 
-![typesass logo](src/assets/typesass-logo.png)
+![CodexMan logo](src/assets/codexManLogo.png)
 
 Official website: <https://typesass.tolern.com/>
 
-typesass is a lightweight desktop speech-to-text assistant for dictation,
-translation, quick Q&A, and automatic paste workflows. It is built with Tauri,
-Vite, and TypeScript, and currently uses Xiaomi Mimo-compatible OpenAI-style
-API endpoints for ASR and text generation.
+CodexMan 是一款基于 Tauri、Vue 和 FastAPI 的语音输入工具。当前首发版本提供真实闭环的语音转文字、语音转文字后 AI 润色、现有文本 AI 润色、词典、历史记录、桌面快捷键和 CodeX 会话浏览。
 
-## 中文说明
+## 当前可用功能
 
-typesass 是一款轻量级桌面语音转文字助手，面向日常口述输入、语音翻译、随口提问和自动粘贴工作流。当前版本基于 Tauri、Vite 和 TypeScript 构建，并使用兼容 OpenAI 风格的小米 Mimo API 端点完成语音识别和文本生成。
+- 通过全局快捷键开始语音转文字或语音润色。
+- 浏览器和桌面端统一通过独立 FastAPI HTTP 服务调用 ASR 与文本处理。
+- 桌面端可读取选中文本、润色并尝试自动粘贴；无法确认插入时显示可复制结果，不伪报成功。
+- 维护语音词典、模块内历史、主题、开机启动与系统权限诊断。
+- 只读浏览并打开本机 CodeX 工作空间和已有会话。
+- 第三方可依据运行时 OpenAPI、稳定错误码、requestId 和 Retry-After 接入。
 
-### 功能特性
+模型管理用于维护本机 ASR 与文本模型、默认模型及启停状态；API Key 仅保存到 macOS Keychain。任务管理用于维护项目和 CodeX 任务，首发版使用单 worker 按排队顺序执行，只有当前任务进入可靠终态后才领取下一项，并以真实的 CodeX 终态事件推进状态。翻译、语音问答和实时字幕尚未达到端到端生产标准，本版本不提供入口、快捷键或对外承诺。
 
-- 通过全局快捷键开始录音。
-- 语音转文字后，可选择使用 AI 自动润色口述内容。
-- 支持语音翻译，并把结果自动粘贴到当前输入框。
-- 支持语音提问，结果在本地 Hub 中展示。
-- 支持本地历史、词典、设置和托盘菜单。
-- API Key 不写入源码，桌面端可存储到 macOS 钥匙串。
+## 默认快捷键
 
-### 下载状态
-
-- macOS: 已提供 `0.0.2` 版本安装包。
-- Windows: 开发中。
-
-## Features
-
-- Start recording from a global shortcut.
-- Transcribe speech, then optionally polish the dictated text with AI.
-- Translate spoken content and paste the result into the active input field.
-- Ask quick voice questions and view the answer in the local hub.
-- Keep local history, dictionary entries, settings, and tray-menu workflows.
-- Store API credentials outside the source code.
-
-## Default Shortcuts
-
-| Action | Shortcut |
+| 功能 | 快捷键 |
 | --- | --- |
-| Dictation | `Control + P` |
-| Translation | `Control + T` |
-| Ask | `Control + Space` |
+| 语音转文字 | `Control + Shift + D` |
+| 语音转文字并润色 | `Control + P` |
+| 选中文本润色 | `Control + Shift + P` |
 
-## Requirements
+## 开发
 
-- Node.js 20 or later
-- npm
-- Rust and Cargo for the Tauri desktop app
-- A Xiaomi Mimo API key
+要求 Node.js 20+、npm、Rust/Cargo；Sidecar 构建固定使用 CPython 3.9，构建脚本会在 macOS 自动探测系统/Xcode 与 PATH 中的合规解释器，不依赖当前 Shell 的 `python3` 指向。只有需要覆盖自动选择时才设置 `AITOOL_PYTHON=/absolute/path/to/python3.9`；最终用户不需要安装 Python。
 
-## Downloads
+Chrome 浏览器插件只维护 `codexManExtension/` 这一份源码。`npm run build:browser-extension` 会生成 `public/downloads/typesass-extension.zip`，前端页面的下载链接和桌面端 Tauri 导出命令都使用这个 ZIP；`npm run dev`、`npm run build`、`npm run tauri:build` 会自动先刷新插件包。
 
-- macOS: `0.0.2` is available from GitHub Releases.
-- Windows: in development.
+macOS 官网分发使用 Tauri 专用发布流程，不使用 Electron 打包或 Electron 公证流程。执行 `npm run release:mac` 会清理旧 bundle、运行 Tauri dmg 构建、使用 `codexman-notary` 公证、贴票并执行 Gatekeeper 验证，最终输出到 `website/downloads/codexman_版本_架构.dmg`。每次发布前必须先递增 `package.json` 与 `src-tauri/tauri.conf.json` 版本，小修复递增 patch 位，较大功能版本递增 minor 位。
 
-## Web Preview
-
-Use the web preview when Rust/Cargo is not installed yet:
-
-```bash
-npm install
-npm run build
-npm run preview:web
-```
-
-Open the URL printed in the terminal, enter your Mimo API key, and start
-recording.
-
-You can also provide the key through an environment variable:
-
-```bash
-MIMO_API_KEY=your_api_key npm run preview:web
-```
-
-## Desktop Development
-
-Install Rust first, then run the Tauri app:
+App 启动时自动托管固定地址为 `http://127.0.0.1:18080` 的本机 HTTP 服务，用户无需配置 IP 或域名。HTTP 服务契约见 [server/README.md](server/README.md)：
 
 ```bash
 npm install
 npm run dev
 ```
 
-You can also provide the key through an environment variable:
+浏览器通过设备码流程取得 8 小时工作会话 Token：浏览器生成并展示 userCode，用户在桌面 App 的 HTTP 文档页手工批准，再由原浏览器轮询领取 Token。批准使用的临时 Basic 凭据只在 Rust 内存中，普通浏览器和 WebView JS 都无法读取；机密服务端客户端仍可调用 `POST /v1/auth/token`。Mimo Key、上游地址、模型和长期调用 secret 禁止进入前端构建变量或客户端配置。
+
+浏览器来源不参与本机 HTTP 服务访问判断；`/health` 和设备码创建可直接访问。模型、任务、Codex 状态等敏感接口只依赖 Bearer/Basic/设备码流程鉴权；错误响应中的 `retryable` 决定是否允许重试，存在 `Retry-After` 时优先按该值等待。
+
+## 验证
 
 ```bash
-MIMO_API_KEY=your_api_key npm run dev
+npm run lint
+npm run typecheck
+npm run build
+cd src-tauri && cargo check && cargo test
+cd ../server && .venv-test/bin/python -m pytest --cov=app --cov-branch
 ```
-
-Build the desktop app:
-
-```bash
-npm run tauri:build
-```
-
-## Default Model Configuration
-
-| Setting | Value |
-| --- | --- |
-| Base URL | `https://token-plan-cn.xiaomimimo.com/v1` |
-| ASR model | `mimo-v2.5-asr` |
-| AI model | `mimo-v2.5` |
-| Language | Auto detect |
-
-## Privacy And Security
-
-typesass does not hard-code API keys and does not store them in `localStorage`.
-On macOS, keys entered in the desktop settings page are stored in Keychain. You
-can also provide `MIMO_API_KEY` at runtime if you prefer environment-based
-configuration.
-
-## Repository Mirrors
-
-This project is mirrored as:
-
-- GitHub: `typesass`
-- Alibaba Cloud Codeup: `aiTool`
-
-The local `origin` remote is configured to keep the Codeup repository as the
-fetch source and push to both Codeup and GitHub.
 
 ## License
 

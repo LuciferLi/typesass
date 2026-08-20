@@ -4,15 +4,15 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
-- 进程：`/typesass.app/Contents/MacOS/ai-tool`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
+- 进程：`/CodexMan.app/Contents/MacOS/ai-tool`
 
 执行：
 
-1. `pkill -f '/typesass.app/Contents/MacOS/ai-tool' || true`
-2. `open -n /Users/lucifer/Documents/source/t/monorepo/aiTool/src-tauri/target/release/bundle/macos/typesass.app`
-3. `pgrep -fl '/typesass.app/Contents/MacOS/ai-tool|ai-tool'`
-4. `screencapture -x -o -l <typesassWindowId> /tmp/aitool-final-hub.png`
+1. `pkill -f '/CodexMan.app/Contents/MacOS/ai-tool' || true`
+2. `open -n /Users/lucifer/Documents/source/t/monorepo/aiTool/src-tauri/target/release/bundle/macos/CodexMan.app`
+3. `pgrep -fl '/CodexMan.app/Contents/MacOS/ai-tool|ai-tool'`
+4. `screencapture -x -o -l <CodexManWindowId> /tmp/aitool-final-hub.png`
 5. Playwright 打开 `http://127.0.0.1:1421/?mode=hub`，点击设置页并验证快捷键录制交互。
 
 结果：
@@ -33,7 +33,7 @@
 环境：
 
 - 页面：`http://127.0.0.1:1420/?mode=hub`
-- App 包：`src-tauri/target/release/bundle/macos/typesass.app`
+- App 包：`src-tauri/target/release/bundle/macos/CodexMan.app`
 
 执行与结果：
 
@@ -57,8 +57,8 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
-- 进程：`/typesass.app/Contents/MacOS/ai-tool`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
+- 进程：`/CodexMan.app/Contents/MacOS/ai-tool`
 - 环境变量：`MIMO_API_KEY` 为空
 
 执行与结果：
@@ -68,7 +68,7 @@
 3. 通过系统按键事件触发 `Control + P`，窗口列表出现悬浮条窗口 `132x46` 和错误提示窗口 `460x86`，二者均位于屏幕顶部偏下。
 4. 缺 Key 时，Hub 自动切换到设置页，截图：`/tmp/aitool-missing-key-settings-20260724.png`。
 5. 等待 7 秒后再次枚举窗口，只剩 Hub 主窗口，悬浮条和错误提示窗口自动隐藏成功。
-6. 对 Hub 执行 `Command + W` 后，Hub 窗口隐藏但 typesass 进程仍在。
+6. 对 Hub 执行 `Command + W` 后，Hub 窗口隐藏但 CodexMan 进程仍在。
 7. Hub 隐藏后再次触发 `Control + P`，Hub 可重新显示并切到设置页，后台快捷键链路有效。
 
 未覆盖：
@@ -79,7 +79,7 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 分支：`dev-20260723`
 
 执行与结果：
@@ -100,7 +100,7 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 页面预览：`http://127.0.0.1:1421/?mode=hub`、`http://127.0.0.1:1421/?mode=result`
 - 分支：`dev-20260723`
 
@@ -112,7 +112,7 @@
 4. 执行 `cargo check --manifest-path src-tauri/Cargo.toml`，通过。
 5. 执行 `git diff --check`，通过。
 6. 执行 `npx tauri build --bundles app`，通过并生成最新 `.app`。
-7. 启动最新 `.app`，进程存在；窗口枚举未发现 typesass 可见窗口，说明启动后不再弹常驻 Hub。
+7. 启动最新 `.app`，进程存在；窗口枚举未发现 CodexMan 可见窗口，说明启动后不再弹常驻 Hub。
 8. 打开 Hub 预览，确认首页统计、模式按钮、快捷键展示、最近结果按钮均来自本地真实状态；没有结果时复制/重新整理按钮为禁用态。
 9. 打开结果窗口预览并注入真实转写兜底 payload，确认复制按钮显示；需要辅助功能权限时才显示“打开辅助功能设置”。
 
@@ -130,7 +130,7 @@
 环境：
 
 - 页面预览：`http://127.0.0.1:1421/?mode=hub`
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 分支：`dev-20260723`
 
 执行与结果：
@@ -184,7 +184,7 @@
 环境：
 
 - 页面预览：`http://127.0.0.1:1421/index.html?mode=hub`
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 分支：`dev-20260723`
 
 执行与结果：
@@ -193,7 +193,7 @@
 2. 使用 macOS `security` 命令完成旧钥匙串 service 标识 `asia.aijob.aitool` 的测试 Key 写入、读取、删除闭环；复核测试值未遗留，已有用户钥匙串值不展示也不删除。
 3. 首页新增准备状态面板，展示 Mimo Key、麦克风、辅助功能、快捷键状态；“打开设置”和“编辑”按钮均为真实跳转。
 4. 悬浮条录音态改为按 WebAudio 采样估算音量并驱动九段波形；错误态增加轻震动画，结果窗口增加弹入动画。
-5. 启动最新 `.app` 后不弹常驻窗口；模拟 `Control+P` 后出现 typesass 提示和 Hub，符合缺 Key 时引导设置的预期。
+5. 启动最新 `.app` 后不弹常驻窗口；模拟 `Control+P` 后出现 CodexMan 提示和 Hub，符合缺 Key 时引导设置的预期。
 6. 执行 `npm run lint`、`npm run build`、`cargo fmt --check --manifest-path src-tauri/Cargo.toml`、`cargo check --manifest-path src-tauri/Cargo.toml`、`npx tauri build --bundles app`，均通过。
 
 截图证据：
@@ -211,7 +211,7 @@
 环境：
 
 - 页面预览：`http://127.0.0.1:1422/?mode=hub`
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 分支：`dev-20260723`
 
 执行与结果：
@@ -225,13 +225,13 @@
 7. 打开 Hub 首页，确认快捷键诊断在网页预览下显示“仅桌面端可注册”，下一步引导仍指向真实桌面 App 使用路径。
 8. 打开设置页并滚动到系统诊断区域，确认四个诊断卡片无文字挤压、无遮挡，快捷键诊断为真实状态入口。
 9. 执行 `npx tauri build --bundles app`，通过并生成最新 `.app`。
-10. 检查打包后 `Info.plist`：`CFBundleDisplayName=typesass`，`NSMicrophoneUsageDescription=typesass 需要使用麦克风录制语音并转换成文字。`，`CFBundleIconFile=icon.icns`。
+10. 检查打包后 `Info.plist`：`CFBundleDisplayName=CodexMan`，`NSMicrophoneUsageDescription=CodexMan 需要使用麦克风录制语音并转换成文字。`，`CFBundleIconFile=icon.icns`。
 11. 检查打包后资源：`Contents/Resources/icon.icns` 存在，文件类型为 Mac OS X icon。
 
 截图证据：
 
-- `output/playwright/typesass-shortcut-diagnostic-home-20260724.png`
-- `output/playwright/typesass-shortcut-diagnostic-settings-bottom-20260724.png`
+- `output/playwright/codexman-shortcut-diagnostic-home-20260724.png`
+- `output/playwright/codexman-shortcut-diagnostic-settings-bottom-20260724.png`
 
 未覆盖：
 
@@ -250,7 +250,7 @@
 执行与结果：
 
 1. 仅检查 Keychain 条目是否存在，不打印密钥：存在。
-2. 使用系统 `say` 生成短音频 `output/e2e/typesass-asr-smoke.wav`。
+2. 使用系统 `say` 生成短音频 `output/e2e/codexman-asr-smoke.wav`。
 3. 使用与 App 一致的 OpenAI 兼容 `chat/completions` 请求体调用 Mimo ASR。
 4. ASR 请求成功：HTTP `200`，耗时 `927ms`，模型 `mimo-v2.5-asr`，识别文本 `TypeSess测试语音输入。`。
 5. 使用同一 Key 调用 Mimo 文本模型做 AI 整理冒烟。
@@ -258,8 +258,8 @@
 
 证据文件：
 
-- `output/e2e/typesass-asr-smoke-result.json`
-- `output/e2e/typesass-ai-smoke-result.json`
+- `output/e2e/codexman-asr-smoke-result.json`
+- `output/e2e/codexman-ai-smoke-result.json`
 
 未覆盖：
 
@@ -270,7 +270,7 @@
 环境：
 
 - 页面预览：历史截图来自本地 Vite 预览。
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 分支：`dev-20260723`
 
 执行与结果：
@@ -285,12 +285,12 @@
 
 截图证据：
 
-- `output/playwright/typesass-final-polish-home-20260724.png`
-- `output/playwright/typesass-final-polish-modes-20260724.png`
-- `output/playwright/typesass-final-polish-history-timing-20260724.png`
-- `output/playwright/typesass-floating-nudge-busy-20260724.png`
-- `output/playwright/typesass-final-delivery-shortcuts-20260724.png`
-- `output/playwright/typesass-brand-clean-settings-20260724.png`
+- `output/playwright/codexman-final-polish-home-20260724.png`
+- `output/playwright/codexman-final-polish-modes-20260724.png`
+- `output/playwright/codexman-final-polish-history-timing-20260724.png`
+- `output/playwright/codexman-floating-nudge-busy-20260724.png`
+- `output/playwright/codexman-final-delivery-shortcuts-20260724.png`
+- `output/playwright/codexman-brand-clean-settings-20260724.png`
 
 未覆盖：
 
@@ -300,31 +300,31 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 目标输入框：TextEdit 临时文档
 - 快捷键：`Control + P`
 - 分支：`dev-20260723`
 
 执行与结果：
 
-1. 启动最新 `typesass.app`，App 后台驻留，不弹常驻 Hub。
-2. TextEdit 临时文档保持焦点，内容为 `typesass 自动粘贴验证：`。
+1. 启动最新 `CodexMan.app`，App 后台驻留，不弹常驻 Hub。
+2. TextEdit 临时文档保持焦点，内容为 `CodexMan 自动粘贴验证：`。
 3. 发送第一次 `Control + P`，屏幕顶部下方出现录音胶囊，位置和无阴影符合预期。
 4. macOS 弹出麦克风权限请求，允许后录音继续。
 5. 播放系统测试语音后发送第二次 `Control + P`，录音停止并进入转写流程。
-6. 因当前 `typesass.app` 未通过辅助功能授权，自动粘贴被系统阻止，结果兜底窗口出现并提示需要开启辅助功能权限。
+6. 因当前 `CodexMan.app` 未通过辅助功能授权，自动粘贴被系统阻止，结果兜底窗口出现并提示需要开启辅助功能权限。
 7. 本次系统播放语音未被麦克风形成有效输入，上游返回“无实际内容输出”占位文案；已补修为空语音拦截，不再把占位文案当作成功结果。
 
 截图证据：
 
-- `output/e2e/typesass-real-shortcut-start-20260724.png`
-- `output/e2e/typesass-permission-after-quartz-click-20260724.png`
-- `output/e2e/typesass-real-chain-after-stop-20260724.png`
-- `output/e2e/typesass-accessibility-settings-20260724.png`
+- `output/e2e/codexman-real-shortcut-start-20260724.png`
+- `output/e2e/codexman-permission-after-quartz-click-20260724.png`
+- `output/e2e/codexman-real-chain-after-stop-20260724.png`
+- `output/e2e/codexman-accessibility-settings-20260724.png`
 
 未覆盖：
 
-- 辅助功能权限仍需用户在系统设置中重新添加或切换当前 `typesass.app` 后复测。
+- 辅助功能权限仍需用户在系统设置中重新添加或切换当前 `CodexMan.app` 后复测。
 - 最终语音输入效果需用户真实说话验证，系统扬声器播放未能稳定进入麦克风。
 
 ## 2026-07-24 最终视觉抛光与切图复测
@@ -346,12 +346,12 @@
 
 截图证据：
 
-- `output/playwright/typesass-polished-home-20260724.png`
-- `output/playwright/typesass-polished-modes-20260724.png`
-- `output/playwright/typesass-polished-shortcuts-20260724.png`
-- `output/playwright/typesass-polished-history-timing-20260724.png`
-- `output/playwright/typesass-polished-floating-pill-20260724.png`
-- `output/e2e/typesass-polished-hub-app-20260724.png`
+- `output/playwright/codexman-polished-home-20260724.png`
+- `output/playwright/codexman-polished-modes-20260724.png`
+- `output/playwright/codexman-polished-shortcuts-20260724.png`
+- `output/playwright/codexman-polished-history-timing-20260724.png`
+- `output/playwright/codexman-polished-floating-pill-20260724.png`
+- `output/e2e/codexman-polished-hub-app-20260724.png`
 
 未覆盖：
 
@@ -374,8 +374,8 @@
 
 截图证据：
 
-- `output/playwright/typesass-accessibility-watch-state-20260724.png`
-- `output/playwright/typesass-short-recording-toast-20260724.png`
+- `output/playwright/codexman-accessibility-watch-state-20260724.png`
+- `output/playwright/codexman-short-recording-toast-20260724.png`
 
 未覆盖：
 
@@ -385,24 +385,24 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 目标输入框：TextEdit 临时文档
 - 快捷键：`Control + P`
 - 分支：`dev-20260723`
 
 执行与结果：
 
-1. 用户确认当前 `typesass.app` 已获得辅助功能权限。
-2. TextEdit 临时文档保持焦点，内容为 `typesass 权限后自动粘贴验证：`。
+1. 用户确认当前 `CodexMan.app` 已获得辅助功能权限。
+2. TextEdit 临时文档保持焦点，内容为 `CodexMan 权限后自动粘贴验证：`。
 3. 发送第一次 `Control + P`，开始短录音。
 4. 播放一句短测试语音后发送第二次 `Control + P`，录音停止并进入转写流程。
 5. Hub 历史记录新增 `TextEdit` 记录，展示 `录音 3.3s`、`转写 1.0s`、`AI总结 11s`。
-6. TextEdit 文档内容变为 `收你的成本。typesass 权限后自动粘贴验证：`，确认结果已自动粘贴到聚焦输入框。
+6. TextEdit 文档内容变为 `收你的成本。CodexMan 权限后自动粘贴验证：`，确认结果已自动粘贴到聚焦输入框。
 
 截图证据：
 
-- `output/e2e/typesass-real-short-chain-paste-success-20260724.png`
-- `output/e2e/typesass-real-short-chain-history-timing-2-20260724.png`
+- `output/e2e/codexman-real-short-chain-paste-success-20260724.png`
+- `output/e2e/codexman-real-short-chain-history-timing-2-20260724.png`
 
 备注：
 
@@ -412,7 +412,7 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 页面预览：`http://127.0.0.1:1421/?mode=hub`
 - 分支：`dev-20260723`
 
@@ -425,7 +425,7 @@
 
 截图证据：
 
-- `output/playwright/typesass-dictation-polish-switch-20260724.png`
+- `output/playwright/codexman-dictation-polish-switch-20260724.png`
 
 未覆盖：
 
@@ -435,22 +435,22 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 分支：`dev-20260723`
 
 执行与结果：
 
-1. 托盘图标取消 macOS template 模式，改为显示 typesass 彩色 Logo。
+1. 托盘图标取消 macOS template 模式，改为显示 CodexMan 彩色 Logo。
 2. 托盘左键不再直接打开 Hub，改为弹出菜单。
-3. 菜单项按 Typeless 参考结构补齐：`打开 typesass 主页`、`显示历史记录`、`将词汇添加到词典`、`设置...`、`选择麦克风`、版本、`检查更新...`、`退出 typesass`。
-4. `打开 typesass 主页`、`显示历史记录`、`设置...` 会打开 Hub 并切换到对应视图。
+3. 菜单项按 Typeless 参考结构补齐：`打开 CodexMan 主页`、`显示历史记录`、`将词汇添加到词典`、`设置...`、`选择麦克风`、版本、`检查更新...`、`退出 CodexMan`。
+4. `打开 CodexMan 主页`、`显示历史记录`、`设置...` 会打开 Hub 并切换到对应视图。
 5. `将词汇添加到词典` 会读取系统剪贴板文本，写入本地词典并切到词典页；剪贴板为空时展示真实错误提示。
 6. `选择麦克风` 子菜单提供系统默认、打开麦克风设置和刷新麦克风列表入口。
 7. `检查更新...` 在未接入在线更新通道前展示当前版本状态，不伪装成已有在线更新能力。
 
 截图证据：
 
-- `output/e2e/typesass-tray-menu-20260724.png`
+- `output/e2e/codexman-tray-menu-20260724.png`
 
 未覆盖：
 
@@ -460,25 +460,25 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 图标源：`src-tauri/icons/icon.png`
 - 分支：`dev-20260723`
 
 执行与结果：
 
-1. 从现有 typesass 图标生成透明圆角源图，只保留原 ts 字母、波形、颜色和内部圆角图形，不改变功能逻辑。
+1. 从现有 CodexMan 图标生成透明圆角源图，只保留原 ts 字母、波形、颜色和内部圆角图形，不改变功能逻辑。
 2. 使用 Tauri 图标生成流程重新切出标准 PNG、`.icns`、`.ico`、iOS、Android 和 Windows 图标资源。
-3. 同步更新 Hub 使用的 `src/assets/typesass-logo.png`，以及输出预览图 `output/assets/typesass-logo-128.png`、`output/assets/typesass-logo-512.png`。
+3. 同步更新 Hub 使用的 `src/assets/codexManLogo.png`，以及输出预览图 `output/assets/codexman-logo-128.png`、`output/assets/codexman-logo-512.png`。
 4. 复核主 Logo、Tauri 512 图标、32/64/128/256 PNG 和输出预览图均为 RGBA，四角 alpha 为 0，不再是黑色方底。
 5. 执行静态检查和桌面打包，确认最新 `.app` 可生成。
 
 验证证据：
 
-- `src/assets/typesass-logo.png`：`256x256` RGBA，四角透明。
+- `src/assets/codexManLogo.png`：`256x256` RGBA，四角透明。
 - `src-tauri/icons/icon.png`：`512x512` RGBA，四角透明。
 - `src-tauri/icons/icon.icns`、`src-tauri/icons/icon.ico`：已重新生成。
-- `output/assets/typesass-logo-128.png`、`output/assets/typesass-logo-512.png`：已同步为 RGBA 圆角图。
-- 圆角透明预览图：`output/e2e/typesass-logo-rounded-preview-20260724.png`。
+- `output/assets/codexman-logo-128.png`、`output/assets/codexman-logo-512.png`：已同步为 RGBA 圆角图。
+- 圆角透明预览图：`output/e2e/codexman-logo-rounded-preview-20260724.png`。
 
 未覆盖：
 
@@ -488,7 +488,7 @@
 
 环境：
 
-- App：`src-tauri/target/release/bundle/macos/typesass.app`
+- App：`src-tauri/target/release/bundle/macos/CodexMan.app`
 - 图标源：`src-tauri/icons/icon.png`
 - 分支：`dev-20260723`
 
@@ -497,14 +497,14 @@
 1. 检测上一版 512 图标的 alpha 有效边界为 `47,47-464,464`，存在约 `47px` 外部透明边距。
 2. 按 alpha 有效边界裁切并等比放大到整张 `512x512` 画布，保留四角透明和内部 ts 字母、波形、颜色。
 3. 重新生成 Tauri 标准 PNG、`.icns`、`.ico`、iOS、Android 和 Windows 图标资源。
-4. 同步更新 Hub 使用的 `src/assets/typesass-logo.png`，以及输出预览图 `output/assets/typesass-logo-128.png`、`output/assets/typesass-logo-512.png`。
+4. 同步更新 Hub 使用的 `src/assets/codexManLogo.png`，以及输出预览图 `output/assets/codexman-logo-128.png`、`output/assets/codexman-logo-512.png`。
 5. 复核新版 `src-tauri/icons/icon.png` alpha 有效边界为 `0,0-511,511`，确认外部透明边距已去掉。
 
 验证证据：
 
 - `src-tauri/icons/icon.png`：`512x512` RGBA，alpha 有效边界 `0,0-511,511`。
-- `src/assets/typesass-logo.png`：`256x256` RGBA，alpha 有效边界 `0,0-255,255`。
-- 无外部边距预览图：`output/e2e/typesass-logo-no-padding-preview-20260724.png`。
+- `src/assets/codexManLogo.png`：`256x256` RGBA，alpha 有效边界 `0,0-255,255`。
+- 无外部边距预览图：`output/e2e/codexman-logo-no-padding-preview-20260724.png`。
 
 未覆盖：
 

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>codexMan</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="typesass-popup">
+      <header class="typesass-popup__header">
+        <img class="typesass-popup__logo" src="icons/icon48.png" alt="codexMan">
+        <div class="typesass-popup__title">
+          <strong>codexMan</strong>
+          <p>浏览器元素标注与任务创建</p>
+        </div>
+        <span id="statusBadge">检测中</span>
+      </header>
+
+      <section class="typesass-panel">
+        <div class="typesass-panel__row">
+          <span>应用服务</span>
+          <button id="healthButton" type="button">重新检测</button>
+        </div>
+        <p id="healthText">正在检测 codexMan 是否已打开。</p>
+      </section>
+
+      <section class="typesass-panel">
+        <label>
+          <span>应用授权码</span>
+          <span class="typesass-token-field">
+            <input id="accessTokenInput" type="password" placeholder="点击获取授权码后自动保存">
+            <button id="toggleTokenButton" class="typesass-icon-button" type="button" aria-label="查看授权码" title="查看授权码">
+              <svg class="typesass-eye-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"></path>
+                <circle cx="12" cy="12" r="2.5"></circle>
+              </svg>
+            </button>
+          </span>
+        </label>
+        <button id="requestTokenButton" type="button">获取授权码</button>
+      </section>
+
+      <section class="typesass-panel">
+        <label>
+          <span>任务项目</span>
+          <select id="projectSelect">
+            <option value="">请先读取项目</option>
+          </select>
+        </label>
+        <button id="refreshProjectsButton" type="button">读取项目</button>
+      </section>
+
+      <button id="startPickerButton" class="typesass-primary" type="button" disabled>开始选择元素</button>
+      <p id="messageText">发送后会在选中的任务项目里创建任务，任务内容会保留页面地址、目标元素和截图说明。</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
