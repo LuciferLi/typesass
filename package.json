@@ -1,6 +1,6 @@
 {
   "name": "codexman",
-  "version": "0.1.14",
+  "version": "0.1.22",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -15,7 +15,7 @@
   "scripts": {
     "build:browser-extension": "node scripts/buildBrowserExtensionZip.mjs",
     "predev": "npm run build:browser-extension",
-    "dev": "npm run build:sidecar && node scripts/freeDevPort.mjs 1420 && tauri dev",
+    "dev": "npm run build:sidecar && node scripts/freeDevPort.mjs 1420 1421 && tauri dev",
     "dev:frontend": "node scripts/freeDevPort.mjs 1420 && vite --host 0.0.0.0",
     "tslint": "pnpm run typecheck",
     "lint": "eslint --ext .ts,.js,.vue --ignore-path .gitignore src/ && pnpm run typecheck",
@@ -32,6 +32,7 @@
   "dependencies": {
     "@icon-park/svg": "^1.4.2",
     "@icon-park/vue-next": "^1.4.2",
+    "@lobehub/icons-static-svg": "^1.94.0",
     "@tauri-apps/api": "^2.11.1",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vueuse/core": "^14.4.0",

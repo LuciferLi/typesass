@@ -38,6 +38,59 @@ const defaultState: VoicePolishPersistedState = {
     styleInstruction: ''
 };
 
+/**
+ * 把历史时间规范成前端稳定可解析的 ISO 字符串。
+ * 流程：兼容旧版 App 写入的 Unix 毫秒/秒时间戳字符串，也兼容新版 ISO 字符串。
+ * 参数：createdAt 为持久化历史中的创建时间。
+ * 返回：合法 ISO 时间字符串；无法解析时返回空字符串，交由页面展示兜底文案。
+ * 边界：纯数字按时间戳处理，避免 JS 把毫秒字符串当成日期文本导致 Invalid Date。
+ */
+function normalizeHistoryCreatedAt(createdAt: unknown): string {
+    if (typeof createdAt !== 'string') return '';
+    const normalizedCreatedAt = createdAt.trim();
+    if (!normalizedCreatedAt) return '';
+    const numericTimestamp = Number(normalizedCreatedAt);
+    const date =
+        Number.isFinite(numericTimestamp) && numericTimestamp > 0
+            ? new Date(numericTimestamp < 1_000_000_000_000 ? numericTimestamp * 1000 : numericTimestamp)
+            : new Date(normalizedCreatedAt);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toISOString();
+}
+
+/**
+ * 生成语音历史兜底 ID。
+ * 流程：优先使用安全上下文下的 crypto.randomUUID，缺失时使用时间戳和随机数生成本地临时 ID。
+ * 参数：无。
+ * 返回：历史列表渲染使用的稳定字符串。
+ * 边界：仅用于修复历史脏数据缺失 ID 的场景，不作为跨设备唯一业务主键。
+ */
+function createFallbackHistoryId(): string {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    return `voice-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * 规范化语音历史列表。
+ * 流程：过滤非法项，兼容旧版 createdAt 毫秒字符串，并补齐可展示的 ISO 时间。
+ * 参数：history 为持久化配置里的原始历史字段。
+ * 返回：可供页面直接渲染和再次持久化的历史列表。
+ * 边界：文本字段非法时按空字符串处理，避免单条脏数据拖垮整个历史列表。
+ */
+function normalizeVoicePolishHistory(history: unknown): VoicePolishHistoryItemModel[] {
+    if (!Array.isArray(history)) return [];
+    return history
+        .filter((item): item is Partial<VoicePolishHistoryItemModel> => Boolean(item) && typeof item === 'object')
+        .map((item) => {
+            const id = typeof item.id === 'string' && item.id.trim() ? item.id : createFallbackHistoryId();
+            const sourceText = typeof item.sourceText === 'string' ? item.sourceText : '';
+            const outputText = typeof item.outputText === 'string' ? item.outputText : '';
+            const contextApp = typeof item.contextApp === 'string' ? item.contextApp : '';
+            const createdAt = normalizeHistoryCreatedAt(item.createdAt);
+            return { id, sourceText, outputText, contextApp, createdAt };
+        });
+}
+
 export const useVoicePolishStore = defineStore('voicePolish', {
     state: (): VoicePolishState => {
         return {
@@ -77,7 +130,7 @@ export const useVoicePolishStore = defineStore('voicePolish', {
             this.asrModelId = typeof nextState.asrModelId === 'string' ? nextState.asrModelId : '';
             this.textModelId = typeof nextState.textModelId === 'string' ? nextState.textModelId : '';
             this.dictionary = Array.isArray(nextState.dictionary) ? nextState.dictionary : [];
-            this.history = Array.isArray(nextState.history) ? nextState.history : [];
+            this.history = normalizeVoicePolishHistory(nextState.history);
             this.styleInstruction = typeof nextState.styleInstruction === 'string' ? nextState.styleInstruction : '';
         },
 

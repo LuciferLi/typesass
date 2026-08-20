@@ -91,3 +91,13 @@ export type AppVoicePolishResponseModel = {
     // 用户可读完成提示。
     message: string;
 };
+
+// 结果兜底窗口载荷，用于自动粘贴失败、无输入焦点或 AI 润色失败时展示可复制结果。
+export type ResultWindowPayloadModel = {
+    // 展示给用户复制或重试的结果文本。
+    text: string;
+    // 本次展示结果窗口的原因说明。
+    reason: string;
+    // 是否需要展示辅助功能设置入口。
+    requiresAccessibility: boolean;
+};

@@ -3,7 +3,7 @@
         <ui-dialog-content>
             <ui-dialog-header>
                 <ui-dialog-title>{{ title }}</ui-dialog-title>
-                <ui-dialog-description class="sr-only">选择厂商或填写自定义中转站模型配置。</ui-dialog-description>
+                <ui-dialog-description class="sr-only">{{ dialogDescription }}</ui-dialog-description>
             </ui-dialog-header>
             <form @submit.prevent="handleSubmit">
                 <ui-alert
@@ -21,22 +21,55 @@
                         <ui-field-label>厂商</ui-field-label>
                         <ui-select-root
                             v-model="selectedVendorValue"
-                            @update:model-value="handleFormChanged">
+                            @update:model-value="handleVendorChanged">
                             <ui-select-trigger>
-                                <ui-select-value placeholder="选择厂商或自定义中转站" />
+                                <ui-select-value :placeholder="vendorPlaceholder" />
                             </ui-select-trigger>
                             <ui-select-content>
-                                <ui-select-item value="custom">自定义中转站</ui-select-item>
+                                <ui-select-item
+                                    v-if="props.group === 'text'"
+                                    value="custom"
+                                    >自定义中转站</ui-select-item
+                                >
                                 <ui-select-item
                                     v-for="vendor in vendorOptions"
                                     :key="vendor.key"
                                     :value="vendor.key">
-                                    {{ vendor.label }}
+                                    <span class="flex items-center gap-2">
+                                        <model-manage-vendor-mark
+                                            :vendor-key="vendor.key"
+                                            :label="vendor.label" />
+                                        <span>{{ vendor.label }}</span>
+                                    </span>
                                 </ui-select-item>
                             </ui-select-content>
                         </ui-select-root>
                         <ui-field-description v-if="selectedVendor">
-                            {{ selectedVendor.model }} · {{ selectedVendor.baseUrl }}
+                            {{ selectedVendor.apiKeyHelp }}
+                        </ui-field-description>
+                    </ui-field>
+
+                    <ui-field v-if="selectedVendor">
+                        <ui-field-label>模型</ui-field-label>
+                        <ui-select-root
+                            v-model="selectedModelKey"
+                            @update:model-value="handleFormChanged">
+                            <ui-select-trigger>
+                                <ui-select-value placeholder="选择模型" />
+                            </ui-select-trigger>
+                            <ui-select-content>
+                                <ui-select-item
+                                    v-for="modelOption in selectedVendor.models"
+                                    :key="modelOption.key"
+                                    :disabled="modelOption.comingSoon"
+                                    :value="modelOption.key">
+                                    {{ modelOption.label }}{{ modelOption.recommended ? ' · 推荐' : ''
+                                    }}{{ modelOption.comingSoon ? ' · 即将支持' : '' }}
+                                </ui-select-item>
+                            </ui-select-content>
+                        </ui-select-root>
+                        <ui-field-description v-if="selectedModel">
+                            {{ selectedModel.description }}
                         </ui-field-description>
                     </ui-field>
 
@@ -167,6 +200,7 @@
 <script setup lang="ts">
     import { CheckSmall, LoadingOne, PreviewClose, PreviewOpen } from '@icon-park/vue-next';
 
+    import ModelManageVendorMark from '@/components/modelManage/vendorMark.vue';
     import {
         Alert as UiAlert,
         AlertDescription as UiAlertDescription,
@@ -196,7 +230,14 @@
         SelectValue as UiSelectValue
     } from '@/components/ui/select';
     import { ModelVendorPresets } from '@/config/defaultModel';
-    import type { ModelFormModel, ModelGroupType, ModelVendorKey, PrivateModelItemModel } from '@/model/modelManage';
+    import type {
+        ModelFormModel,
+        ModelGroupType,
+        ModelPresetKey,
+        ModelVendorKey,
+        ModelVendorOptionModel,
+        PrivateModelItemModel
+    } from '@/model/modelManage';
     import { isTauriRuntime } from '@/service/tauri/command';
     import { useModelManageStore } from '@/stores/modelManage';
 
@@ -228,6 +269,7 @@
     const open = defineModel<boolean>('open', { default: false });
     const modelManageStore = useModelManageStore();
     const selectedVendorValue = ref<ModelVendorKey | 'custom'>('custom');
+    const selectedModelKey = ref<ModelPresetKey | ''>('');
     const apiKey = ref('');
     const apiKeyVisible = ref(false);
     const customBaseUrl = ref('');
@@ -237,10 +279,16 @@
     const submitting = ref(false);
     const testStatus = ref<'idle' | 'success' | 'error'>('idle');
     const testMessage = ref('');
-    const vendorOptions = computed(() => ModelVendorPresets.filter((vendor) => vendor.group === props.group));
-    const selectedVendor = computed(() => {
+    const vendorOptions = computed<ModelVendorOptionModel[]>(() =>
+        ModelVendorPresets.filter((vendor) => vendor.group === props.group)
+    );
+    const selectedVendor = computed<ModelVendorOptionModel | null>(() => {
         if (selectedVendorValue.value === 'custom') return null;
         return vendorOptions.value.find((vendor) => vendor.key === selectedVendorValue.value) || null;
+    });
+    const selectedModel = computed(() => {
+        if (!selectedVendor.value) return null;
+        return selectedVendor.value.models.find((model) => model.key === selectedModelKey.value) || null;
     });
     const apiKeyPlaceholder = computed(() => selectedVendor.value?.apiKeyPlaceholder || '请输入中转站 API Key');
     const apiKeyHelp = computed(() => {
@@ -251,16 +299,41 @@
     const apiKeyUrlLabel = computed(() => selectedVendor.value?.apiKeyUrlLabel || '');
     const operationRunning = computed(() => testing.value || submitting.value);
     const canRunModelTest = computed(() => isTauriRuntime());
+    const vendorPlaceholder = computed(() => {
+        if (props.group === 'asr') return '选择实时语音识别厂商';
+        return '选择厂商或自定义中转站';
+    });
+    const dialogDescription = computed(() => {
+        if (props.group === 'asr') return '选择实时语音识别厂商和模型配置。';
+        return '选择厂商或填写自定义中转站模型配置。';
+    });
 
     /**
      * 重置添加模型表单。
-     * 流程：清空密钥和自定义字段，并把厂商选择恢复为自定义中转站。
+     * 流程：清空密钥和自定义字段；文本模型默认自定义中转站，ASR 默认首个实时 provider。
      * 参数：无。
      * 返回：无返回值。
      * 边界：不关闭弹窗，由调用处决定弹窗状态。
      */
     function resetForm(): void {
-        selectedVendorValue.value = 'custom';
+        const editingVendor = props.model?.vendorKey as ModelVendorKey | undefined;
+        const editingModel = props.model?.modelKey as ModelPresetKey | undefined;
+        const matchedVendor = editingVendor
+            ? vendorOptions.value.find((vendor) => vendor.key === editingVendor)
+            : vendorOptions.value.find((vendor) =>
+                  vendor.models.some(
+                      (model) => model.model === props.model?.modelName && model.baseUrl === props.model?.baseUrl
+                  )
+              );
+        selectedVendorValue.value = matchedVendor?.key ?? firstVendorValue();
+        selectedModelKey.value =
+            matchedVendor?.models.find((model) => model.key === editingModel)?.key ??
+            matchedVendor?.models.find(
+                (model) => model.model === props.model?.modelName && model.baseUrl === props.model?.baseUrl
+            )?.key ??
+            matchedVendor?.models.find((model) => model.recommended && !model.comingSoon)?.key ??
+            matchedVendor?.models.find((model) => !model.comingSoon)?.key ??
+            '';
         apiKey.value = '';
         apiKeyVisible.value = false;
         customBaseUrl.value = props.model?.baseUrl ?? '';
@@ -273,6 +346,25 @@
     watch(open, (visible) => {
         if (visible) resetForm();
     });
+
+    /**
+     * 厂商切换后自动选择该厂商推荐模型。
+     * 流程：先选推荐且当前已接入的模型，再退回首个可用模型；自定义中转站清空模型选择。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：暂未接入的实时 ASR 模型不会被默认选中，避免用户误以为已经可以保存使用。
+     */
+    function handleVendorChanged(): void {
+        if (selectedVendor.value) {
+            selectedModelKey.value =
+                selectedVendor.value.models.find((model) => model.recommended && !model.comingSoon)?.key ??
+                selectedVendor.value.models.find((model) => !model.comingSoon)?.key ??
+                '';
+        } else {
+            selectedModelKey.value = '';
+        }
+        handleFormChanged();
+    }
 
     /**
      * 表单内容变化后清理上一次测试状态。
@@ -301,18 +393,32 @@
             return null;
         }
         if (selectedVendor.value) {
+            if (!selectedModel.value) {
+                setTestError('请先选择模型。');
+                return null;
+            }
+            if (selectedModel.value.comingSoon) {
+                setTestError('该实时 ASR 模型将在下一阶段接入 WebSocket 音频流，当前版本暂不能保存使用。');
+                return null;
+            }
             return {
-                name: selectedVendor.value.modelName,
+                name: selectedModel.value.modelName,
                 group: props.group,
-                baseUrl: selectedVendor.value.baseUrl,
-                model: selectedVendor.value.model,
+                baseUrl: selectedModel.value.baseUrl,
+                model: selectedModel.value.model,
+                provider: selectedModel.value.provider ?? 'openai-compatible',
                 apiKey: normalizedApiKey || undefined,
                 source: 'vendor',
                 vendorKey: selectedVendor.value.key,
+                modelKey: selectedModel.value.key,
                 remark: selectedVendor.value.label,
                 enabled: true,
                 isDefault: false
             };
+        }
+        if (props.group === 'asr') {
+            setTestError('ASR 只支持内置实时语音识别厂商，请选择阿里实时 ASR、腾讯云实时 ASR 或讯飞实时转写。');
+            return null;
         }
         const normalizedBaseUrl = customBaseUrl.value.trim();
         const normalizedDisplayName = customDisplayName.value.trim();
@@ -327,13 +433,27 @@
             group: props.model?.capability ?? props.group,
             baseUrl: normalizedBaseUrl,
             model: normalizedModelName,
+            provider: 'openai-compatible',
             apiKey: normalizedApiKey || undefined,
             source: 'custom',
             vendorKey: '',
+            modelKey: '',
             remark: props.model?.provider ?? '自定义中转站',
             enabled: props.model?.enabled ?? true,
             isDefault: props.model?.isDefault ?? false
         };
+    }
+
+    /**
+     * 获取当前能力的默认厂商选项。
+     * 流程：文本模型保留自定义中转站；ASR 新增入口强制选择首个实时 provider。
+     * 参数：无。
+     * 返回：厂商键或 custom。
+     * 边界：如果 ASR 预设异常为空，则仍返回 custom 并由提交校验给出明确错误。
+     */
+    function firstVendorValue(): ModelVendorKey | 'custom' {
+        if (props.group === 'text') return 'custom';
+        return vendorOptions.value[0]?.key ?? 'custom';
     }
 
     /**

@@ -1,12 +1,35 @@
 <template>
     <span
-        class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border text-[10px] font-semibold"
+        class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-background/80 p-1"
         :class="markConfig.className">
-        {{ markConfig.text }}
+        <img
+            v-if="markConfig.icon"
+            :src="markConfig.icon"
+            :alt="markConfig.alt"
+            class="h-full w-full object-contain"
+            loading="lazy"
+            draggable="false" />
+        <span
+            v-else
+            class="text-[10px] font-semibold">
+            {{ markConfig.text }}
+        </span>
     </span>
 </template>
 
 <script setup lang="ts">
+    import alibabaCloudIcon from '@lobehub/icons-static-svg/icons/alibabacloud-color.svg?url';
+    import deepseekIcon from '@lobehub/icons-static-svg/icons/deepseek-color.svg?url';
+    import geminiIcon from '@lobehub/icons-static-svg/icons/gemini-color.svg?url';
+    import iflytekCloudIcon from '@lobehub/icons-static-svg/icons/iflytekcloud-color.svg?url';
+    import kimiIcon from '@lobehub/icons-static-svg/icons/kimi-color.svg?url';
+    import openaiIcon from '@lobehub/icons-static-svg/icons/openai.svg?url';
+    import qwenIcon from '@lobehub/icons-static-svg/icons/qwen-color.svg?url';
+    import tencentCloudIcon from '@lobehub/icons-static-svg/icons/tencentcloud-color.svg?url';
+    import volcengineIcon from '@lobehub/icons-static-svg/icons/volcengine-color.svg?url';
+    import xiaomiMiMoIcon from '@lobehub/icons-static-svg/icons/xiaomimimo.svg?url';
+    import zhipuIcon from '@lobehub/icons-static-svg/icons/zhipu-color.svg?url';
+
     import type { ModelVendorKey } from '@/model/modelManage';
 
     defineOptions({
@@ -20,25 +43,30 @@
         label: string;
     }>();
 
-    // 厂商徽标视觉配置，避免直接内置第三方商标文件。
+    // 厂商徽标视觉配置，优先使用 LobeHub 模型图标库，未知厂商保留字母兜底。
     type VendorMarkConfig = {
-        // 徽标显示文本。
-        text: string;
-        // 徽标对应的 Tailwind 色彩类。
+        // 徽标显示文本；没有图标资源时作为兜底展示。
+        text?: string;
+        // LobeHub 静态 SVG 图标资源地址。
+        icon?: string;
+        // 图标替代文本，供图片不可用和无障碍场景使用。
+        alt: string;
+        // 徽标对应的 Tailwind 色彩类，用于容器微调或未知厂商兜底。
         className: string;
     };
 
     const vendorMarkConfigMap: Record<ModelVendorKey, VendorMarkConfig> = {
-        'xiaomi-asr': { text: 'MI', className: 'border-orange-500/30 bg-orange-500/10 text-orange-300' },
-        'xiaomi-text': { text: 'MI', className: 'border-orange-500/30 bg-orange-500/10 text-orange-300' },
-        openai: { text: 'AI', className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' },
-        deepseek: { text: 'DS', className: 'border-blue-500/30 bg-blue-500/10 text-blue-300' },
-        qwen: { text: 'QW', className: 'border-sky-500/30 bg-sky-500/10 text-sky-300' },
-        'qwen-asr': { text: 'QA', className: 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300' },
-        gemini: { text: 'G', className: 'border-red-500/30 bg-red-500/10 text-red-300' },
-        kimi: { text: 'KM', className: 'border-violet-500/30 bg-violet-500/10 text-violet-300' },
-        zhipu: { text: 'GL', className: 'border-lime-500/30 bg-lime-500/10 text-lime-300' },
-        volcengine: { text: 'ARK', className: 'border-rose-500/30 bg-rose-500/10 text-rose-300' }
+        xiaomi: { icon: xiaomiMiMoIcon, alt: '小米 MiMo', className: '' },
+        openai: { icon: openaiIcon, alt: 'OpenAI', className: '' },
+        deepseek: { icon: deepseekIcon, alt: 'DeepSeek', className: '' },
+        qwen: { icon: qwenIcon, alt: '阿里通义', className: '' },
+        gemini: { icon: geminiIcon, alt: 'Google Gemini', className: '' },
+        kimi: { icon: kimiIcon, alt: 'Moonshot Kimi', className: '' },
+        zhipu: { icon: zhipuIcon, alt: '智谱 GLM', className: '' },
+        volcengine: { icon: volcengineIcon, alt: '火山方舟', className: '' },
+        'aliyun-realtime-asr': { icon: alibabaCloudIcon, alt: '阿里实时 ASR', className: '' },
+        'tencent-realtime-asr': { icon: tencentCloudIcon, alt: '腾讯云实时 ASR', className: '' },
+        'iflytek-realtime-asr': { icon: iflytekCloudIcon, alt: '讯飞实时转写', className: '' }
     };
 
     /**
@@ -56,6 +84,7 @@
         if (isKnownVendorKey(props.vendorKey)) return vendorMarkConfigMap[props.vendorKey];
         return {
             text: props.label.trim().slice(0, 1).toUpperCase() || '自',
+            alt: props.label.trim() || '自定义模型',
             className: 'border-border bg-muted text-muted-foreground'
         };
     });

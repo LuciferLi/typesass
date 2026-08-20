@@ -4,21 +4,47 @@ export type ModelCapabilityType = 'asr' | 'text';
 /** 模型分组类型，与服务目录能力字段保持一致。 */
 export type ModelGroupType = ModelCapabilityType;
 
-/** 模型来源类型，用于区分厂商预设和自定义中转站。 */
+/** 模型来源类型，用于区分厂商模型和自定义中转站。 */
 export type ModelSourceType = 'vendor' | 'custom';
 
-/** 厂商预设键，用于添加模型时快速填充私有连接参数。 */
+/** 模型运行协议类型，用于让业务链路按 provider 分发而不是写死单一厂商。 */
+export type ModelProviderType =
+    | 'openai-compatible'
+    | 'aliyun-realtime-asr'
+    | 'tencent-realtime-asr'
+    | 'iflytek-realtime-asr';
+
+/** 厂商键，用于添加模型时限定官方模型列表和凭证说明。 */
 export type ModelVendorKey =
-    | 'xiaomi-asr'
-    | 'xiaomi-text'
+    | 'xiaomi'
     | 'openai'
     | 'deepseek'
     | 'qwen'
-    | 'qwen-asr'
     | 'gemini'
     | 'kimi'
     | 'zhipu'
-    | 'volcengine';
+    | 'volcengine'
+    | 'aliyun-realtime-asr'
+    | 'tencent-realtime-asr'
+    | 'iflytek-realtime-asr';
+
+/** 厂商模型键，用于在厂商内部选择官方支持的具体模型或规格。 */
+export type ModelPresetKey =
+    | 'mimo-v25'
+    | 'gpt-4o-mini'
+    | 'deepseek-chat'
+    | 'deepseek-reasoner'
+    | 'qwen-plus'
+    | 'qwen-turbo'
+    | 'gemini-25-flash'
+    | 'kimi-k3'
+    | 'glm-52'
+    | 'volcengine-endpoint'
+    | 'fun-asr-realtime'
+    | 'paraformer-realtime-v2'
+    | 'tencent-16k-zh'
+    | 'tencent-16k-zh-video'
+    | 'iflytek-rtasr-standard';
 
 /**
  * 安全模型目录项。
@@ -41,6 +67,10 @@ export interface ModelCatalogItemModel {
 export interface PrivateModelItemModel extends ModelCatalogItemModel {
     /** 供应商标识，用于管理页展示来源。 */
     provider: string;
+    /** 产品化厂商键；旧数据为空时按 provider 或自定义兜底。 */
+    vendorKey?: string;
+    /** 厂商内部模型键；旧数据为空时按 modelName 兜底。 */
+    modelKey?: string;
     /** 上游服务地址；仅由本机私有 IPC 返回。 */
     baseUrl: string;
     /** 上游模型名；仅由本机私有 IPC 返回。 */
@@ -63,6 +93,10 @@ export interface SavePrivateModelRequestModel {
     isDefault: boolean;
     /** 供应商标识。 */
     provider: string;
+    /** 产品化厂商键；用于管理页回显，不参与 sidecar 上游调用。 */
+    vendorKey?: string;
+    /** 厂商内部模型键；用于管理页回显，不参与 sidecar 上游调用。 */
+    modelKey?: string;
     /** 上游服务地址。 */
     baseUrl: string;
     /** 上游真实模型名。 */
@@ -86,12 +120,16 @@ export interface ModelFormModel {
     baseUrl: string;
     /** 上游真实模型名。 */
     model: string;
+    /** 运行协议标识；实时 ASR 会保留厂商 provider，普通模型使用 OpenAI Compatible。 */
+    provider: ModelProviderType;
     /** 上游 API Key；保存后写入本地模型 JSON 配置。 */
     apiKey?: string;
     /** 模型来源。 */
     source: ModelSourceType;
     /** 厂商预设键，自定义中转站为空。 */
     vendorKey: ModelVendorKey | '';
+    /** 厂商内部模型键，自定义中转站为空。 */
+    modelKey: ModelPresetKey | '';
     /** 用户备注。 */
     remark: string;
     /** 保存后是否启用。 */
@@ -110,9 +148,31 @@ export interface ModelTestResultModel {
     message: string;
 }
 
-/** 厂商预设模型，用于添加模型弹窗填充私有连接参数。 */
+/** 厂商下的模型预设，用于填充实际调用参数。 */
 export interface ModelVendorPresetModel {
-    /** 厂商预设键。 */
+    /** 厂商内部模型键。 */
+    key: ModelPresetKey;
+    /** 厂商展示名称。 */
+    label: string;
+    /** 厂商默认请求地址。 */
+    baseUrl: string;
+    /** 厂商默认上游模型名。 */
+    model: string;
+    /** 厂商模型对应的运行协议；未填写时默认为 OpenAI Compatible。 */
+    provider?: ModelProviderType;
+    /** 添加后展示名称。 */
+    modelName: string;
+    /** 面向用户的模型定位说明。 */
+    description: string;
+    /** 是否为当前厂商下默认推荐模型。 */
+    recommended?: boolean;
+    /** 模型暂未接入当前运行链路时为 true，仅用于产品路线展示。 */
+    comingSoon?: boolean;
+}
+
+/** 厂商配置，用于模型管理页生成厂商和模型两级选择。 */
+export interface ModelVendorOptionModel {
+    /** 厂商键。 */
     key: ModelVendorKey;
     /** 厂商展示名称。 */
     label: string;
@@ -120,12 +180,6 @@ export interface ModelVendorPresetModel {
     mark: string;
     /** 适用模型分组。 */
     group: ModelGroupType;
-    /** 厂商默认请求地址。 */
-    baseUrl: string;
-    /** 厂商默认上游模型名。 */
-    model: string;
-    /** 添加后展示名称。 */
-    modelName: string;
     /** API Key 输入提示。 */
     apiKeyPlaceholder: string;
     /** API Key 获取说明。 */
@@ -134,4 +188,6 @@ export interface ModelVendorPresetModel {
     apiKeyUrl: string;
     /** API Key 地址展示文案。 */
     apiKeyUrlLabel: string;
+    /** 厂商下可选模型列表。 */
+    models: ModelVendorPresetModel[];
 }

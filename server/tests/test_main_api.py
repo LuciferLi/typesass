@@ -380,7 +380,7 @@ async def test_tc_api_003_audio_and_text_success_contracts() -> None:
             json={
                 "modelId": "fake-text-id",
                 "mode": "polish",
-                "text": "12345678",
+                "text": "abcdefgh",
                 "audioDurationMs": 0,
             },
         )

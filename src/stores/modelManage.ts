@@ -53,7 +53,9 @@ function createPrivateModelRequest(form: ModelFormModel): SavePrivateModelReques
         capability: form.group,
         enabled: form.enabled,
         isDefault: form.isDefault,
-        provider: 'openai-compatible',
+        provider: form.provider,
+        vendorKey: form.vendorKey || undefined,
+        modelKey: form.modelKey || undefined,
         baseUrl: form.baseUrl,
         modelName: form.model,
         apiKey: form.apiKey || undefined
@@ -218,8 +220,10 @@ export const useModelManageStore = defineStore('modelManage', {
                 group: model.capability,
                 baseUrl: model.baseUrl,
                 model: model.modelName,
-                source: 'custom',
-                vendorKey: '',
+                provider: (model.provider || 'openai-compatible') as ModelFormModel['provider'],
+                source: model.vendorKey ? 'vendor' : 'custom',
+                vendorKey: (model.vendorKey || '') as ModelFormModel['vendorKey'],
+                modelKey: (model.modelKey || '') as ModelFormModel['modelKey'],
                 remark: model.provider,
                 enabled: changes.enabled ?? model.enabled,
                 isDefault: changes.isDefault ?? model.isDefault

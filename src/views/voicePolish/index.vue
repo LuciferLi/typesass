@@ -187,7 +187,7 @@
                     v-for="item in visibleHistory"
                     :key="item.id"
                     class="p-4">
-                    <div class="text-[12px] text-muted-foreground">{{ new Date(item.createdAt).toLocaleString() }}</div>
+                    <div class="text-[12px] text-muted-foreground">{{ formatHistoryCreatedAt(item.createdAt) }}</div>
                     <div class="mt-2 text-[13px] text-muted-foreground">原文：{{ item.sourceText }}</div>
                     <div class="mt-2 whitespace-pre-wrap text-[14px] font-semibold leading-6 text-foreground">
                         {{ item.outputText }}
@@ -281,6 +281,16 @@
     const permissionPromptOpen = ref(false);
     const shortcutDialogOpen = ref(false);
     const isClientRuntime = isTauriRuntime();
+    const historyTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    });
     const asrModels = computed(() => modelManageStore.enabledServiceModels('asr'));
     const textModels = computed(() => modelManageStore.enabledServiceModels('text'));
     const selectedAsrModelId = computed({
@@ -538,6 +548,25 @@
      */
     function handleOpenModelManage(): void {
         void router.push({ name: HubRouteName.ModelManage });
+    }
+
+    /**
+     * 格式化语音历史创建时间。
+     * 流程：兼容旧版毫秒/秒时间戳和新版 ISO 字符串，统一按北京时间展示。
+     * 参数：createdAt 为历史记录创建时间。
+     * 返回：用户可读的北京时间；无法解析时显示兜底文案。
+     * 边界：不展示 Invalid Date，避免历史脏数据直接暴露给用户。
+     */
+    function formatHistoryCreatedAt(createdAt: string): string {
+        if (!createdAt) return '时间未记录';
+        const normalizedCreatedAt = createdAt.trim();
+        const numericTimestamp = Number(normalizedCreatedAt);
+        const date =
+            Number.isFinite(numericTimestamp) && numericTimestamp > 0
+                ? new Date(numericTimestamp < 1_000_000_000_000 ? numericTimestamp * 1000 : numericTimestamp)
+                : new Date(normalizedCreatedAt);
+        if (Number.isNaN(date.getTime())) return '时间未记录';
+        return `${historyTimeFormatter.format(date)} 北京时间`;
     }
 
     /**

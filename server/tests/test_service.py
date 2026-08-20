@@ -179,8 +179,11 @@ async def test_tc_svc_004_text_modes_context_and_limits(
     bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        bodies.append(__import__("json").loads(request.content))
-        return httpx.Response(200, json=completion(" polished ", None))
+        body = __import__("json").loads(request.content)
+        bodies.append(body)
+        user_content = body["messages"][1]["content"]
+        content = "x" * 3000 if "原文：" + "x" * 3000 in user_content else " polished "
+        return httpx.Response(200, json=completion(content, None))
 
     settings = settings_factory(max_text_chars=3000)  # type: ignore[operator]
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -199,19 +202,74 @@ async def test_tc_svc_004_text_modes_context_and_limits(
         )
         first = await service.process_text(dictate, "req-1")
         second = await service.process_text(polish, "req-2")
-    assert first[0] == second[0] == "polished"
+    assert first[0] == "polished"
+    assert second[0] == "x" * 3000
     assert first[2] == second[2] == "fake-text-id"
     assert all(
         set(body) == {"model", "messages", "temperature", "max_completion_tokens"}
         for body in bodies
     )
-    assert "整理听写内容" in bodies[0]["messages"][0]["content"]
+    assert "保真整理" in bodies[0]["messages"][0]["content"]
+    assert "禁止总结、概括、扩写、脑补、删减关键信息" in bodies[0]["messages"][0]["content"]
+    assert "数字、数量、版本、否定、条件、因果、转折" in bodies[0]["messages"][0]["content"]
     assert bodies[0]["max_completion_tokens"] == 256
-    assert "润色文字" in bodies[1]["messages"][0]["content"]
+    assert "保真润色" in bodies[1]["messages"][0]["content"]
     assert "词典：术语" in bodies[1]["messages"][1]["content"]
     assert "上下文应用：editor" in bodies[1]["messages"][1]["content"]
     assert "风格要求：concise" in bodies[1]["messages"][1]["content"]
     assert bodies[1]["max_completion_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_tc_svc_004_text_fidelity_fallback_keeps_original(
+    settings_factory: object,
+) -> None:
+    """TC-SVC-004B 文本处理疑似丢失关键数字或过度压缩时回退原文。
+
+    流程：用 MockTransport 分别模拟模型漏掉版本号和把长口述压成短句，确认服务端返回原文而不是失真输出。
+    参数：``settings_factory`` 提供隔离模型目录。
+    返回：无；断言两类高风险失真均被兜底。
+    异常边界：兜底日志只记录长度与 requestId，不记录正文。
+    """
+
+    responses = iter(
+        [
+            completion("我今天发布了版本。", None),
+            completion("请帮我处理这个问题。", None),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    settings = settings_factory(max_text_chars=2000)  # type: ignore[operator]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = ModelService(settings, client)
+        number_source = "我今天发布了 0.1.21 版本，不是 0.1.20，用户下载时一定要看到新的版本号。"
+        compressed_source = (
+            "我现在最重要的是保持原意，因为如果最后输出出来的结果跟我说的完全都不一样，"
+            "那这个语音润色功能就没有意义了，只能修正标点和错别字。"
+        )
+        number_result = await service.process_text(
+            TextProcessRequest(
+                modelId="fake-text-id",
+                mode="dictate",
+                text=number_source,
+                audioDurationMs=0,
+            ),
+            "req-number",
+        )
+        compressed_result = await service.process_text(
+            TextProcessRequest(
+                modelId="fake-text-id",
+                mode="dictate",
+                text=compressed_source,
+                audioDurationMs=0,
+            ),
+            "req-compressed",
+        )
+    assert number_result[0] == number_source
+    assert compressed_result[0] == compressed_source
 
 
 @pytest.mark.parametrize(

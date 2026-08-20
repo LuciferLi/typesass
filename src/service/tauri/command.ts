@@ -29,6 +29,7 @@ import type {
     AppVoicePolishResponseModel,
     ProcessTextRequestModel,
     ProcessTextResponseModel,
+    ResultWindowPayloadModel,
     TranscribeRequestModel,
     TranscribeResponseModel,
     VoicePolishRunModeType
@@ -834,6 +835,28 @@ export async function runAppVoicePolish(
 }
 
 /**
+ * 停止当前 App 原生录音并进入转写。
+ * 流程：悬浮窗确认按钮通过桌面 IPC 设置录音停止信号，Rust 侧继续执行 ASR 和文本处理。
+ * 参数：无。
+ * 返回：原生侧当前状态文案。
+ * 异常：普通 Web、非语音窗口或没有可停止录音时透传原生错误。
+ */
+export async function stopAppVoiceRecording(): Promise<string> {
+    return invokeDesktop<string>('stop_app_voice_recording');
+}
+
+/**
+ * 取消当前 App 原生语音任务。
+ * 流程：悬浮窗取消按钮通过桌面 IPC 设置整链路取消信号，后台请求返回后会丢弃结果。
+ * 参数：无。
+ * 返回：原生侧当前状态文案。
+ * 异常：普通 Web、非语音窗口或取消失败时透传原生错误。
+ */
+export async function cancelAppVoiceTask(): Promise<string> {
+    return invokeDesktop<string>('cancel_app_voice_task');
+}
+
+/**
  * 读取本机私有模型安全元数据。
  * 流程：通过受限 Tauri IPC 读取配置；原生端只返回 hasApiKey，不返回密钥正文。
  * 参数：无。
@@ -917,8 +940,8 @@ export async function showResultWindow(text: string, reason: string, requiresAcc
  * 返回：最近结果；没有缓存时返回 null。
  * 异常：状态锁或 IPC 失败时透传错误。
  */
-export async function getLastResultWindowPayload(): Promise<{ text: string; reason: string } | null> {
-    return invokeDesktop<{ text: string; reason: string } | null>('get_last_result_window_payload');
+export async function getLastResultWindowPayload(): Promise<ResultWindowPayloadModel | null> {
+    return invokeDesktop<ResultWindowPayloadModel | null>('get_last_result_window_payload');
 }
 
 /**

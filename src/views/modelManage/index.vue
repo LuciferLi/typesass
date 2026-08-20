@@ -80,7 +80,7 @@
                     class="grid grid-cols-[minmax(0,1fr)_140px_280px] gap-4 px-4 py-4">
                     <div class="flex min-w-0 items-start gap-3">
                         <model-manage-vendor-mark
-                            :vendor-key="model.provider"
+                            :vendor-key="model.vendorKey || model.provider"
                             :label="model.displayName" />
                         <div class="min-w-0">
                             <div class="truncate text-[14px] font-medium text-foreground">{{ model.displayName }}</div>
@@ -90,7 +90,7 @@
                     </div>
                     <div class="flex items-start">
                         <div class="grid gap-2">
-                            <ui-badge variant="secondary">{{ model.provider || '自定义' }}</ui-badge>
+                            <ui-badge variant="secondary">{{ modelSourceLabel(model) }}</ui-badge>
                             <ui-badge
                                 v-if="model.isDefault"
                                 variant="outline">
@@ -262,6 +262,17 @@
     function modelRuntimeStatusLabel(model: PrivateModelItemModel): string {
         if (!model.hasApiKey) return '配置不完整';
         return model.enabled ? '已启用' : '已禁用';
+    }
+
+    /**
+     * 生成模型来源展示文案。
+     * 流程：优先使用产品化厂商键；旧数据没有厂商键时保留原 provider 文案，避免历史配置显示异常。
+     * 参数：model 为模型管理页脱敏模型元数据。
+     * 返回：来源短文案。
+     * 边界：只展示厂商标识，不展示上游地址或密钥。
+     */
+    function modelSourceLabel(model: PrivateModelItemModel): string {
+        return model.vendorKey || model.provider || '自定义';
     }
 
     /**

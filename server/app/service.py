@@ -1,8 +1,10 @@
 """目录驱动的 OpenAI-compatible 上游调用服务。"""
 
+import asyncio
 import base64
 import binascii
 import logging
+import re
 import time
 from typing import Dict, Literal, Tuple
 
@@ -21,6 +23,51 @@ ALLOWED_AUDIO_CONTENT_TYPES = {
     "audio/mp4",
     "audio/ogg",
 }
+CRITICAL_TOKEN_PATTERN = re.compile(
+    r"\d+(?:[.,:/-]\d+)*(?:%|％|ms|s|秒|分钟|小时|天|元|块|万|亿|GB|MB|KB)?",
+    re.IGNORECASE,
+)
+TEXT_FIDELITY_FALLBACK_MIN_CHARS = 30
+TEXT_FIDELITY_MIN_LENGTH_RATIO = 0.55
+
+
+def _critical_text_tokens(text: str) -> set[str]:
+    """提取文本保真兜底需要强制保留的关键数字类片段。
+
+    用途：捕获版本号、时间、数量、金额、百分比和单位数字，避免润色模型漏掉硬信息。
+    流程：使用固定正则匹配数字及紧邻单位，返回去重集合。
+    参数：``text`` 为原文或模型输出。
+    返回：关键数字类片段集合。
+    异常边界：不解析自然语言语义，不记录正文，避免兜底逻辑引入隐私日志。
+    """
+
+    return {match.group(0) for match in CRITICAL_TOKEN_PATTERN.finditer(text)}
+
+
+def _should_fallback_to_original_text(source_text: str, processed_text: str) -> bool:
+    """判断文本处理结果是否疑似丢失原意。
+
+    用途：在模型过度总结、删减或漏掉关键数字时回退 ASR 原文，优先保护用户原意。
+    流程：先拒绝空输出，再检查关键数字是否缺失，最后对较长文本做长度缩水保护。
+    参数：``source_text`` 为原始 ASR 或待润色文本，``processed_text`` 为模型输出。
+    返回：需要回退原文返回 true。
+    异常边界：只做保守启发式判断，不根据正文内容生成错误信息或日志。
+    """
+
+    normalized_source = source_text.strip()
+    normalized_processed = processed_text.strip()
+    if not normalized_processed:
+        return True
+    source_tokens = _critical_text_tokens(normalized_source)
+    if source_tokens and not source_tokens.issubset(
+        _critical_text_tokens(normalized_processed)
+    ):
+        return True
+    if len(normalized_source) < TEXT_FIDELITY_FALLBACK_MIN_CHARS:
+        return False
+    return len(normalized_processed) < int(
+        len(normalized_source) * TEXT_FIDELITY_MIN_LENGTH_RATIO
+    )
 
 
 class ModelService:
@@ -173,13 +220,25 @@ class ModelService:
         if any(len(item) > 100 for item in request.dictionary):
             raise ApiError(400, "INVALID_DICTIONARY", "词典单项长度超过限制。")
         if request.mode == "dictate":
-            mode_rule = "整理听写内容，删除无意义重复和语气词，保持原意。"
-        else:
-            mode_rule = "润色文字，使表达清晰自然，保持事实与原意。"
-        system_prompt = (
-            "你是中文文本处理助手。{0}只输出最终文本，不解释处理过程。".format(
-                mode_rule
+            mode_rule = (
+                "你正在处理语音转文字后的口述原文，目标是保真整理。"
+                "只修正明显错别字、标点、断句和轻微口语连接，让文字更易读。"
+                "必须完整保留原文中的事实、对象、动作、时间、地点、数字、数量、版本、否定、条件、因果、转折、限制和强调。"
+                "禁止总结、概括、扩写、脑补、删减关键信息、改变立场或把不确定内容改成确定表达。"
+                "如果某句话不够通顺但含义不明确，宁可保留原句。"
             )
+        else:
+            mode_rule = (
+                "你正在润色用户已经写好的文本，目标是保真润色。"
+                "只改善标点、错别字、语序和表达流畅度。"
+                "必须完整保留原文中的事实、对象、动作、时间、地点、数字、数量、版本、否定、条件、因果、转折、限制和强调。"
+                "禁止总结、概括、扩写、脑补、删减关键信息或改变原意。"
+                "如果无法确认用户意图，宁可保留原句。"
+            )
+        system_prompt = (
+            "你是中文文本保真处理助手。{0}"
+            "输出前逐项自查：是否遗漏数字、否定、条件、因果、转折或关键对象；如有遗漏，必须恢复。"
+            "只输出最终文本，不解释处理过程。".format(mode_rule)
         )
         context_lines = ["原文：{0}".format(text)]
         if request.dictionary:
@@ -196,12 +255,43 @@ class ModelService:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": "\n".join(context_lines)},
             ],
-            "temperature": 0.2,
-            "max_completion_tokens": min(4096, max(256, len(text) * 2)),
+            "temperature": 0.1,
+            "max_completion_tokens": min(4096, max(256, len(text) * 3)),
         }
         started_at = time.perf_counter()
-        response = await self._chat_completion(model, body, request_id)
+        if request.processing_timeout_ms is None:
+            response = await self._chat_completion(model, body, request_id)
+        else:
+            try:
+                response = await asyncio.wait_for(
+                    self._chat_completion(model, body, request_id),
+                    timeout=request.processing_timeout_ms / 1000,
+                )
+            except asyncio.TimeoutError as error:
+                logger.warning(
+                    "upstream_timeout",
+                    extra={
+                        "context": {
+                            "requestId": request_id,
+                            "timeoutMs": request.processing_timeout_ms,
+                        }
+                    },
+                )
+                raise ApiError(504, "UPSTREAM_TIMEOUT", "模型服务响应超时。") from error
         processed_text = self._message_text(response)
+        if _should_fallback_to_original_text(text, processed_text):
+            logger.warning(
+                "text_fidelity_fallback",
+                extra={
+                    "context": {
+                        "requestId": request_id,
+                        "mode": request.mode,
+                        "sourceChars": len(text),
+                        "processedChars": len(processed_text),
+                    }
+                },
+            )
+            processed_text = text
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         return processed_text, elapsed_ms, model.id
 

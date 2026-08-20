@@ -703,6 +703,13 @@ class TextProcessRequest(StrictRequestModel):
         max_length=2000,
         description="可选输出语气、长度或格式要求。",
     )
+    processing_timeout_ms: Optional[int] = Field(
+        alias="processingTimeoutMs",
+        default=None,
+        ge=1000,
+        le=30000,
+        description="可选单次文本处理超时毫秒数；语音快捷键等低等待场景可传入较短预算，省略时使用服务默认上游超时。",
+    )
 
 
 class TextProcessResponse(BaseModel):

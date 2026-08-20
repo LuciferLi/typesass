@@ -6,6 +6,7 @@ mod codex_desktop;
 mod desktop_error;
 mod private_models;
 mod private_rpc;
+mod realtime_asr;
 mod sidecar;
 mod task_store;
 mod web_server;
@@ -24,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
+use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -64,7 +66,7 @@ const DEFAULT_ASR_TEXT_SHORTCUT: &str = "ctrl+shift+d";
 const DEFAULT_DICTATE_SHORTCUT: &str = "ctrl+p";
 const DEFAULT_POLISH_SHORTCUT: &str = "ctrl+shift+p";
 const LOGIN_AGENT_LABEL: &str = "asia.aijob.aitool.login";
-const FLOAT_WINDOW_WIDTH: f64 = 132.0;
+const FLOAT_WINDOW_WIDTH: f64 = 280.0;
 const FLOAT_WINDOW_TOP: f64 = 60.0;
 const TOAST_WINDOW_WIDTH: f64 = 460.0;
 const TOAST_WINDOW_HEIGHT: f64 = 86.0;
@@ -158,11 +160,21 @@ const CODEX_CDP_THREAD_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
 /// Token 续签和清除 IPC 的稳定桌面错误码；统一入口会附加唯一诊断 ID，且不记录 Token 正文。
 const PUBLIC_API_TOKEN_IPC_ERROR_CODE: &str = "DESKTOP_OPERATION_FAILED";
 const PUBLIC_API_BASE_URL: &str = "http://127.0.0.1:18080";
-const APP_VOICE_RECORD_MAX_DURATION_MS: u64 = 30_000;
+/// 单次 App 原生录音最长时长。
+/// 说明：底层录音模块支持最长 120 秒；快捷键口述不应在用户长句中途 30 秒自动截断。
+const APP_VOICE_RECORD_MAX_DURATION_MS: u64 = 120_000;
+const APP_VOICE_RECORD_MIN_DURATION_MS: u64 = 800;
 const APP_VOICE_AUDIO_MAX_BYTES: usize = 25 * 1024 * 1024;
 const APP_VOICE_PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(65);
+/// 语音快捷键场景的 AI 润色等待上限。
+/// 说明：ASR 已经完成后，润色属于体验增强；上游文本模型慢或返回空时不应让用户长时间卡在处理中。
+const APP_VOICE_TEXT_PROCESS_TIMEOUT: Duration = Duration::from_secs(4);
 const APP_VOICE_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const APP_VOICE_TOKEN_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+const APP_VOICE_CANCELLED_MESSAGE: &str = "本次语音输入已取消。";
+const APP_VOICE_MIN_SPEECH_RMS_AMPLITUDE: f64 = 196.6;
+const APP_VOICE_MIN_SPEECH_PEAK_AMPLITUDE: i16 = 1_147;
+const APP_VOICE_MIN_SPEECH_FRAME_RATIO: f64 = 0.008;
 const VOICE_SHORTCUT_DEDUP_WINDOW: Duration = Duration::from_millis(800);
 const BROWSER_EXTENSION_ZIP_BYTES: &[u8] =
     include_bytes!("../../public/downloads/typesass-extension.zip");
@@ -327,8 +339,24 @@ struct RuntimePublicApiToken {
 struct RuntimeAppVoiceRecorder {
     /// 是否已有一次录音、识别或粘贴流程正在运行。
     running: Mutex<bool>,
+    /// 当前语音任务阶段，供快捷键和悬浮窗按钮判断是停止录音还是取消处理。
+    phase: Mutex<AppVoiceRunPhase>,
     /// 当前录音阶段的停止信号；第二次快捷键会置位该标记。
     stop_requested: Mutex<Option<Arc<AtomicBool>>>,
+    /// 当前整条语音链路的取消信号；悬浮窗 X 会置位该标记并丢弃后续结果。
+    cancel_requested: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// App 原生语音任务阶段。
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AppVoiceRunPhase {
+    /// 没有正在运行的语音任务。
+    #[default]
+    Idle,
+    /// 正在采集麦克风音频，可通过停止信号进入转写。
+    Recording,
+    /// 已停止录音，正在进行模型目录、ASR、润色或粘贴处理。
+    Processing,
 }
 
 /// 运行期间的语音快捷键短时间去重状态。
@@ -350,8 +378,14 @@ impl Drop for AppVoiceRunGuard {
         if let Ok(mut running) = state.running.lock() {
             *running = false;
         };
+        if let Ok(mut phase) = state.phase.lock() {
+            *phase = AppVoiceRunPhase::Idle;
+        };
         if let Ok(mut stop_requested) = state.stop_requested.lock() {
             *stop_requested = None;
+        };
+        if let Ok(mut cancel_requested) = state.cancel_requested.lock() {
+            *cancel_requested = None;
         };
     }
 }
@@ -364,6 +398,16 @@ struct FloatingVoiceStatePayload {
     phase: String,
     /// 面向用户的简短状态文案；悬浮窗主要用视觉表达，文案用于无障碍和 tooltip。
     message: String,
+}
+
+/// 悬浮录音窗实时音量事件载荷。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FloatingVoiceLevelPayload {
+    /// 归一化 RMS 音量，范围 0 到 1，用于驱动稳定波纹高度。
+    rms_level: f64,
+    /// 归一化峰值音量，范围 0 到 1，用于让强发声有更明显反馈。
+    peak_level: f64,
 }
 
 /// 私有模型连通性测试 IPC 响应。
@@ -1348,6 +1392,11 @@ fn local_config_updated_at() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+/// 生成当前 UTC ISO 时间字符串，用于业务历史记录的跨时区稳定展示。
+fn current_utc_iso_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
 /// 将系统时间转换为 Unix 毫秒时间戳。
 fn system_time_to_millis(value: SystemTime) -> Result<u128, String> {
     value
@@ -1803,6 +1852,8 @@ pub fn run() {
             play_native_interaction_sound,
             sync_tray_dictation_history,
             run_app_voice_polish,
+            stop_app_voice_recording,
+            cancel_app_voice_task,
             read_local_config_value,
             write_local_config_value,
             remove_local_config_value,
@@ -2015,12 +2066,22 @@ fn emit_hub_event(app: AppHandle, event: &'static str, payload: String) {
 
 /// 根据当前前台 App 计算快捷键录音行为；不主动恢复目标 App，避免录音流程切换焦点。
 fn resolve_voice_trigger_context(frontmost_app: &str) -> VoiceTriggerContext {
+    let raw_frontmost_app = frontmost_app.trim();
     let normalized_frontmost_app = normalize_target_app_name(frontmost_app);
-    if normalized_frontmost_app.is_empty() {
+    if normalized_frontmost_app.is_empty()
+        && matches!(raw_frontmost_app, "AiTool" | "CodexMan" | "ai-tool")
+    {
         return VoiceTriggerContext {
             target_app: String::new(),
             show_floating_window: false,
             keep_hub_visible: true,
+        };
+    }
+    if normalized_frontmost_app.is_empty() {
+        return VoiceTriggerContext {
+            target_app: String::new(),
+            show_floating_window: true,
+            keep_hub_visible: false,
         };
     }
     VoiceTriggerContext {
@@ -2030,17 +2091,14 @@ fn resolve_voice_trigger_context(frontmost_app: &str) -> VoiceTriggerContext {
     }
 }
 
-/// 根据当前前台 App 计算粘贴行为；有请求目标时必须与当前前台 App 一致，避免处理期间焦点漂移后误粘。
+/// 根据粘贴瞬间的当前前台 App 计算粘贴行为。
+/// 流程：语音输出只粘贴到用户当前正在操作的前台 App，不再绑定录音开始时的目标 App。
+/// 参数：requested_target_app 为历史兼容参数，当前仅用于签名兼容；frontmost_app 为粘贴瞬间系统前台 App。
+/// 返回：前台是外部 App 时作为目标；前台为空或 CodexMan 自身时拒绝自动粘贴。
+/// 异常/边界：不回退到录音开始目标，避免用户切换输入位置后仍粘到旧应用。
 fn resolve_paste_target(requested_target_app: &str, frontmost_app: &str) -> PasteTargetDecision {
-    let normalized_requested_app = normalize_target_app_name(requested_target_app);
+    let _ = requested_target_app;
     let normalized_frontmost_app = normalize_target_app_name(frontmost_app);
-    if !normalized_requested_app.is_empty() && normalized_requested_app != normalized_frontmost_app
-    {
-        return PasteTargetDecision {
-            target_app: String::new(),
-            should_hide_hub: false,
-        };
-    }
     if !normalized_frontmost_app.is_empty() {
         return PasteTargetDecision {
             target_app: normalized_frontmost_app,
@@ -2064,14 +2122,29 @@ fn should_refocus_requested_paste_target(
     !normalized_requested_app.is_empty() && normalized_requested_app == resolved_target_app
 }
 
-/// 判断是否允许在显式目标 App 未变化时绕过 AX 文本控件误判。
-/// ChatGPT、浏览器和部分 Electron WebView 的 DOM 焦点不会稳定映射为 AXTextArea，
-/// 此时只要目标 App 与录音开始时一致，就应继续发送系统粘贴，而不是误弹结果窗口。
+/// 判断录音开始目标与当前粘贴目标是否一致。
+/// 该判断只用于减少不必要的 App 重新激活；实际发送 Cmd+V 前仍以粘贴瞬间的前台 App 为准。
 fn should_trust_explicit_paste_target(
     requested_target_app: &str,
     resolved_target_app: &str,
 ) -> bool {
     should_refocus_requested_paste_target(requested_target_app, resolved_target_app)
+}
+
+/// 判断是否允许在系统没有暴露文本焦点时继续向当前前台 App 发送粘贴。
+/// 流程：只要粘贴目标与当前前台 App 一致，就允许发送一次系统粘贴指令。
+/// 参数：requested_target_app 为录音开始时目标 App，resolved_target_app 为当前粘贴目标，frontmost_app 为发起粘贴前的前台 App。
+/// 返回：允许时返回 true；目标为空或前台不一致时返回 false。
+/// 异常/边界：该兜底只解决 ChatGPT/浏览器富文本输入框 AX 角色缺失问题，不回退到录音开始目标。
+fn should_allow_unconfirmed_focus_paste(
+    requested_target_app: &str,
+    resolved_target_app: &str,
+    frontmost_app: &str,
+) -> bool {
+    let _ = requested_target_app;
+    let normalized_resolved = normalize_target_app_name(resolved_target_app);
+    let normalized_frontmost = normalize_target_app_name(frontmost_app);
+    !normalized_resolved.is_empty() && normalized_resolved == normalized_frontmost
 }
 
 /// 展示当前版本的更新状态；在线更新通道接入前不给用户虚假的升级入口。
@@ -2189,11 +2262,55 @@ async fn run_app_voice_polish(
 ) -> Result<AppVoicePolishResponse, String> {
     ensure_app_voice_window(window.label())?;
     let app = window.app_handle().clone();
+    let worker_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        run_app_voice_polish_core(&app, &mode, &target_app)
+        run_app_voice_polish_core(&worker_app, &mode, &target_app)
     })
     .await
     .map_err(|error| format!("执行 App 语音任务失败：{}", error))?
+    .map_err(|error| {
+        record_app_voice_pipeline_failure(&app, "app_voice_ipc", &error);
+        error
+    })
+}
+
+/// 停止当前 App 原生录音并进入转写。
+/// 流程：仅 hub/main 可调用；录音阶段置位采样停止信号，处理阶段只返回当前状态，避免误取消用户已经提交的音频。
+/// 参数：window 为触发窗口。
+/// 返回：用户可读状态文案。
+/// 异常/边界：没有录音任务时返回明确提示，不启动新任务。
+#[tauri::command]
+fn stop_app_voice_recording(window: tauri::WebviewWindow) -> Result<String, String> {
+    ensure_app_voice_window(window.label())?;
+    let app = window.app_handle().clone();
+    if request_app_voice_recording_stop(&app) {
+        emit_floating_voice_state(&app, "stopping", "正在停止录音并准备转文字。");
+        return Ok("正在停止录音并准备转文字。".to_string());
+    }
+    if is_app_voice_running(&app) {
+        emit_floating_voice_state(&app, "processing", "上一段语音正在处理中，请稍候。");
+        return Ok("上一段语音正在处理中，请稍候。".to_string());
+    }
+    Ok("当前没有正在录音的语音输入。".to_string())
+}
+
+/// 取消当前 App 原生语音任务。
+/// 流程：录音阶段同时停止采样，处理阶段置位取消信号并立即隐藏悬浮窗；后台请求返回后会丢弃结果。
+/// 参数：window 为触发窗口。
+/// 返回：用户可读状态文案。
+/// 异常/边界：取消无法强杀已经提交的 HTTP 请求，但可保证不写历史、不粘贴、不展示旧结果。
+#[tauri::command]
+fn cancel_app_voice_task(window: tauri::WebviewWindow) -> Result<String, String> {
+    ensure_app_voice_window(window.label())?;
+    let app = window.app_handle().clone();
+    if request_app_voice_cancellation(&app) {
+        emit_hub_notice(&app, APP_VOICE_CANCELLED_MESSAGE, "idle");
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.hide();
+        }
+        return Ok(APP_VOICE_CANCELLED_MESSAGE.to_string());
+    }
+    Ok("当前没有正在运行的语音输入。".to_string())
 }
 
 /// 校验 App 原生语音入口窗口。
@@ -2220,34 +2337,34 @@ fn run_app_voice_polish_core(
 ) -> Result<AppVoicePolishResponse, String> {
     let normalized_mode = normalize_app_voice_mode(mode)?;
     let stop_requested = Arc::new(AtomicBool::new(false));
-    let _guard = begin_app_voice_run(app, Arc::clone(&stop_requested))?;
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    let _guard = begin_app_voice_run(
+        app,
+        Arc::clone(&stop_requested),
+        Arc::clone(&cancel_requested),
+    )?;
     let normalized_target_app = normalize_target_app_name(target_app);
-    emit_floating_voice_state(app, "preparing", "正在准备录音，出现录音状态后再开始说话。");
-    emit_hub_notice(app, "正在录音，请稍后。", "running");
-    ensure_microphone_access_for_voice()?;
-
-    emit_floating_voice_state(app, "recording", "正在录音，再按一次快捷键停止。");
-    let audio = app_audio::record_microphone_wav(APP_VOICE_RECORD_MAX_DURATION_MS, stop_requested)?;
-    clear_app_voice_recording_stop(app);
     append_shortcut_diagnostic(
         app,
         &format!(
-            "voice audio captured duration_ms={} bytes={} samples={} peak={} rms={:.2} active_ratio={:.4} stopped_by_request={}",
-            audio.duration_ms,
-            audio.bytes.len(),
-            audio.diagnostics.sample_count,
-            audio.diagnostics.peak_amplitude,
-            audio.diagnostics.rms_amplitude,
-            audio.diagnostics.active_sample_ratio,
-            audio.diagnostics.stopped_by_request
+            "voice pipeline started mode={} target_app={}",
+            normalized_mode, normalized_target_app
         ),
     );
-    if audio.bytes.len() > APP_VOICE_AUDIO_MAX_BYTES {
-        return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
-    }
-
+    emit_floating_voice_state(app, "preparing", "正在准备录音，出现录音状态后再开始说话。");
+    emit_hub_notice(app, "正在录音，请稍后。", "running");
+    append_shortcut_diagnostic(app, "voice microphone permission checking");
+    ensure_microphone_access_for_voice()?;
+    append_shortcut_diagnostic(app, "voice microphone permission ready");
+    let previous_system_mute_state = Arc::new(Mutex::new(None::<bool>));
+    emit_floating_voice_state(app, "preparing", "正在检查模型配置。");
+    append_shortcut_diagnostic(app, "voice native model catalog loading");
     let mut persisted = read_voice_polish_persisted_state(app)?;
-    let catalog = request_public_api_json::<Vec<PublicModelCatalogItem>>(app, "/v1/models", None)?;
+    let catalog = list_app_voice_public_model_catalog(app)?;
+    append_shortcut_diagnostic(
+        app,
+        &format!("voice native model catalog loaded count={}", catalog.len()),
+    );
     let asr_selection = resolve_app_voice_model_selection(
         app,
         &catalog,
@@ -2270,22 +2387,276 @@ fn run_app_voice_polish_core(
     if let Some(selection) = text_selection.as_ref() {
         persisted.text_model_id = selection.model_id.clone();
     }
+    let asr_runtime_model = private_models::get_private_model_runtime(
+        app,
+        &asr_selection.model_id,
+        private_models::PrivateModelCapability::Asr,
+    )?;
+    append_shortcut_diagnostic(
+        app,
+        &format!(
+            "voice asr model selected provider={} model={} realtime={}",
+            asr_runtime_model.provider,
+            asr_runtime_model.model_name,
+            realtime_asr::is_realtime_asr_provider(&asr_runtime_model.provider)
+        ),
+    );
+    let mut realtime_asr_session =
+        if realtime_asr::is_realtime_asr_provider(&asr_runtime_model.provider) {
+            emit_floating_voice_state(app, "preparing", "正在连接实时语音识别服务。");
+            append_shortcut_diagnostic(
+                app,
+                &format!(
+                    "voice realtime asr session starting provider={} model={}",
+                    asr_runtime_model.provider, asr_runtime_model.model_name
+                ),
+            );
+            let partial_app = app.clone();
+            let diagnostic_app = app.clone();
+            Some(realtime_asr::start_realtime_asr_session(
+                asr_runtime_model.clone(),
+                Some(Arc::new(move |text| {
+                    let normalized = text.trim();
+                    if !normalized.is_empty() {
+                        emit_floating_voice_state(
+                            &partial_app,
+                            "recording",
+                            &format!("正在识别：{}", normalized),
+                        );
+                    }
+                })),
+                Some(Arc::new(move |message| {
+                    append_shortcut_diagnostic(&diagnostic_app, &message);
+                })),
+            )?)
+        } else {
+            None
+        };
+    if realtime_asr_session.is_some() {
+        append_shortcut_diagnostic(app, "voice realtime asr session ready");
+    }
+
+    emit_floating_voice_state(
+        app,
+        "preparing",
+        "正在预热麦克风，出现录音状态后再开始说话。",
+    );
+    let level_app = app.clone();
+    let ready_app = app.clone();
+    let mute_state = Arc::clone(&previous_system_mute_state);
+    let audio_result = app_audio::record_microphone_wav_with_pcm_callback(
+        APP_VOICE_RECORD_MAX_DURATION_MS,
+        stop_requested,
+        Some(Arc::new(move |level| {
+            emit_floating_voice_level(&level_app, level.rms_level, level.peak_level);
+        })),
+        Some(Arc::new(move || {
+            append_shortcut_diagnostic(&ready_app, "voice audio first frame ready");
+            play_app_voice_interaction_sound(&ready_app, "start");
+            mute_app_voice_system_output_for_recording(&ready_app, &mute_state);
+            emit_floating_voice_state(&ready_app, "recording", "正在录音，再按一次快捷键停止。");
+        })),
+        realtime_asr_session
+            .as_ref()
+            .map(|session| Arc::clone(&session.pcm_callback)),
+    );
+    clear_app_voice_recording_stop(app);
+    restore_app_voice_system_output(app, &previous_system_mute_state);
+    let audio = match audio_result {
+        Ok(audio) => audio,
+        Err(error) => {
+            append_shortcut_diagnostic(
+                app,
+                &format!(
+                    "voice audio recording failed {}",
+                    trim_error_message(&error)
+                ),
+            );
+            if let Some(session) = realtime_asr_session.take() {
+                append_shortcut_diagnostic(
+                    app,
+                    &format!(
+                        "voice audio recording failed, realtime asr cleanup starting {}",
+                        trim_error_message(&error)
+                    ),
+                );
+                match session.finish() {
+                    Ok(result) => append_shortcut_diagnostic(
+                        app,
+                        &format!(
+                            "voice realtime asr cleanup finished text_chars={}",
+                            result.text.chars().count()
+                        ),
+                    ),
+                    Err(session_error) => append_shortcut_diagnostic(
+                        app,
+                        &format!(
+                            "voice realtime asr cleanup failed {}",
+                            trim_error_message(&session_error)
+                        ),
+                    ),
+                }
+            }
+            return Err(error);
+        }
+    };
+    play_app_voice_interaction_sound(app, "stop");
+    ensure_app_voice_not_cancelled(&cancel_requested)?;
+    append_shortcut_diagnostic(
+        app,
+        &format!(
+            "voice audio captured device={} sample_rate={} channels={} format={} duration_ms={} bytes={} samples={} peak={} rms={:.2} active_ratio={:.4} auto_gain_max={:.2} auto_gain_avg={:.2} stopped_by_request={}",
+            audio.diagnostics.device_name,
+            audio.diagnostics.sample_rate,
+            audio.diagnostics.channel_count,
+            audio.diagnostics.sample_format,
+            audio.duration_ms,
+            audio.bytes.len(),
+            audio.diagnostics.sample_count,
+            audio.diagnostics.peak_amplitude,
+            audio.diagnostics.rms_amplitude,
+            audio.diagnostics.active_sample_ratio,
+            audio.diagnostics.max_auto_gain,
+            audio.diagnostics.average_auto_gain,
+            audio.diagnostics.stopped_by_request
+        ),
+    );
+    if audio.bytes.len() > APP_VOICE_AUDIO_MAX_BYTES {
+        if let Some(session) = realtime_asr_session.take() {
+            let _ = session.finish();
+        }
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice audio rejected reason=file_too_large bytes={} max_bytes={}",
+                audio.bytes.len(),
+                APP_VOICE_AUDIO_MAX_BYTES
+            ),
+        );
+        return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
+    }
+    if audio.duration_ms < APP_VOICE_RECORD_MIN_DURATION_MS {
+        if let Some(session) = realtime_asr_session.take() {
+            let _ = session.finish();
+        }
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice audio rejected reason=too_short duration_ms={} min_duration_ms={}",
+                audio.duration_ms, APP_VOICE_RECORD_MIN_DURATION_MS
+            ),
+        );
+        emit_floating_voice_state(app, "error", "录音太短了，请说完一句话后再停止。");
+        return Err("录音太短了，请说完一句话后再停止。".to_string());
+    }
+    if !has_app_voice_speech_like_audio(&audio.diagnostics) && realtime_asr_session.is_none() {
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice batch audio skipped before asr due to low speech signal peak={} rms={:.2} active_ratio={:.4}",
+                audio.diagnostics.peak_amplitude,
+                audio.diagnostics.rms_amplitude,
+                audio.diagnostics.active_sample_ratio
+            ),
+        );
+        emit_floating_voice_state(app, "error", "没有检测到有效语音，本次不会转文字。");
+        return Err("没有检测到有效语音，本次不会转文字。".to_string());
+    }
+    if !has_app_voice_speech_like_audio(&audio.diagnostics) && realtime_asr_session.is_some() {
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice realtime asr low local speech signal, defer to provider final text peak={} rms={:.2} active_ratio={:.4}",
+                audio.diagnostics.peak_amplitude,
+                audio.diagnostics.rms_amplitude,
+                audio.diagnostics.active_sample_ratio
+            ),
+        );
+    }
+
+    set_app_voice_phase(app, AppVoiceRunPhase::Processing);
+    ensure_app_voice_not_cancelled(&cancel_requested)?;
 
     emit_floating_voice_state(app, "transcribing", "正在转文字。");
     emit_hub_notice(app, "正在识别语音。", "running");
-    let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio.bytes);
-    let transcribed = request_public_api_json::<AppVoiceTranscribeResponse>(
-        app,
-        "/v1/audio/transcriptions",
-        Some(json!({
-            "modelId": asr_selection.model_id,
-            "audioBase64": audio_base64,
-            "contentType": audio.content_type,
-            "language": "auto"
-        })),
-    )?;
+    let transcribed = if let Some(session) = realtime_asr_session.take() {
+        append_shortcut_diagnostic(app, "voice realtime asr finish requested");
+        let realtime_result = session.finish().map_err(|error| {
+            append_shortcut_diagnostic(
+                app,
+                &format!(
+                    "voice realtime asr finish failed {}",
+                    trim_error_message(&error)
+                ),
+            );
+            error
+        })?;
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice realtime asr finish succeeded text_chars={}",
+                realtime_result.text.chars().count()
+            ),
+        );
+        AppVoiceTranscribeResponse {
+            text: realtime_result.text,
+        }
+    } else {
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice batch asr request started model_id={} content_type={} audio_bytes={}",
+                asr_selection.model_id,
+                audio.content_type,
+                audio.bytes.len()
+            ),
+        );
+        let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&audio.bytes);
+        let batch_result = request_public_api_json::<AppVoiceTranscribeResponse>(
+            app,
+            "/v1/audio/transcriptions",
+            Some(json!({
+                "modelId": asr_selection.model_id,
+                "audioBase64": audio_base64,
+                "contentType": audio.content_type,
+                "language": "auto"
+            })),
+        );
+        match batch_result {
+            Ok(response) => {
+                append_shortcut_diagnostic(
+                    app,
+                    &format!(
+                        "voice batch asr request succeeded text_chars={}",
+                        response.text.trim().chars().count()
+                    ),
+                );
+                response
+            }
+            Err(error) => {
+                append_shortcut_diagnostic(
+                    app,
+                    &format!(
+                        "voice batch asr request failed {}",
+                        trim_error_message(&error)
+                    ),
+                );
+                return Err(error);
+            }
+        }
+    };
+    ensure_app_voice_not_cancelled(&cancel_requested)?;
     let source_text = transcribed.text.trim().to_string();
     if source_text.is_empty() {
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice asr returned empty text peak={} rms={:.2} active_ratio={:.4}",
+                audio.diagnostics.peak_amplitude,
+                audio.diagnostics.rms_amplitude,
+                audio.diagnostics.active_sample_ratio
+            ),
+        );
         if is_app_voice_audio_effectively_silent(&audio.diagnostics) {
             return Err(
                 "CodexMan 已开始录音，但麦克风几乎没有收到声音。请确认系统输入设备、麦克风音量和当前麦克风开关后重试。"
@@ -2295,6 +2666,7 @@ fn run_app_voice_polish_core(
         return Err("没有识别到有效语音内容，请靠近麦克风后重试。".to_string());
     }
 
+    let mut transcription_fallback_reason = String::new();
     let output_text = if let Some(selection) = text_selection {
         emit_floating_voice_state(app, "polishing", "正在整理文字。");
         emit_hub_notice(app, "正在润色文本。", "running");
@@ -2304,7 +2676,7 @@ fn run_app_voice_polish_core(
             .map(|item| item.word.trim().to_string())
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
-        let processed = request_public_api_json::<AppVoiceProcessResponse>(
+        let process_result = request_public_api_json_with_timeout::<AppVoiceProcessResponse>(
             app,
             "/v1/text/process",
             Some(json!({
@@ -2314,16 +2686,57 @@ fn run_app_voice_polish_core(
                 "audioDurationMs": audio.duration_ms,
                 "dictionary": dictionary,
                 "contextApp": normalized_target_app,
-                "styleInstruction": persisted.style_instruction
+                "styleInstruction": persisted.style_instruction,
+                "processingTimeoutMs": APP_VOICE_TEXT_PROCESS_TIMEOUT.as_millis()
             })),
-        )?;
-        processed.processed_text.trim().to_string()
+            APP_VOICE_TEXT_PROCESS_TIMEOUT,
+        );
+        ensure_app_voice_not_cancelled(&cancel_requested)?;
+        match process_result {
+            Ok(processed) => {
+                let processed_text = processed.processed_text.trim().to_string();
+                if processed_text.is_empty() {
+                    transcription_fallback_reason = "AI 润色返回为空".to_string();
+                    append_shortcut_diagnostic(
+                        app,
+                        "voice text process returned empty text, falling back to transcription",
+                    );
+                    source_text.clone()
+                } else {
+                    append_shortcut_diagnostic(
+                        app,
+                        &format!(
+                            "voice text process succeeded text_chars={}",
+                            processed_text.chars().count()
+                        ),
+                    );
+                    processed_text
+                }
+            }
+            Err(error) => {
+                transcription_fallback_reason = if is_public_api_empty_result_error(&error) {
+                    "AI 润色返回为空".to_string()
+                } else {
+                    trim_error_message(&error)
+                };
+                append_shortcut_diagnostic(
+                    app,
+                    &format!(
+                        "voice text process failed, falling back to transcription {}",
+                        trim_error_message(&error)
+                    ),
+                );
+                source_text.clone()
+            }
+        }
     } else {
         source_text.clone()
     };
+    ensure_app_voice_not_cancelled(&cancel_requested)?;
     if output_text.is_empty() {
         return Err("语音处理结果为空，请调整模型配置后重试。".to_string());
     }
+    ensure_app_voice_not_cancelled(&cancel_requested)?;
 
     let history_item = VoicePolishHistoryItem {
         id: format!(
@@ -2333,12 +2746,39 @@ fn run_app_voice_polish_core(
         source_text: source_text.clone(),
         output_text: output_text.clone(),
         context_app: normalized_target_app.clone(),
-        created_at: local_config_updated_at(),
+        created_at: current_utc_iso_timestamp(),
     };
     persisted.history.insert(0, history_item);
     persisted.history.truncate(80);
     write_voice_polish_persisted_state(app, &persisted)?;
     sync_native_dictation_history(app, &persisted.history);
+    append_shortcut_diagnostic(
+        app,
+        &format!(
+            "voice history saved mode={} source_chars={} output_chars={} history_count={}",
+            normalized_mode,
+            source_text.chars().count(),
+            output_text.chars().count(),
+            persisted.history.len()
+        ),
+    );
+
+    if !transcription_fallback_reason.is_empty() && normalized_mode == "polish" {
+        let fallback_message = format_app_voice_ai_fallback_message(&transcription_fallback_reason);
+        let result_state = app.state::<RuntimeResult>();
+        show_result_window_core(app, &result_state, &output_text, &fallback_message, false)?;
+        emit_floating_voice_state(app, "error", &fallback_message);
+        emit_hub_notice(app, &fallback_message, "error");
+        return Ok(AppVoicePolishResponse {
+            source_text,
+            output_text,
+            mode: normalized_mode,
+            context_app: normalized_target_app,
+            audio_duration_ms: audio.duration_ms,
+            paste: None,
+            message: fallback_message,
+        });
+    }
 
     let paste = if normalized_target_app.is_empty() {
         None
@@ -2365,6 +2805,16 @@ fn run_app_voice_polish_core(
     };
     emit_floating_voice_state(app, "success", completed_message);
     emit_hub_notice(app, completed_message, "success");
+    append_shortcut_diagnostic(
+        app,
+        &format!(
+            "voice pipeline completed mode={} duration_ms={} source_chars={} output_chars={}",
+            normalized_mode,
+            audio.duration_ms,
+            source_text.chars().count(),
+            output_text.chars().count()
+        ),
+    );
 
     Ok(AppVoicePolishResponse {
         source_text,
@@ -2378,13 +2828,114 @@ fn run_app_voice_polish_core(
 }
 
 /// 判断本次 App 原生录音是否接近静音。
-/// 流程：同时检查峰值、RMS 和有效样本占比，避免单个噪点把静音误判成有人声。
+/// 流程：同时检查峰值和 RMS；有效样本占比只作为日志诊断，不作为静音硬条件，避免短句被误判。
 /// 参数：diagnostics 为录音阶段生成的波形统计。
 /// 返回：明显低于正常人声音量时返回 true。
 /// 异常/边界：该判断只用于改善 ASR 空结果提示，不会阻止有波形的音频送往模型。
 fn is_app_voice_audio_effectively_silent(diagnostics: &app_audio::AppAudioDiagnostics) -> bool {
-    diagnostics.active_sample_ratio < 0.02
-        || (diagnostics.peak_amplitude < 800 && diagnostics.rms_amplitude < 80.0)
+    diagnostics.peak_amplitude < 800 && diagnostics.rms_amplitude < 80.0
+}
+
+/// 判断录音是否具备旧静态页一致的人声特征。
+/// 流程：同时检查 RMS、峰值和有效采样比例，三项都达标才允许进入 ASR，避免空音频或纯底噪触发模型幻觉。
+/// 参数：diagnostics 为录音阶段生成的波形统计，阈值由旧版 Float32 录音门禁等比例换算到 i16 PCM。
+/// 返回：具备可识别人声特征时返回 true。
+/// 异常/边界：短句但确实有峰值和有效采样的录音仍可通过；底噪、静音或误触过短会在调用方给出明确提示。
+fn has_app_voice_speech_like_audio(diagnostics: &app_audio::AppAudioDiagnostics) -> bool {
+    diagnostics.rms_amplitude >= APP_VOICE_MIN_SPEECH_RMS_AMPLITUDE
+        && diagnostics.peak_amplitude >= APP_VOICE_MIN_SPEECH_PEAK_AMPLITUDE
+        && diagnostics.active_sample_ratio >= APP_VOICE_MIN_SPEECH_FRAME_RATIO
+}
+
+/// 判断错误是否属于用户可自行恢复的录音门禁提示。
+/// 流程：只匹配 App 原生录音前置校验产生的稳定文案，避免把模型、网络或权限错误误当普通提示吞掉。
+/// 参数：error 为主流程返回的错误文案。
+/// 返回：属于最短录音或无人声门禁时返回 true。
+/// 异常/边界：权限缺失、服务异常、模型异常仍走桌面错误记录，方便后续排查。
+fn is_app_voice_user_recording_gate_error(error: &str) -> bool {
+    matches!(
+        error,
+        "录音太短了，请说完一句话后再停止。" | "没有检测到有效语音，本次不会转文字。"
+    )
+}
+
+/// 记录 App 原生语音任务最终失败原因。
+/// 流程：把已经脱敏的错误写入本机诊断日志，并对非用户门禁错误写入桌面错误记录。
+/// 参数：app 为 Tauri 句柄，context 为触发入口，error 为稳定错误文案。
+/// 返回：桌面错误记录生成的用户可见文案；用户录音门禁错误直接返回原文。
+/// 异常/边界：不会记录原始音频、API Key、Token 或上游完整响应体。
+fn record_app_voice_pipeline_failure(app: &tauri::AppHandle, context: &str, error: &str) -> String {
+    let trimmed_error = trim_error_message(error);
+    append_shortcut_diagnostic(
+        app,
+        &format!(
+            "voice pipeline failed context={} error={}",
+            context, trimmed_error
+        ),
+    );
+    if error == APP_VOICE_CANCELLED_MESSAGE || is_app_voice_user_recording_gate_error(error) {
+        return error.to_string();
+    }
+    desktop_error::record_desktop_error(app, "APP_VOICE_PIPELINE_FAILED", context, None, error)
+}
+
+/// 读取 App 原生语音可用模型目录。
+/// 流程：直接读取 Rust 本机私有模型公共目录，而不是 sidecar `/v1/models`；实时 ASR 不注入 sidecar，但仍必须能被 App 原生录音选择。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：复用语音模型选择逻辑所需的安全目录项。
+/// 异常/边界：只返回不含密钥、上游地址和原始凭证的字段；JSON 损坏时显式失败。
+fn list_app_voice_public_model_catalog(
+    app: &tauri::AppHandle,
+) -> Result<Vec<PublicModelCatalogItem>, String> {
+    private_models::list_public_model_catalog(app).map(|records| {
+        records
+            .into_iter()
+            .map(|record| PublicModelCatalogItem {
+                id: record.id,
+                display_name: record.display_name,
+                capability: match record.capability {
+                    private_models::PrivateModelCapability::Asr => "asr".to_string(),
+                    private_models::PrivateModelCapability::Text => "text".to_string(),
+                },
+                enabled: record.enabled,
+                is_default: record.is_default,
+            })
+            .collect()
+    })
+}
+
+/// 整理 App 原生口述润色失败时的用户提示。
+/// 流程：区分超时、空结果和普通失败，统一说明本次不会自动粘贴，只展示 ASR 原文并保存历史，方便用户确认或后续重试。
+/// 参数：reason 为文本处理接口返回的安全错误文案或本地降级原因。
+/// 返回：可展示在结果窗口和 Hub 通知中的完整文案。
+/// 异常/边界：空原因使用通用兜底文案，避免用户只看到“失败”但不知道原文是否保留。
+fn format_app_voice_ai_fallback_message(reason: &str) -> String {
+    let normalized_reason = reason.trim();
+    let lower_reason = normalized_reason.to_lowercase();
+    if lower_reason.contains("timeout")
+        || lower_reason.contains("timed out")
+        || lower_reason.contains("deadline")
+        || normalized_reason.contains("超时")
+    {
+        return "AI 润色超时，本次已展示 ASR 原文并保存到历史记录，可在结果窗口或历史记录中重试。"
+            .to_string();
+    }
+    if normalized_reason.is_empty() {
+        return "AI 润色未产出可用内容，本次已展示 ASR 原文并保存到历史记录，可在结果窗口或历史记录中重试。".to_string();
+    }
+    format!(
+        "AI 润色未完成，本次已展示 ASR 原文并保存到历史记录，可在结果窗口或历史记录中重试。原因：{}",
+        normalized_reason
+    )
+}
+
+/// 判断公共模型接口是否属于可降级的空结果错误。
+/// 流程：基于本机 API 统一错误码和用户文案识别空响应；仅用于 ASR 已成功后的文本润色降级。
+/// 参数：error 为公共 API 已脱敏后的错误文案。
+/// 返回：属于空结果时返回 true。
+/// 异常/边界：网络、鉴权、模型配置和格式错误不降级，避免掩盖真实故障。
+fn is_public_api_empty_result_error(error: &str) -> bool {
+    error.contains("UPSTREAM_EMPTY_RESULT") || error.contains("模型服务返回空结果")
 }
 
 /// 归一化 App 原生语音模式。
@@ -2409,6 +2960,7 @@ fn normalize_app_voice_mode(mode: &str) -> Result<String, String> {
 fn begin_app_voice_run(
     app: &tauri::AppHandle,
     stop_requested: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
 ) -> Result<AppVoiceRunGuard, String> {
     let state = app.state::<RuntimeAppVoiceRecorder>();
     let mut running = state
@@ -2420,11 +2972,23 @@ fn begin_app_voice_run(
     }
     *running = true;
     drop(running);
+    let mut phase = state
+        .phase
+        .lock()
+        .map_err(|_| "写入语音任务阶段失败：状态锁已损坏".to_string())?;
+    *phase = AppVoiceRunPhase::Recording;
+    drop(phase);
     let mut stored_stop = state
         .stop_requested
         .lock()
         .map_err(|_| "写入录音停止信号失败：状态锁已损坏".to_string())?;
     *stored_stop = Some(stop_requested);
+    drop(stored_stop);
+    let mut stored_cancel = state
+        .cancel_requested
+        .lock()
+        .map_err(|_| "写入语音取消信号失败：状态锁已损坏".to_string())?;
+    *stored_cancel = Some(cancel_requested);
     Ok(AppVoiceRunGuard { app: app.clone() })
 }
 
@@ -2456,6 +3020,49 @@ fn clear_app_voice_recording_stop(app: &tauri::AppHandle) {
     };
 }
 
+/// 更新当前 App 原生语音阶段。
+/// 流程：仅修改运行期阶段标记，不影响并发门禁；快捷键和悬浮窗按钮会据此区分停止与处理中。
+/// 参数：app 为 Tauri 句柄，phase 为目标阶段。
+/// 返回：无。
+/// 异常/边界：锁损坏时忽略，主链路仍按运行门禁保护。
+fn set_app_voice_phase(app: &tauri::AppHandle, phase: AppVoiceRunPhase) {
+    let state = app.state::<RuntimeAppVoiceRecorder>();
+    if let Ok(mut stored_phase) = state.phase.lock() {
+        *stored_phase = phase;
+    };
+}
+
+/// 请求取消当前 App 原生语音任务。
+/// 流程：设置整链路取消标记；如果仍在录音阶段，同时设置停止采样标记，让录音循环尽快退出。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：首次成功置位取消信号时为 true。
+/// 异常/边界：处理阶段的 HTTP 请求无法同步强制中断，但返回后会被取消标记拦截。
+fn request_app_voice_cancellation(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<RuntimeAppVoiceRecorder>();
+    let Ok(cancel_requested) = state.cancel_requested.lock() else {
+        return false;
+    };
+    let Some(cancel_flag) = cancel_requested.as_ref() else {
+        return false;
+    };
+    let changed = !cancel_flag.swap(true, Ordering::AcqRel);
+    drop(cancel_requested);
+    let _ = request_app_voice_recording_stop(app);
+    changed
+}
+
+/// 检查当前语音任务是否已被用户取消。
+/// 流程：读取取消标记；一旦被取消，后续 ASR、润色、历史写入和粘贴都会短路。
+/// 参数：cancel_requested 为本次语音任务私有取消标记。
+/// 返回：未取消时为空。
+/// 异常/边界：取消以稳定错误文案向上冒泡，由快捷键入口识别后静默收尾。
+fn ensure_app_voice_not_cancelled(cancel_requested: &Arc<AtomicBool>) -> Result<(), String> {
+    if cancel_requested.load(Ordering::Acquire) {
+        return Err(APP_VOICE_CANCELLED_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
 /// 读取当前是否存在 App 原生语音流程。
 /// 流程：只读运行态门禁，供快捷键决定是开始还是停止录音。
 /// 参数：app 为 Tauri 句柄。
@@ -2478,6 +3085,34 @@ fn emit_floating_voice_state(app: &tauri::AppHandle, phase: &str, message: &str)
             FloatingVoiceStatePayload {
                 phase: phase.to_string(),
                 message: message.to_string(),
+            },
+        );
+    }
+}
+
+/// 向悬浮录音窗发送旧版轻微抖动反馈。
+/// 流程：当快捷键已收到但当前处于准备、录音停止或处理状态时，仅提示 UI 做一次 softNudge 动画。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：无。
+/// 异常/边界：窗口不存在或事件发送失败时忽略，不影响录音状态机。
+fn emit_floating_voice_nudge(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("floating-voice-nudge", ());
+    }
+}
+
+/// 向悬浮录音窗发送麦克风实时音量。
+/// 流程：仅发送 0 到 1 的 RMS/峰值统计，不携带原始音频、文本或设备信息。
+/// 参数：app 为 Tauri 句柄，rms_level 与 peak_level 为归一化音量。
+/// 返回：无。
+/// 异常/边界：窗口不存在或事件投递失败时忽略，不影响录音、ASR 和粘贴主链路。
+fn emit_floating_voice_level(app: &tauri::AppHandle, rms_level: f64, peak_level: f64) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit(
+            "floating-voice-level",
+            FloatingVoiceLevelPayload {
+                rms_level: rms_level.clamp(0.0, 1.0),
+                peak_level: peak_level.clamp(0.0, 1.0),
             },
         );
     }
@@ -2622,25 +3257,43 @@ fn request_public_api_json<T>(
 where
     T: DeserializeOwned,
 {
+    request_public_api_json_with_timeout(app, path, payload, APP_VOICE_PUBLIC_API_TIMEOUT)
+}
+
+/// 按指定超时调用本机公共 HTTP 服务并解析 JSON。
+/// 流程：先等待 sidecar 健康，再用受信内网 Origin 和调用方指定超时发起 JSON 请求。
+/// 参数：app 为 Tauri 句柄，path 为接口路径，payload 为空表示 GET，否则 POST JSON，timeout 为本次请求总等待上限。
+/// 返回：反序列化后的响应模型。
+/// 异常/边界：用于区分 ASR 等硬依赖接口和 AI 润色这类可降级接口，避免单一长超时拖慢快捷键体验。
+fn request_public_api_json_with_timeout<T>(
+    app: &tauri::AppHandle,
+    path: &str,
+    payload: Option<Value>,
+    timeout: Duration,
+) -> Result<T, String>
+where
+    T: DeserializeOwned,
+{
     wait_for_public_api_health()?;
-    perform_public_api_json_request(app, path, payload)
+    perform_public_api_json_request(app, path, payload, timeout)
 }
 
 /// 执行一次公共 HTTP JSON 请求。
 /// 流程：按 payload 判断 GET/POST，使用固定本机地址并声明受信 Tauri 内网 Origin。
-/// 参数：app 为诊断上下文，path 为接口路径，payload 为可选 JSON。
+/// 参数：app 为诊断上下文，path 为接口路径，payload 为可选 JSON，timeout 为本次请求总等待上限。
 /// 返回：反序列化响应。
 /// 异常/边界：非 2xx 响应会尝试解析统一错误 envelope。
 fn perform_public_api_json_request<T>(
     app: &tauri::AppHandle,
     path: &str,
     payload: Option<Value>,
+    timeout: Duration,
 ) -> Result<T, String>
 where
     T: DeserializeOwned,
 {
     let client = reqwest::blocking::Client::builder()
-        .timeout(APP_VOICE_PUBLIC_API_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|error| format!("创建本机 HTTP 客户端失败：{}", error))?;
     let url = format!("{}{}", PUBLIC_API_BASE_URL, path);
@@ -3125,6 +3778,7 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
     }
     if should_skip_duplicate_voice_shortcut(&app, mode) {
         append_shortcut_diagnostic(&app, &format!("voice trigger deduplicated {}", mode));
+        emit_floating_voice_nudge(&app);
         return;
     }
     if mode == "polish" {
@@ -3137,6 +3791,7 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
             append_shortcut_diagnostic(&app, &format!("voice recording stop requested {}", mode));
             emit_floating_voice_state(&app, "stopping", "正在停止录音并准备转文字。");
         } else {
+            emit_floating_voice_nudge(&app);
             emit_floating_voice_state(&app, "processing", "上一段语音正在处理中，请稍候。");
         }
         return;
@@ -3164,20 +3819,27 @@ fn trigger_voice_mode(app: tauri::AppHandle, mode: &str) {
     let target_app = context.target_app;
     thread::spawn(move || {
         if let Err(error) = run_app_voice_polish_core(&app, &mode, &target_app) {
-            append_shortcut_diagnostic(
-                &app,
-                &format!("voice pipeline failed {}", trim_error_message(&error)),
-            );
-            let message = desktop_error::record_desktop_error(
-                &app,
-                "APP_VOICE_PIPELINE_FAILED",
-                "app_voice_shortcut",
-                None,
-                &error,
-            );
+            if error == APP_VOICE_CANCELLED_MESSAGE {
+                append_shortcut_diagnostic(&app, "voice pipeline cancelled by user");
+                emit_hub_notice(&app, APP_VOICE_CANCELLED_MESSAGE, "idle");
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.hide();
+                }
+                return;
+            }
+            let message = record_app_voice_pipeline_failure(&app, "app_voice_shortcut", &error);
+            if is_app_voice_user_recording_gate_error(&error) {
+                emit_floating_voice_state(&app, "error", &error);
+                emit_hub_notice(&app, &error, "idle");
+                thread::sleep(Duration::from_secs(5));
+                if let Some(main) = app.get_webview_window("main") {
+                    let _ = main.hide();
+                }
+                return;
+            }
             emit_floating_voice_state(&app, "error", &message);
             emit_hub_notice(&app, &message, "error");
-            thread::sleep(Duration::from_millis(900));
+            thread::sleep(Duration::from_secs(5));
             if let Some(main) = app.get_webview_window("main") {
                 let _ = main.hide();
             }
@@ -4766,6 +5428,116 @@ fn read_codex_task_concurrency_limit(app: &AppHandle) -> usize {
             (CODEX_TASK_MIN_CONCURRENT_RUNNING..=CODEX_TASK_MAX_CONCURRENT_RUNNING).contains(value)
         })
         .unwrap_or(CODEX_TASK_DEFAULT_CONCURRENT_RUNNING)
+}
+
+/// 读取语音录音提示音开关。
+/// 流程：沿用旧静态页 `interactionSounds` 配置；字段缺失时按旧版默认值开启，确保新用户默认有开始/结束提示音。
+/// 参数：app 为 Tauri 句柄，用于读取本地客户端配置。
+/// 返回：是否播放录音开始和结束提示音。
+/// 异常/边界：配置文件不存在、损坏或字段非法时回落为开启，不阻断录音主流程。
+fn read_app_voice_interaction_sounds_enabled(app: &AppHandle) -> bool {
+    read_local_config_document(app)
+        .ok()
+        .and_then(|document| document.items.get(LOCAL_CONFIG_SETTINGS_KEY).cloned())
+        .and_then(|settings| settings.get("interactionSounds").and_then(Value::as_bool))
+        .unwrap_or(true)
+}
+
+/// 读取语音录音期间是否临时静音系统输出。
+/// 流程：沿用旧静态页 `muteWhileDictating` 配置；字段缺失时按旧版默认值关闭，避免默认改变用户系统声音。
+/// 参数：app 为 Tauri 句柄，用于读取本地客户端配置。
+/// 返回：是否在录音 ready 后临时静音系统输出。
+/// 异常/边界：配置文件不存在、损坏或字段非法时回落为关闭，不影响录音主流程。
+fn read_app_voice_mute_while_dictating_enabled(app: &AppHandle) -> bool {
+    read_local_config_document(app)
+        .ok()
+        .and_then(|document| document.items.get(LOCAL_CONFIG_SETTINGS_KEY).cloned())
+        .and_then(|settings| settings.get("muteWhileDictating").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// 录音 ready 后按旧配置临时静音系统输出。
+/// 流程：开关关闭时不操作；开关开启时读取并保存旧静音态，再设置为静音，供录音结束或取消后恢复。
+/// 参数：app 为 Tauri 句柄，previous_state 为本次录音保存的旧静音态。
+/// 返回：无。
+/// 异常/边界：系统脚本失败只写诊断日志，不阻断录音；已保存旧状态时不重复覆盖。
+fn mute_app_voice_system_output_for_recording(
+    app: &AppHandle,
+    previous_state: &Arc<Mutex<Option<bool>>>,
+) {
+    if !read_app_voice_mute_while_dictating_enabled(app) {
+        return;
+    }
+    let Ok(mut stored_previous) = previous_state.lock() else {
+        append_shortcut_diagnostic(app, "voice mute skipped because state lock is poisoned");
+        return;
+    };
+    if stored_previous.is_some() {
+        return;
+    }
+    match set_system_output_muted_core(true) {
+        Ok(previous) => {
+            *stored_previous = Some(previous);
+            append_shortcut_diagnostic(app, "voice system output muted during recording");
+        }
+        Err(error) => {
+            append_shortcut_diagnostic(
+                app,
+                &format!("voice system mute failed {}", trim_error_message(&error)),
+            );
+        }
+    }
+}
+
+/// 录音结束、失败或取消后恢复系统输出静音状态。
+/// 流程：读取本次录音保存的旧静音态；存在时恢复并清空，避免下次录音重复使用旧值。
+/// 参数：app 为 Tauri 句柄，previous_state 为本次录音保存的旧静音态。
+/// 返回：无。
+/// 异常/边界：恢复失败只写诊断日志，不能掩盖录音或 ASR 的真实结果。
+fn restore_app_voice_system_output(app: &AppHandle, previous_state: &Arc<Mutex<Option<bool>>>) {
+    let previous = match previous_state.lock() {
+        Ok(mut stored_previous) => stored_previous.take(),
+        Err(_) => {
+            append_shortcut_diagnostic(
+                app,
+                "voice mute restore skipped because state lock is poisoned",
+            );
+            None
+        }
+    };
+    let Some(previous) = previous else {
+        return;
+    };
+    if let Err(error) = set_system_output_muted_core(previous) {
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice system mute restore failed {}",
+                trim_error_message(&error)
+            ),
+        );
+    }
+}
+
+/// 按旧静态页语义播放 App 原生语音提示音。
+/// 流程：先读取用户开关；开启时调用原生播放核心，失败只写快捷键诊断日志，不影响录音、ASR 或粘贴。
+/// 参数：app 为 Tauri 句柄，kind 为 start 或 stop。
+/// 返回：无。
+/// 异常/边界：提示音是辅助反馈，不允许因为系统声音不可用导致语音任务失败。
+fn play_app_voice_interaction_sound(app: &AppHandle, kind: &str) {
+    if !read_app_voice_interaction_sounds_enabled(app) {
+        return;
+    }
+    if let Err(error) = play_native_interaction_sound_core(kind) {
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice interaction sound failed kind={} {}",
+                kind,
+                trim_error_message(&error)
+            ),
+        );
+    }
 }
 
 /// 从任务执行失败中提取允许写入诊断日志的稳定错误码。
@@ -7115,6 +7887,15 @@ fn format_paste_focus_summary(role: &str, subrole: &str, description: &str) -> S
 #[tauri::command]
 fn set_system_output_muted(window: tauri::WebviewWindow, muted: bool) -> Result<bool, String> {
     ensure_sensitive_management_window(window.label())?;
+    set_system_output_muted_core(muted)
+}
+
+/// 设置系统输出静音状态的核心实现。
+/// 流程：macOS 下先读取旧静音态，再切到目标静音态；其它平台返回 false。
+/// 参数：muted 表示是否设置为静音。
+/// 返回：设置前的静音状态，用于录音结束后恢复。
+/// 异常/边界：脚本失败时返回错误，不伪造旧状态。
+fn set_system_output_muted_core(muted: bool) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
         let previous = run_osascript(r#"output muted of (get volume settings)"#)?
@@ -7138,9 +7919,18 @@ fn set_system_output_muted(window: tauri::WebviewWindow, muted: bool) -> Result<
 /// 播放录音开始或停止提示音，避免 WebView 全局快捷键触发时受自动播放策略影响。
 #[tauri::command]
 fn play_native_interaction_sound(kind: String) -> Result<(), String> {
+    play_native_interaction_sound_core(&kind)
+}
+
+/// 执行系统提示音播放。
+/// 流程：macOS 下使用系统内置音效和 `afplay` 后台播放；其它平台直接成功返回。
+/// 参数：kind 为 start 或 stop，未知值按 start 音处理以兼容旧调用。
+/// 返回：播放命令成功发起时为空。
+/// 异常/边界：只启动系统播放器，不等待音频播放结束，避免阻塞录音状态切换。
+fn play_native_interaction_sound_core(kind: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let sound_path = match kind.as_str() {
+        let sound_path = match kind {
             "start" => "/System/Library/Sounds/Tink.aiff",
             "stop" => "/System/Library/Sounds/Pop.aiff",
             _ => "/System/Library/Sounds/Tink.aiff",
@@ -7609,19 +8399,7 @@ fn paste_text_core(
     let normalized_target_app = paste_target.target_app;
     let accessibility_trusted = is_accessibility_trusted();
     if normalized_target_app.is_empty() {
-        let requested_target_app = normalize_target_app_name(&target_app);
-        let normalized_frontmost_app = normalize_target_app_name(&frontmost_before_paste);
-        let message = if !requested_target_app.is_empty()
-            && !normalized_frontmost_app.is_empty()
-            && requested_target_app != normalized_frontmost_app
-        {
-            format!(
-                "录音开始时的目标是 {}，但粘贴前当前前台已变为 {}；已阻止自动粘贴，避免写入错误输入框。",
-                requested_target_app, normalized_frontmost_app
-            )
-        } else {
-            "当前焦点不在外部输入目标上；已保持原剪贴板不变。".to_string()
-        };
+        let message = "当前前台不是可粘贴的外部应用；已保持原剪贴板不变。".to_string();
         let clipboard_restore_status =
             clipboard_restore_not_attempted("未写入临时剪贴板，避免覆盖用户原剪贴板。");
         return Ok(PasteResponse {
@@ -7730,15 +8508,43 @@ fn paste_text_core(
         (String::new(), focus_strategy.to_string())
     };
 
-    let focus_status = if trusts_explicit_target {
-        PasteFocusStatus {
-            ready: true,
-            summary: "显式目标快速粘贴：目标 App 未变化，直接发送系统粘贴。".to_string(),
+    let focus_status = read_stable_paste_focus_status();
+    if !focus_status.ready && trusts_explicit_target {
+        let stored_snapshot = focus_snapshot_state
+            .snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.clone())
+            .filter(|snapshot| {
+                normalize_target_app_name(&snapshot.target_app) == normalized_target_app
+            });
+        if let Some(snapshot) = stored_snapshot {
+            let _ = restore_paste_focus_snapshot(&snapshot);
+            thread::sleep(Duration::from_millis(PASTE_TARGET_REFOCUS_DELAY_MS));
         }
+    }
+    let focus_status = if focus_status.ready {
+        focus_status
     } else {
         read_stable_paste_focus_status()
     };
-    if !focus_status.ready && !trusts_explicit_target {
+    let focus_status = if !focus_status.ready
+        && should_allow_unconfirmed_focus_paste(
+            &target_app,
+            &normalized_target_app,
+            &frontmost_before_paste,
+        ) {
+        PasteFocusStatus {
+            ready: true,
+            summary: format!(
+                "{}；当前前台目标 {} 未变化，AX 未暴露文本输入角色，改为发送一次系统粘贴指令。",
+                focus_status.summary, normalized_target_app
+            ),
+        }
+    } else {
+        focus_status
+    };
+    if !focus_status.ready {
         let clipboard_restore_status =
             clipboard_restore_not_attempted("未写入临时剪贴板，避免覆盖用户原剪贴板。");
         return Ok(PasteResponse {
@@ -7763,14 +8569,7 @@ fn paste_text_core(
             focused_element_after_paste: String::new(),
         });
     }
-    let focused_element_before_paste = if focus_status.ready {
-        focus_status.summary
-    } else {
-        format!(
-            "{}；Web 输入焦点未暴露为 AX 文本控件，但录音开始目标 App 与粘贴前目标 App 一致，继续发送系统粘贴。",
-            focus_status.summary
-        )
-    };
+    let focused_element_before_paste = focus_status.summary;
     let frontmost_before_clipboard_write = get_frontmost_app().unwrap_or_default();
     let normalized_frontmost_before_clipboard_write =
         normalize_target_app_name(&frontmost_before_clipboard_write);
@@ -7780,7 +8579,7 @@ fn paste_text_core(
         return Ok(PasteResponse {
             command_sent: false,
             message: format!(
-                "录音开始时的目标是 {}，但粘贴前当前前台已变为 {}；已阻止自动粘贴，避免写入错误输入框。",
+                "准备粘贴时的目标是 {}，但写入剪贴板前当前前台已变为 {}；已阻止自动粘贴，避免写入错误应用。",
                 normalized_target_app,
                 if normalized_frontmost_before_clipboard_write.is_empty() {
                     "未知应用".to_string()
@@ -9360,6 +10159,8 @@ mod tests {
             enabled: true,
             is_default: false,
             provider: "openai-compatible".to_string(),
+            vendor_key: "qwen".to_string(),
+            model_key: "qwen-plus".to_string(),
             base_url: "https://api.example.com/v1".to_string(),
             model_name: "text-model".to_string(),
             api_key: "secret-value".to_string(),
@@ -9372,6 +10173,8 @@ mod tests {
             enabled: false,
             is_default: false,
             provider: existing.provider.clone(),
+            vendor_key: Some("qwen".to_string()),
+            model_key: Some("qwen-turbo".to_string()),
             base_url: format!("{}/", existing.base_url),
             model_name: existing.model_name.clone(),
             api_key: None,
@@ -9414,6 +10217,15 @@ mod tests {
     }
 
     #[test]
+    fn unknown_frontmost_shortcut_still_shows_floating_window() {
+        let decision = resolve_voice_trigger_context("");
+
+        assert_eq!(decision.target_app, "");
+        assert!(decision.show_floating_window);
+        assert!(!decision.keep_hub_visible);
+    }
+
+    #[test]
     fn external_frontmost_shortcut_keeps_current_focus_without_reactivation() {
         let decision = resolve_voice_trigger_context("ChatGPT");
 
@@ -9431,10 +10243,10 @@ mod tests {
     }
 
     #[test]
-    fn paste_with_explicit_target_stops_when_frontmost_app_changed() {
+    fn paste_with_explicit_target_uses_current_frontmost_app() {
         let decision = resolve_paste_target("ChatGPT", "TextEdit");
 
-        assert_eq!(decision.target_app, "");
+        assert_eq!(decision.target_app, "TextEdit");
         assert!(!decision.should_hide_hub);
     }
 
@@ -9456,6 +10268,25 @@ mod tests {
         assert!(!should_trust_explicit_paste_target("", "ChatGPT"));
         assert!(!should_trust_explicit_paste_target("ChatGPT", "TextEdit"));
         assert!(!should_trust_explicit_paste_target("CodexMan", "ChatGPT"));
+    }
+
+    #[test]
+    fn unconfirmed_focus_paste_allows_current_frontmost_target() {
+        assert!(should_allow_unconfirmed_focus_paste(
+            "ChatGPT", "ChatGPT", "ChatGPT"
+        ));
+        assert!(should_allow_unconfirmed_focus_paste(
+            "", "ChatGPT", "ChatGPT"
+        ));
+        assert!(should_allow_unconfirmed_focus_paste(
+            "ChatGPT", "TextEdit", "TextEdit"
+        ));
+        assert!(!should_allow_unconfirmed_focus_paste(
+            "ChatGPT", "ChatGPT", "TextEdit"
+        ));
+        assert!(should_allow_unconfirmed_focus_paste(
+            "CodexMan", "ChatGPT", "ChatGPT"
+        ));
     }
 
     #[test]

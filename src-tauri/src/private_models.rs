@@ -42,6 +42,12 @@ pub struct SavePrivateModelRequest {
     pub is_default: bool,
     /// 模型供应商协议标识。
     pub provider: String,
+    /// 产品化厂商键，仅用于管理页回显，不参与上游调用。
+    #[serde(default)]
+    pub vendor_key: Option<String>,
+    /// 厂商内部模型键，仅用于管理页回显，不参与上游调用。
+    #[serde(default)]
+    pub model_key: Option<String>,
     /// 供应商 HTTPS API 基础地址。
     pub base_url: String,
     /// 供应商实际模型名称。
@@ -66,6 +72,12 @@ pub struct PrivateModelRecord {
     pub is_default: bool,
     /// 供应商协议标识。
     pub provider: String,
+    /// 产品化厂商键，仅用于管理页回显。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vendor_key: String,
+    /// 厂商内部模型键，仅用于管理页回显。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_key: String,
     /// API 基础地址。
     pub base_url: String,
     /// 实际模型名称。
@@ -118,6 +130,19 @@ pub struct SidecarModelRecord {
     pub api_key: String,
 }
 
+/// App 原生运行时模型配置；只在主进程内部使用，允许读取密钥但禁止通过 IPC 返回。
+#[derive(Debug, Clone)]
+pub struct PrivateModelRuntimeRecord {
+    /// 供应商协议。
+    pub provider: String,
+    /// API 或 WebSocket 基础地址。
+    pub base_url: String,
+    /// 供应商实际模型名称。
+    pub model_name: String,
+    /// 运行时凭证，来自本机私有配置。
+    pub api_key: String,
+}
+
 /// 私有模型探针失败，区分可展示业务失败与必须通过 IPC 抛出的内部错误。
 #[derive(Debug)]
 pub struct PrivateModelTestFailure {
@@ -149,6 +174,39 @@ pub fn list_private_models(app: &AppHandle) -> Result<Vec<PrivateModelRecord>, S
 pub fn list_public_model_catalog(app: &AppHandle) -> Result<Vec<PublicModelCatalogRecord>, String> {
     let records = read_metadata(app)?;
     Ok(build_public_model_catalog(records))
+}
+
+/// 读取 App 原生运行链路要调用的私有模型配置。
+/// 流程：按模型 ID 查找本机 JSON 记录，校验启用、能力和密钥完整后返回仅主进程内部使用的运行时配置。
+/// 参数：app 为 Tauri AppHandle，model_id 为公共目录中的不透明模型 ID，capability 为当前业务能力。
+/// 返回：包含上游地址、模型名、provider 和密钥的运行时模型。
+/// 异常/边界：不会向 WebView 暴露密钥；缺模型、禁用、能力不匹配或缺密钥均返回稳定中文错误。
+pub fn get_private_model_runtime(
+    app: &AppHandle,
+    model_id: &str,
+    capability: PrivateModelCapability,
+) -> Result<PrivateModelRuntimeRecord, String> {
+    let normalized_id = model_id.trim();
+    let records = read_metadata(app)?;
+    let record = records
+        .into_iter()
+        .find(|item| item.id == normalized_id)
+        .ok_or_else(|| "模型不存在，请重新选择可用模型。".to_string())?;
+    if !record.enabled {
+        return Err("模型已禁用，请在模型管理中启用后重试。".to_string());
+    }
+    if record.capability != capability {
+        return Err("模型能力与当前语音识别流程不匹配。".to_string());
+    }
+    if record.api_key.trim().is_empty() {
+        return Err("模型缺少运行凭证，请在模型管理中补充 API Key。".to_string());
+    }
+    Ok(PrivateModelRuntimeRecord {
+        provider: record.provider,
+        base_url: record.base_url,
+        model_name: record.model_name,
+        api_key: record.api_key,
+    })
 }
 
 /// 保存私有模型元数据及可选 API Key。
@@ -203,6 +261,18 @@ pub fn save_private_model(
         enabled: request.enabled,
         is_default: request.is_default,
         provider: request.provider.trim().to_string(),
+        vendor_key: request
+            .vendor_key
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
+        model_key: request
+            .model_key
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
         base_url: request.base_url.trim_end_matches('/').to_string(),
         model_name: request.model_name.trim().to_string(),
         api_key,
@@ -295,6 +365,19 @@ pub fn test_private_model(
                 })
         }?,
     };
+    if request.provider.trim() != "openai-compatible" {
+        validate_realtime_provider_credential(request.provider.trim(), &api_key).map_err(
+            |message| PrivateModelTestFailure {
+                code: "MODEL_REALTIME_CREDENTIAL_INVALID",
+                message,
+                is_internal: false,
+            },
+        )?;
+        return Ok(
+            "实时 ASR provider 配置格式验证通过；真实连通性会在录音时通过 WebSocket 验证。"
+                .to_string(),
+        );
+    }
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
@@ -363,6 +446,90 @@ pub fn test_private_model(
     Ok("模型连通性测试通过".to_string())
 }
 
+/// 校验实时 ASR provider 凭证结构。
+/// 流程：阿里只要求单一 API Key；腾讯要求 appId/secretId/secretKey；讯飞要求 appId/apiKey，可选 apiSecret。
+/// 参数：provider 为运行协议，credential 为用户保存的凭证文本。
+/// 返回：结构合法为空。
+/// 异常/边界：只校验字段结构，不联网；错误不包含凭证原文。
+fn validate_realtime_provider_credential(provider: &str, credential: &str) -> Result<(), String> {
+    let normalized = credential.trim();
+    if normalized.is_empty() {
+        return Err("实时 ASR 凭证不能为空。".to_string());
+    }
+    if provider == "aliyun-realtime-asr" {
+        return Ok(());
+    }
+    let fields = parse_realtime_credential_fields(normalized)?;
+    let required_keys: &[&str] = match provider {
+        "tencent-realtime-asr" => &["appid", "secretid", "secretkey"],
+        "iflytek-realtime-asr" => &["appid", "apikey"],
+        _ => return Err("未知实时 ASR provider。".to_string()),
+    };
+    for key in required_keys {
+        if !fields.contains_key(*key) {
+            return Err(format!("实时 ASR 凭证缺少 {} 字段。", key));
+        }
+    }
+    Ok(())
+}
+
+/// 解析实时 ASR 多字段凭证。
+/// 流程：支持 JSON 对象和 key=value 多行/分号格式，字段名统一小写并去掉连接符。
+/// 参数：raw 为凭证文本。
+/// 返回：字段映射。
+/// 异常/边界：无法解析时返回格式提示，不泄露凭证值。
+fn parse_realtime_credential_fields(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let normalized = raw.trim();
+    if normalized.starts_with('{') {
+        let value = serde_json::from_str::<serde_json::Value>(normalized)
+            .map_err(|_| "实时 ASR 凭证 JSON 格式无效。".to_string())?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "实时 ASR 凭证必须是 JSON 对象。".to_string())?;
+        return Ok(object
+            .iter()
+            .filter_map(|(key, value)| {
+                value.as_str().map(|text| {
+                    (
+                        normalize_realtime_credential_key(key),
+                        text.trim().to_string(),
+                    )
+                })
+            })
+            .filter(|(_, value)| !value.is_empty())
+            .collect());
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for line in normalized.split(['\n', ';', ',']) {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = normalize_realtime_credential_key(key);
+        let value = value.trim().to_string();
+        if !key.is_empty() && !value.is_empty() {
+            fields.insert(key, value);
+        }
+    }
+    if fields.is_empty() {
+        return Err("实时 ASR 凭证格式无效，请使用 JSON 或 key=value 多字段格式。".to_string());
+    }
+    Ok(fields)
+}
+
+/// 归一化实时 ASR 凭证字段名。
+/// 流程：去掉空格、下划线和短横线后转小写。
+/// 参数：key 为用户输入字段名。
+/// 返回：稳定字段名。
+fn normalize_realtime_credential_key(key: &str) -> String {
+    key.trim()
+        .chars()
+        .filter(|ch| !matches!(*ch, '_' | '-' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// 构造与正式语音转写完全一致的 ASR 模型探针请求体。
 /// 流程：把最小合法 WAV 编码为历史已验证的 data URL，再按 OpenAI Compatible chat/completions 音频结构组装请求。
 /// 参数：model_name 为上游实际模型名；返回只含 model/messages 的 JSON 请求体。
@@ -416,6 +583,9 @@ fn build_sidecar_catalog(
 ) -> Result<Vec<SidecarModelRecord>, String> {
     let mut catalog = Vec::with_capacity(records.len());
     for record in records {
+        if record.provider != "openai-compatible" {
+            continue;
+        }
         let normalized_api_key = record.api_key.trim();
         let is_runtime_enabled = record.enabled && !normalized_api_key.is_empty();
         let api_key = if is_runtime_enabled {
@@ -467,8 +637,14 @@ fn validate_request(request: &SavePrivateModelRequest) -> Result<(), String> {
     if display_name.is_empty() || display_name.chars().count() > 80 {
         return Err("模型展示名称长度必须为 1 到 80 个字符".to_string());
     }
-    if provider != "openai-compatible" {
-        return Err("当前私有模型只支持 openai-compatible 协议".to_string());
+    if !matches!(
+        provider,
+        "openai-compatible"
+            | "aliyun-realtime-asr"
+            | "tencent-realtime-asr"
+            | "iflytek-realtime-asr"
+    ) {
+        return Err("当前私有模型只支持内置模型协议".to_string());
     }
     if model_name.is_empty()
         || model_name.chars().count() > 160
@@ -491,19 +667,34 @@ fn validate_request(request: &SavePrivateModelRequest) -> Result<(), String> {
         .host_str()
         .ok_or_else(|| "模型 Base URL 缺少主机".to_string())?;
     let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
-    if !matches!(url.scheme(), "http" | "https")
-        || (url.scheme() != "https" && !loopback)
-        || url.username() != ""
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || raw_url.contains("%2e")
-        || raw_url.contains('\\')
-        || url.path().contains("//")
+    if provider == "openai-compatible"
+        && (!matches!(url.scheme(), "http" | "https")
+            || (url.scheme() != "https" && !loopback)
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || raw_url.contains("%2e")
+            || raw_url.contains('\\')
+            || url.path().contains("//"))
     {
         return Err(
             "公网模型 Base URL 必须为无凭据 HTTPS；仅本机回环地址允许 HTTP，且禁止 query/fragment"
                 .to_string(),
+        );
+    }
+    if provider != "openai-compatible"
+        && (!matches!(url.scheme(), "ws" | "wss")
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || raw_url.contains("%2e")
+            || raw_url.contains('\\')
+            || url.path().contains("//"))
+    {
+        return Err(
+            "实时 ASR WebSocket 地址必须为无凭据 ws/wss，且禁止 query/fragment".to_string(),
         );
     }
     let segments = url
@@ -622,6 +813,8 @@ mod tests {
             enabled: true,
             is_default: false,
             provider: "openai-compatible".to_string(),
+            vendor_key: None,
+            model_key: None,
             base_url: base_url.to_string(),
             model_name: "gpt-test".to_string(),
             api_key: Some("secret-value".to_string()),
@@ -649,12 +842,25 @@ mod tests {
         .is_err());
     }
 
-    /// 当前私有模型协议只允许 OpenAI Compatible，拒绝未知 provider 进入持久化和探针链路。
+    /// 当前私有模型协议只允许内置 provider，拒绝未知 provider 进入持久化和探针链路。
     #[test]
     fn unsupported_provider_is_rejected() {
         let mut request = valid_request("https://api.example.com/v1");
         request.provider = "anthropic".to_string();
         assert!(validate_request(&request).is_err());
+    }
+
+    /// 实时 ASR provider 配置必须允许 ws/wss 地址，供 App 原生录音链路调用。
+    #[test]
+    fn realtime_asr_provider_websocket_url_is_allowed() {
+        let mut request = valid_request("wss://asr.cloud.tencent.com/asr/v2");
+        request.capability = PrivateModelCapability::Asr;
+        request.provider = "tencent-realtime-asr".to_string();
+        request.model_name = "16k_zh".to_string();
+        request.api_key =
+            Some(r#"{"appId":"123456","secretId":"sid","secretKey":"skey"}"#.to_string());
+        assert!(validate_request(&request).is_ok());
+        assert!(test_private_model(None, request).is_ok());
     }
 
     /// 探针配置校验失败必须返回稳定配置错误码，且不得进入网络请求。
@@ -750,6 +956,8 @@ mod tests {
                 enabled: false,
                 is_default: true,
                 provider: "openai-compatible".to_string(),
+                vendor_key: String::new(),
+                model_key: String::new(),
                 base_url: "https://api.example.com/v1".to_string(),
                 model_name: "disabled".to_string(),
                 api_key: String::new(),
@@ -762,6 +970,8 @@ mod tests {
                 enabled: true,
                 is_default: false,
                 provider: "openai-compatible".to_string(),
+                vendor_key: String::new(),
+                model_key: String::new(),
                 base_url: "https://api.example.com/v1".to_string(),
                 model_name: "enabled".to_string(),
                 api_key: "secret-value".to_string(),
@@ -783,6 +993,8 @@ mod tests {
             enabled: false,
             is_default: false,
             provider: "openai-compatible".to_string(),
+            vendor_key: String::new(),
+            model_key: String::new(),
             base_url: "https://api.example.com/v1".to_string(),
             model_name: "disabled-model".to_string(),
             api_key: String::new(),
@@ -796,6 +1008,32 @@ mod tests {
         assert!(!catalog[0].api_key.contains("secret"));
     }
 
+    /// 实时 ASR 模型由 Rust 原生录音链路调用，不注入 Python sidecar 的 OpenAI-compatible HTTP 目录。
+    #[test]
+    fn realtime_asr_model_is_excluded_from_sidecar_catalog() {
+        let records = vec![PrivateModelRecord {
+            id: "model_550e8400-e29b-41d4-a716-446655440010".to_string(),
+            display_name: "腾讯实时 ASR".to_string(),
+            capability: PrivateModelCapability::Asr,
+            enabled: true,
+            is_default: true,
+            provider: "tencent-realtime-asr".to_string(),
+            vendor_key: "tencent-realtime-asr".to_string(),
+            model_key: "tencent-16k-zh".to_string(),
+            base_url: "wss://asr.cloud.tencent.com/asr/v2".to_string(),
+            model_name: "16k_zh".to_string(),
+            api_key: r#"{"appId":"123456","secretId":"sid","secretKey":"skey"}"#.to_string(),
+            has_api_key: true,
+        }];
+        let sidecar_catalog = build_sidecar_catalog(records.clone()).expect("实时模型过滤不应失败");
+        let public_catalog = build_public_model_catalog(records);
+
+        assert!(sidecar_catalog.is_empty());
+        assert_eq!(public_catalog.len(), 1);
+        assert!(public_catalog[0].enabled);
+        assert!(public_catalog[0].is_default);
+    }
+
     /// 业务页安全目录必须按运行时规则计算可用状态，并且不能暴露上游连接字段或密钥。
     #[test]
     fn public_model_catalog_uses_runtime_enabled_state() {
@@ -807,6 +1045,8 @@ mod tests {
                 enabled: true,
                 is_default: true,
                 provider: "openai-compatible".to_string(),
+                vendor_key: "qwen".to_string(),
+                model_key: "qwen-plus".to_string(),
                 base_url: "https://api.example.com/v1".to_string(),
                 model_name: "text-model".to_string(),
                 api_key: "secret-value".to_string(),
@@ -819,6 +1059,8 @@ mod tests {
                 enabled: true,
                 is_default: true,
                 provider: "openai-compatible".to_string(),
+                vendor_key: String::new(),
+                model_key: String::new(),
                 base_url: "https://api.example.com/v1".to_string(),
                 model_name: "asr-model".to_string(),
                 api_key: String::new(),
