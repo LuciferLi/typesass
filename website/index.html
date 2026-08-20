@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="typesass 是一个桌面端 AI 语音输入工具，支持快捷键录音、Mimo 语音识别、AI 总结、AI 润色、翻译、问答、自动粘贴、本地历史、词典和系统安全存储。"
+      content="CodexMan 是一款 Mac 桌面 AI 语音输入工具。按快捷键说话，自动转文字、整理语气，并粘贴到当前输入框，适合飞书、微信、邮件、浏览器和编辑器。"
     />
-    <title>typesass - 桌面端 AI 语音输入工具</title>
-    <link rel="icon" href="./assets/typesassLogo.png" />
+    <title>CodexMan - 少打字的 Mac AI 语音输入工具</title>
+    <link rel="icon" href="./assets/codexManLogo.png" />
     <style>
       :root {
         color-scheme: dark;
@@ -1999,6 +1999,7 @@
         }
 
         .brandMeta,
+        .githubButton,
         .navActions .ghostButton:not(.githubButton) {
           display: none;
         }
@@ -2107,19 +2108,19 @@
       </svg>
       <div class="scrollProgress" aria-hidden="true"><span id="scrollProgressBar"></span></div>
       <nav class="navBar" aria-label="主导航">
-        <a class="brandLink" href="#top" aria-label="typesass 首页">
-          <img class="brandLogo" src="./assets/typesassLogo.png" alt="" />
+        <a class="brandLink" href="#top" aria-label="CodexMan 首页">
+          <img class="brandLogo" src="./assets/codexManLogo.png" alt="" />
           <span class="brandText">
-            <span class="brandName">typesass</span>
+            <span class="brandName">CodexMan</span>
             <span class="brandMeta">AI 语音输入工具</span>
           </span>
         </a>
         <div class="navLinks" aria-label="页面章节">
-          <a href="#project">项目介绍</a>
+          <a href="#scenes">使用场景</a>
           <a href="#features">核心功能</a>
-          <a href="#flow">工作流</a>
-          <a href="#hub">产品界面</a>
-          <a href="#aiAbility">AI 能力</a>
+          <a href="#flow">怎么使用</a>
+          <a href="#privacy">隐私与权限</a>
+          <a href="#faq">常见问题</a>
         </div>
         <div class="navActions">
           <a
@@ -2127,14 +2128,14 @@
             href="https://github.com/LuciferLi/typesass"
             target="_blank"
             rel="noreferrer"
-            aria-label="打开 typesass GitHub 仓库"
+            aria-label="打开 CodexMan GitHub 仓库"
           >
             <span>GitHub</span>
             <span class="githubStarBadge" aria-live="polite">
               <span id="githubStarCount">--</span>&nbsp;stars
             </span>
           </a>
-          <a class="solidButton" href="#features">功能概览</a>
+          <a class="solidButton" href="#flow">看看怎么用</a>
         </div>
       </nav>
 
@@ -2142,22 +2143,22 @@
         <canvas id="signalCanvas" class="signalCanvas" aria-hidden="true"></canvas>
         <div class="heroInner">
           <div class="heroText reveal">
-            <div class="eyebrow"><i aria-hidden="true"></i>桌面端 AI 语音输入工具</div>
-            <h1 class="heroTitle">typesass <span>让任何输入框听懂你说的话。</span></h1>
+            <div class="eyebrow"><i aria-hidden="true"></i>Mac 桌面端 AI 语音输入工具</div>
+            <h1 class="heroTitle">CodexMan <span>让任何输入框听懂你说的话。</span></h1>
             <p class="heroCopy">
-              typesass 是一个常驻桌面的 AI 语音输入工具：按你设置的快捷键录音，
-              用 Mimo 语音识别转成文字，再让 AI 总结、润色、翻译或回答，最后把结果写回当前输入框。
-              它把隐私、速度和可控性放在第一位，密钥保存在系统安全存储中，历史和词典默认只留在本机。
+              在飞书、微信、浏览器、邮件、文档或编辑器里，按下快捷键说话。
+              CodexMan 会把口述转成文字，整理成更清楚的表达，再放回你正在输入的地方。
+              长消息、会议记录、工作回复，都可以少打很多字。
             </p>
             <div class="heroActions">
               <a
                 class="solidButton downloadButton"
-                href="/downloads/typesass_0.0.2_aarch64.dmg"
-                download="typesass_0.0.2_aarch64.dmg"
-                aria-label="下载 typesass Mac 版本"
+                href="/downloads/codexman_0.1.22_aarch64.dmg"
+                download="codexman_0.1.22_aarch64.dmg"
+                aria-label="下载 CodexMan Mac 版本"
               >
                 <svg class="iconPark" aria-hidden="true"><use href="#iconParkApple"></use></svg>
-                <span>Mac 版本</span>
+                <span>下载 Mac 版 0.1.22</span>
                 <svg class="iconPark" aria-hidden="true"><use href="#iconParkDownloadOne"></use></svg>
               </a>
               <span class="tooltipWrap" data-tooltip="敬请期待">
@@ -2169,21 +2170,21 @@
             </div>
             <div class="heroStats" aria-label="产品亮点">
               <div class="statTile">
-                <span>快捷键策略</span>
-                <strong>可自定义</strong>
+                <span>触发方式</span>
+                <strong>按键说话</strong>
               </div>
               <div class="statTile">
-                <span>核心闭环</span>
-                <strong>录音到粘贴</strong>
+                <span>适用位置</span>
+                <strong>任何输入框</strong>
               </div>
               <div class="statTile">
-                <span>数据策略</span>
-                <strong>本地优先</strong>
+                <span>安装信任</span>
+                <strong>Apple 公证</strong>
               </div>
             </div>
           </div>
 
-          <div class="heroStage reveal" aria-label="typesass 产品动态展示">
+          <div class="heroStage reveal" aria-label="CodexMan 产品动态展示">
             <div class="pillDemo" aria-hidden="true">
               <div class="voiceCapsule">
                 <span class="pillIcon">×</span>
@@ -2194,7 +2195,7 @@
               </div>
             </div>
             <div class="screenFrame">
-              <img src="./assets/hubHome.png" alt="typesass 首页界面截图" />
+              <img src="./assets/hubHome.png" alt="CodexMan 首页界面截图" />
             </div>
             <div class="resultStrip" aria-live="polite">
               <div class="stripLabel">
@@ -2202,7 +2203,7 @@
                 <span class="stripStatus">AI 已整理</span>
               </div>
               <p class="stripText" id="heroResult">
-                把这段口述整理成适合发到项目群里的中文说明，保留要点和下一步。
+                “帮我把刚才说的整理成一段能发到飞书群里的说明，语气自然一点。”
               </p>
             </div>
           </div>
@@ -2210,31 +2211,30 @@
       </header>
 
       <main>
-        <section id="project" class="section">
+        <section id="scenes" class="section">
           <div class="sectionInner">
             <div class="sectionHeader reveal">
-              <div class="sectionKicker">产品定位</div>
-              <h2 class="sectionTitle">它不是聊天机器人，而是一个接管输入动作的桌面工具。</h2>
+              <div class="sectionKicker">真实场景</div>
+              <h2 class="sectionTitle">不是多开一个聊天窗口，而是帮你把话写进当前应用。</h2>
               <p class="sectionCopy">
-                目标很简单：当你在飞书、微信、浏览器、编辑器或任何输入框里需要打字时，直接说出来。
-                typesass 负责录音、转写、整理、翻译、回答、粘贴和记录，让语音变成可控的生产力输入。
+                你不用先打开 AI，再复制粘贴回来。只要当前有输入框，按快捷键说出想法，
+                CodexMan 就能帮你转成更清楚、更适合发送的文字。
               </p>
             </div>
 
             <div class="projectGrid">
               <article class="projectPanel reveal">
                 <p class="projectSummary">
-                  typesass 把 <em>全局快捷键</em>、<em>语音识别</em>、<em>AI 文本处理</em>、
-                  <em>自动粘贴</em> 和 <em>本地记忆</em> 连接成一条桌面链路。它更像一个常驻菜单栏的小型输入引擎，
-                  而不是一个需要打开网页才能使用的 AI 工具。
+                  适合每天要写很多消息、记录很多想法的人。你可以在 <em>飞书和微信</em> 里快速回复，
+                  在 <em>邮件和文档</em> 里口述长段内容，也可以在 <em>浏览器和编辑器</em> 里把零散想法整理成清楚文字。
                 </p>
                 <div class="projectBadges" aria-label="项目特性">
-                  <span>Tauri v2 桌面端</span>
-                  <span>Mimo 语音识别 / AI</span>
-                  <span>系统安全存储</span>
-                  <span>本地历史与词典</span>
-                  <span>全局快捷键</span>
-                  <span>自动粘贴兜底</span>
+                  <span>长消息少打字</span>
+                  <span>会议想法变纪要</span>
+                  <span>客户回复更礼貌</span>
+                  <span>日报周报更快写</span>
+                  <span>项目名人名更稳定</span>
+                  <span>结果不容易丢</span>
                 </div>
                 <div class="signalMap" aria-hidden="true">
                   <span class="signalRing"></span>
@@ -2244,35 +2244,35 @@
                   <span class="mapNode isTranscribe">转写</span>
                   <span class="mapNode isRewrite">润色</span>
                   <span class="mapNode isPaste">粘贴</span>
-                  <span class="signalCore"><img src="./assets/typesassLogo.png" alt="" /></span>
+                  <span class="signalCore"><img src="./assets/codexManLogo.png" alt="" /></span>
                 </div>
               </article>
 
-              <aside class="terminalPanel reveal" aria-label="项目功能摘要">
+              <aside class="terminalPanel reveal" aria-label="使用场景摘要">
                 <div class="terminalTitle">
-                  <span>typesass 运行链路</span>
-                  <span class="statusPill">本地优先</span>
+                  <span>你可以这样用</span>
+                  <span class="statusPill">少打字</span>
                 </div>
                 <div class="terminalLines">
                   <div class="terminalLine">
-                    <strong>触发</strong>
-                    <span>口述、翻译、随便问都可以配置自己的触发方式。</span>
+                    <strong>回消息</strong>
+                    <span>在微信或飞书里说一段想法，整理成清楚、有礼貌、能直接发送的回复。</span>
                   </div>
                   <div class="terminalLine">
-                    <strong>采集</strong>
-                    <span>浏览器侧采集声音，短录音会被拦截，避免误触请求语音识别。</span>
+                    <strong>写记录</strong>
+                    <span>会后把零散结论口述出来，自动整理成要点和下一步。</span>
                   </div>
                   <div class="terminalLine">
-                    <strong>处理</strong>
-                    <span>Mimo 语音识别转写，Mimo 文本模型根据模式做润色、翻译或回答。</span>
+                    <strong>改文字</strong>
+                    <span>选中一段已经写好的内容，一键改语气、改结构、变简洁。</span>
                   </div>
                   <div class="terminalLine">
-                    <strong>记忆</strong>
-                    <span>历史、词典、偏好留在本机，密钥不写入浏览器本地存储。</span>
+                    <strong>记术语</strong>
+                    <span>把人名、项目名、产品名放进词典，后续识别和整理更稳定。</span>
                   </div>
                   <div class="terminalLine">
                     <strong>输出</strong>
-                    <span class="cursorType">能粘贴就自动粘贴，不能粘贴就弹结果窗口。</span>
+                    <span class="cursorType">能粘贴就放回当前输入框，粘贴失败也会保留结果。</span>
                   </div>
                 </div>
               </aside>
@@ -2284,60 +2284,59 @@
           <div class="sectionInner">
             <div class="sectionHeader reveal">
               <div class="sectionKicker">核心功能</div>
-              <h2 class="sectionTitle">用户第一眼应该看懂 typesass 能帮他做什么。</h2>
+              <h2 class="sectionTitle">三件事最重要：说话输入、AI 整理、自动写回。</h2>
               <p class="sectionCopy">
-                这版把功能解释放到主舞台：每张卡都对应真实使用场景，从按下快捷键、语音转文字，
-                到 AI 总结润色、自动粘贴、历史记录和本地安全。
+                CodexMan 不要求你改变工作习惯。你继续在原来的软件里打字，它在后台帮你把语音和选中文字变成更好用的内容。
               </p>
             </div>
 
-            <div class="capabilityGrid" aria-label="typesass 核心功能">
+            <div class="capabilityGrid" aria-label="CodexMan 核心功能">
               <article class="capabilityCard isActive reveal">
                 <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkKeyboard"></use></svg></span><span class="capabilityTag">可配置</span></div>
-                <strong>快捷键口述</strong>
-                <p>后台驻留，按你设置的快捷键开始和停止录音，不需要切换应用。</p>
+                <strong>按快捷键说话</strong>
+                <p>不用切窗口，不用找输入框里的麦克风按钮。按下你设置的快捷键，说完即可。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
-                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkTextRecognition"></use></svg></span><span class="capabilityTag">Mimo</span></div>
+                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkTextRecognition"></use></svg></span><span class="capabilityTag">转文字</span></div>
                 <strong>语音转文字</strong>
-                <p>浏览器侧录音，Mimo 语音识别转写，并记录转写耗时和原始文本。</p>
+                <p>把长口述转成可读文字，适合写消息、记会议、整理想法和快速记录。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
-                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkMagicWand"></use></svg></span><span class="capabilityTag">可关闭</span></div>
-                <strong>AI 总结与润色</strong>
-                <p>可以把一大段口述总结成重点，也能把停顿、重复、不清楚的表达润色成可发送文本。</p>
+                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkMagicWand"></use></svg></span><span class="capabilityTag">润色</span></div>
+                <strong>AI 整理与润色</strong>
+                <p>日常口述难免停顿、重复、顺序不清。AI 会保留原意，整理成更自然的表达。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
-                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkTranslate"></use></svg></span><span class="capabilityTag">多语言</span></div>
-                <strong>语音翻译</strong>
-                <p>先转写，再翻译到设置里的目标语言，适合跨语言沟通。</p>
+                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkTranslate"></use></svg></span><span class="capabilityTag">选中文字</span></div>
+                <strong>已有文字一键改</strong>
+                <p>选中一段内容，用快捷键让它变简洁、变正式、变礼貌，适合邮件和工作沟通。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
-                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkMessageSearch"></use></svg></span><span class="capabilityTag">问答</span></div>
-                <strong>随便问</strong>
-                <p>把语音问题交给 AI 回答，结果展示在结果窗口，不会误粘贴到当前输入框。</p>
+                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkMessageSearch"></use></svg></span><span class="capabilityTag">场景</span></div>
+                <strong>按用途调整语气</strong>
+                <p>同一句话可以变成群消息、邮件、日报、会议结论或客户回复。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
                 <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkCopy"></use></svg></span><span class="capabilityTag">粘贴</span></div>
-                <strong>自动粘贴与兜底</strong>
-                <p>具备系统粘贴权限时自动粘贴，失败时弹结果窗口，避免伪装成功。</p>
+                <strong>自动写回当前输入框</strong>
+                <p>能粘贴就直接放回当前应用；粘贴失败也会显示结果，不怕内容丢失。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
                 <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkHistory"></use></svg></span><span class="capabilityTag">本地</span></div>
                 <strong>历史与词典</strong>
-                <p>本地保存历史、耗时、原文和最终结果，词典可参与后续识别与输出。</p>
+                <p>常用词、人名、项目名可以放进词典；最近结果也能回看，方便二次复制。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
               <article class="capabilityCard reveal">
-                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkKey"></use></svg></span><span class="capabilityTag">安全</span></div>
-                <strong>密钥安全</strong>
-                <p>Mimo 密钥保存到系统安全存储，恢复默认设置不会误删密钥。</p>
+                <div class="capabilityTop"><span class="capabilityIcon"><svg class="iconPark" aria-hidden="true"><use href="#iconParkKey"></use></svg></span><span class="capabilityTag">安心</span></div>
+                <strong>权限和数据看得见</strong>
+                <p>麦克风、辅助功能、快捷键和本地历史都有明确状态，出问题知道去哪处理。</p>
                 <div class="capabilityWave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span></div>
               </article>
             </div>
@@ -2347,11 +2346,11 @@
         <section id="flow" class="section">
           <div class="sectionInner">
             <div class="sectionHeader reveal">
-              <div class="sectionKicker">使用链路</div>
-              <h2 class="sectionTitle">它的核心链路：说一句话，穿过四个节点，回到输入框。</h2>
+              <div class="sectionKicker">怎么使用</div>
+              <h2 class="sectionTitle">四步就能用：按键、说话、整理、写回。</h2>
               <p class="sectionCopy">
-                它把输入动作拆成一条很短的链路：录音胶囊出现，声音变成文字，AI 按模式处理，
-                最后粘贴到当前输入框或进入结果窗口。
+                你只管把想法说出来。CodexMan 会处理录音、转文字、整理语气和输出结果，
+                尽量不打断你正在做的事。
               </p>
             </div>
 
@@ -2364,11 +2363,11 @@
                 <div class="morphGrid">
                   <div class="speechBox">
                     <span>口述原文</span>
-                    <p id="morphOriginal">今天这个会议讲了很多点，我有点乱，帮我整理一下结论和下一步。</p>
+                    <p id="morphOriginal">客户刚才问能不能今天给方案，我想回复说我们下午先确认需求，明早给第一版。</p>
                   </div>
                   <div class="outputBox">
-                    <span>typesass 输出</span>
-                    <p id="morphOutput">会议结论已整理：先确认需求范围，再补充负责人和时间节点，最后同步到项目群。</p>
+                    <span>CodexMan 输出</span>
+                    <p id="morphOutput">可以的，我们今天下午先和您确认需求范围，明天上午给到第一版方案。</p>
                   </div>
                 </div>
               </article>
@@ -2376,59 +2375,59 @@
               <aside class="timeline reveal" aria-label="工作流步骤">
                 <div class="timelineStep">
                   <span class="dataPacket" aria-hidden="true"></span>
-                  <strong>1. 呼出胶囊</strong>
-                  <span>后台驻留，快捷键触发，界面只出现必要的录音控制。</span>
+                  <strong>1. 在当前软件里按快捷键</strong>
+                  <span>微信、飞书、浏览器、邮件、编辑器都可以，不需要先打开聊天窗口。</span>
                 </div>
                 <div class="timelineStep">
                   <span class="dataPacket" aria-hidden="true"></span>
-                  <strong>2. 语音转写</strong>
-                  <span>浏览器侧采集音频，Mimo 语音识别返回文本和耗时。</span>
+                  <strong>2. 把想法直接说出来</strong>
+                  <span>长一点、乱一点也没关系，后面可以自动整理成更清楚的句子。</span>
                 </div>
                 <div class="timelineStep">
                   <span class="dataPacket" aria-hidden="true"></span>
-                  <strong>3. AI 整理</strong>
-                  <span>口述、翻译、随便问三种模式复用同一个输入链路。</span>
+                  <strong>3. 自动转文字并润色</strong>
+                  <span>去掉口头禅、重复和不顺的表达，保留你真正想说的意思。</span>
                 </div>
                 <div class="timelineStep">
                   <span class="dataPacket" aria-hidden="true"></span>
-                  <strong>4. 自动粘贴</strong>
-                  <span>有输入焦点就写回当前应用，失败时打开结果兜底窗口。</span>
+                  <strong>4. 回到当前输入框</strong>
+                  <span>能自动粘贴就直接写回；如果当前应用不允许粘贴，也会显示结果。</span>
                 </div>
               </aside>
             </div>
           </div>
         </section>
 
-        <section id="hub" class="section productBand">
+        <section id="privacy" class="section productBand">
           <div class="sectionInner showcaseGrid">
             <div class="showcaseCopy reveal">
-              <div class="sectionKicker">产品界面</div>
-              <h2 class="sectionTitle">界面保持黑色工作台风格，重点展示真实状态。</h2>
+              <div class="sectionKicker">隐私与权限</div>
+              <h2 class="sectionTitle">需要哪些权限、当前是否可用，打开 App 就能看见。</h2>
               <p class="sectionCopy">
-                现有应用已经形成了清晰的暗色系统：左侧导航、圆润卡片、紫色主操作、绿色运行状态和琥珀诊断提示。
-                用户打开后可以直接看到密钥、麦克风、系统权限、快捷键、历史结果和诊断信息。
+                语音输入需要麦克风，自动粘贴需要辅助功能权限。CodexMan 会把这些状态放在首页，
+                你不需要猜“为什么不能录音”或“为什么没有粘贴成功”。
               </p>
               <div class="featureGrid">
                 <div class="featureCard">
-                  <strong>真实状态，不做假仪表盘</strong>
-                  <span>首页展示密钥、麦克风、系统权限、快捷键和最近结果。</span>
+                  <strong>麦克风权限可检查</strong>
+                  <span>录音前会确认 CodexMan App 自己是否拿到了麦克风权限。</span>
                 </div>
                 <div class="featureCard">
-                  <strong>词典参与输出</strong>
-                  <span>术语本地保存，用作语音识别和 AI 文本处理的上下文。</span>
+                  <strong>粘贴失败也有结果</strong>
+                  <span>如果当前软件不允许自动粘贴，整理好的文字仍会保留在结果窗口。</span>
                 </div>
                 <div class="featureCard">
-                  <strong>结果可追踪</strong>
-                  <span>历史记录保留录音、转写、AI 整理和粘贴耗时。</span>
+                  <strong>历史和词典在本机</strong>
+                  <span>常用词、最近结果和偏好默认保存在你的电脑上，方便回看和修改。</span>
                 </div>
                 <div class="featureCard">
-                  <strong>桌面权限可见</strong>
-                  <span>麦克风、系统权限、快捷键冲突都能在界面里看到状态。</span>
+                  <strong>安装更安心</strong>
+                  <span>Mac 安装包已按 Developer ID 签名并通过 Apple 公证。</span>
                 </div>
               </div>
             </div>
             <figure class="screenshotShell reveal">
-              <img src="./assets/hubHome.png" alt="typesass 首页截图" />
+              <img src="./assets/hubHome.png" alt="CodexMan 权限和首页状态截图" />
             </figure>
           </div>
         </section>
@@ -2436,37 +2435,33 @@
         <section id="modes" class="section">
           <div class="sectionInner">
             <div class="sectionHeader reveal">
-              <div class="sectionKicker">输入模式</div>
-              <h2 class="sectionTitle">口述、翻译、随便问，像切换乐器一样切换输入方式。</h2>
+              <div class="sectionKicker">高级能力</div>
+              <h2 class="sectionTitle">不止语音输入，也能当作你的 AI 工作台。</h2>
               <p class="sectionCopy">
-                三种模式覆盖不同输入场景：想直接发出去就用口述，想跨语言沟通就用翻译，
-                想问一个问题但不污染输入框就用随便问。
+                如果你是重度 AI 工具用户，可以在同一个桌面入口里管理文本润色、历史记录和任务看板。
+                普通用户只需要使用语音输入和划词润色即可。
               </p>
             </div>
 
             <div class="modeGrid">
-              <div class="modeSwitch reveal" role="tablist" aria-label="语音模式">
+              <div class="modeSwitch reveal" role="tablist" aria-label="工作流截图">
                 <button class="modeButton isActive" type="button" data-mode="dictate" role="tab" aria-selected="true">
-                  <strong>口述</strong>
-                  <span>说完直接整理成可粘贴文本，也可以关闭 AI 润色保留原始转写。</span>
+                  <strong>任务看板</strong>
+                  <span>适合需要同时跟进多个 AI 任务的人，把执行中、待处理和历史任务放在一起看。</span>
                 </button>
-                <button class="modeButton" type="button" data-mode="translate" role="tab" aria-selected="false">
-                  <strong>翻译</strong>
-                  <span>先转写，再翻译到设置里的目标语言，适合跨语言会议和聊天。</span>
-                </button>
-                <button class="modeButton" type="button" data-mode="ask" role="tab" aria-selected="false">
-                  <strong>随便问</strong>
-                  <span>把语音问题交给 AI 回答，结果展示在结果窗口，不强行粘贴。</span>
+                <button class="modeButton" type="button" data-mode="polish" role="tab" aria-selected="false">
+                  <strong>文本润色</strong>
+                  <span>选中已有文字后快速润色，适合邮件、日报、群消息和客户回复。</span>
                 </button>
               </div>
 
               <article class="modePreview reveal" aria-live="polite">
                 <div class="modeImage">
-                  <img id="modeImage" src="./assets/modesView.png" alt="typesass 语音模式设置截图" />
+                  <img id="modeImage" src="./assets/modesView.png" alt="CodexMan 任务管理截图" />
                 </div>
                 <div class="modeCaption">
-                  <strong id="modeCaptionTitle">口述模式</strong>
-                  <span id="modeShortcut">快捷键可配置</span>
+                  <strong id="modeCaptionTitle">任务看板</strong>
+                  <span id="modeShortcut">高级工作台</span>
                 </div>
               </article>
             </div>
@@ -2475,22 +2470,22 @@
 
         <div class="ticker" aria-hidden="true">
           <div class="tickerTrack">
-            <span>Tauri v2 桌面端</span>
-            <span>浏览器侧录音</span>
-            <span>Mimo 语音识别</span>
-            <span>系统安全存储</span>
+            <span>Mac 桌面端</span>
+            <span>快捷键语音输入</span>
+            <span>语音转文字</span>
+            <span>AI 整理润色</span>
             <span>本地历史</span>
-            <span>词典上下文</span>
-            <span>全局快捷键</span>
-            <span>自动粘贴</span>
-            <span>Tauri v2 桌面端</span>
-            <span>浏览器侧录音</span>
-            <span>Mimo 语音识别</span>
-            <span>系统安全存储</span>
+            <span>常用词词典</span>
+            <span>任何输入框</span>
+            <span>自动写回</span>
+            <span>Mac 桌面端</span>
+            <span>快捷键语音输入</span>
+            <span>语音转文字</span>
+            <span>AI 整理润色</span>
             <span>本地历史</span>
-            <span>词典上下文</span>
-            <span>全局快捷键</span>
-            <span>自动粘贴</span>
+            <span>常用词词典</span>
+            <span>任何输入框</span>
+            <span>自动写回</span>
           </div>
         </div>
 
@@ -2498,10 +2493,10 @@
           <div class="sectionInner">
             <div class="sectionHeader reveal">
               <div class="sectionKicker">AI 能力</div>
-              <h2 class="sectionTitle">AI 不只是回答问题，它会把口述变成能直接使用的文字。</h2>
+              <h2 class="sectionTitle">AI 把口述变成能直接使用的文字。</h2>
               <p class="sectionCopy">
-                普通人说话时经常会停顿、重复、顺序混乱，甚至一句话里夹着很多不确定表达。
-                typesass 会先理解原意，再按场景做总结、润色、改写、翻译或问答。
+                日常口述难免有停顿、重复和顺序不清。CodexMan 会尽量保留你的原意，
+                再根据场景整理成更自然、更像你要发送出去的文字。
               </p>
             </div>
 
@@ -2509,20 +2504,20 @@
               <article class="openSourcePanel reveal" aria-label="AI 文本处理能力">
                 <div class="stackMap">
                   <div class="stackNode">
-                    <strong>自动总结</strong>
-                    <span>把一大段口述压缩成重点、结论和下一步，适合会议记录、项目沟通和复盘整理。</span>
+                    <strong>把口语变成消息</strong>
+                    <span>“嗯就是那个客户问方案什么时候给”可以变成一段清楚的客户回复。</span>
                   </div>
                   <div class="stackNode">
-                    <strong>口述润色</strong>
-                    <span>把停顿、重复、语序不顺和表达不清的内容整理成自然、清楚、能直接发送的文本。</span>
+                    <strong>把想法变成要点</strong>
+                    <span>一段很长的会议口述，可以整理成结论、负责人和下一步。</span>
                   </div>
                   <div class="stackNode">
                     <strong>按场景改写</strong>
-                    <span>同一句话可以整理成项目群消息、邮件、技术记录或更礼貌的正式表达。</span>
+                    <span>同一句话可以更正式、更简洁、更礼貌，也可以更适合发到群里。</span>
                   </div>
                   <div class="stackNode">
-                    <strong>翻译与问答</strong>
-                    <span>语音问题可以直接交给 AI 回答，也可以把中文口述翻译成目标语言。</span>
+                    <strong>常用词更稳定</strong>
+                    <span>把人名、项目名、产品名放进词典，后续识别和整理时更不容易写错。</span>
                   </div>
                 </div>
               </article>
@@ -2531,29 +2526,29 @@
                 <div class="releaseItem">
                   <span class="releaseMark"><svg class="iconPark" aria-hidden="true"><use href="#iconParkFileText"></use></svg></span>
                   <span>
-                    <strong>总结长口述</strong>
-                    <span>用户说了很多内容时，AI 会提炼主题、重点和待办，不让信息散掉。</span>
+                    <strong>整理长口述</strong>
+                    <span>适合写会议结论、需求说明、排查记录和长段工作消息。</span>
                   </span>
                 </div>
                 <div class="releaseItem">
                   <span class="releaseMark"><svg class="iconPark" aria-hidden="true"><use href="#iconParkMagicWand"></use></svg></span>
                   <span>
                     <strong>润色普通表达</strong>
-                    <span>把“嗯、然后、就是、那个”这类口语痕迹去掉，保留真实意思。</span>
+                    <span>去掉“嗯、然后、就是、那个”这类口语痕迹，让文字更顺。</span>
                   </span>
                 </div>
                 <div class="releaseItem">
                   <span class="releaseMark"><svg class="iconPark" aria-hidden="true"><use href="#iconParkBrain"></use></svg></span>
                   <span>
                     <strong>理解语义而不是照抄</strong>
-                    <span>不是把转写原文原样粘贴，而是按目标场景整理成更有条理的结果。</span>
+                    <span>不是机械照抄转写原文，而是按你的目标场景整理出可用结果。</span>
                   </span>
                 </div>
                 <div class="releaseItem">
                   <span class="releaseMark"><svg class="iconPark" aria-hidden="true"><use href="#iconParkDatabaseTime"></use></svg></span>
                   <span>
                     <strong>词典参与输出</strong>
-                    <span>本地词典可以提供术语上下文，让人名、项目名和专业词更稳定。</span>
+                    <span>本地词典提供术语上下文，让人名、项目名和专业词更稳定。</span>
                   </span>
                 </div>
               </aside>
@@ -2564,33 +2559,76 @@
         <section id="useCases" class="section">
           <div class="sectionInner">
             <div class="sectionHeader reveal">
-              <div class="sectionKicker">使用场景</div>
-              <h2 class="sectionTitle">它应该出现在你真正打字的地方。</h2>
+              <div class="sectionKicker">适合谁</div>
+              <h2 class="sectionTitle">如果你每天都在输入长内容，它会很快变成顺手工具。</h2>
               <p class="sectionCopy">
-                typesass 的价值不是多一个聊天窗口，而是减少你在日常工具里的输入成本。
-                所以官网要展示它如何进入真实工作流，而不是停留在抽象宣传语。
+                它尤其适合需要频繁沟通、记录和整理文字的人。不是为了炫技，而是让你少打字、少复制、少切换。
               </p>
             </div>
             <div class="referenceGrid">
               <article class="referenceCard reveal">
-                <strong>项目沟通</strong>
-                <span>在飞书、微信或邮件里口述一段想法，自动整理成能直接发送的文字。</span>
-                <small>口述 + AI 润色</small>
+                <strong>每天要回很多消息的人</strong>
+                <span>销售、运营、客服、项目经理，可以把口述快速整理成清楚礼貌的回复。</span>
+                <small>沟通效率</small>
               </article>
               <article class="referenceCard reveal">
-                <strong>跨语言聊天</strong>
-                <span>说中文，输出英文、日文或其它目标语言，减少来回复制翻译的动作。</span>
-                <small>语音翻译</small>
+                <strong>经常写记录和总结的人</strong>
+                <span>会议结论、日报周报、需求说明，可以先说出来，再让 AI 整理结构。</span>
+                <small>记录整理</small>
               </article>
               <article class="referenceCard reveal">
-                <strong>技术记录</strong>
-                <span>把会议、排查结论、代码上下文里的术语放进本地词典，后续输出更稳定。</span>
-                <small>词典 + 历史</small>
+                <strong>长时间打字容易累的人</strong>
+                <span>长消息和重复输入交给语音，手只负责确认和微调。</span>
+                <small>少打字</small>
               </article>
               <article class="referenceCard reveal">
-                <strong>快速问答</strong>
-                <span>不想污染输入框时，用随便问模式把问题交给 AI，结果留在结果窗口里处理。</span>
-                <small>问答模式</small>
+                <strong>AI 工具重度用户</strong>
+                <span>把语音输入、划词润色、历史和任务看板放在一个桌面入口里。</span>
+                <small>AI 工作台</small>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section id="faq" class="section productBand">
+          <div class="sectionInner">
+            <div class="sectionHeader reveal">
+              <div class="sectionKicker">常见问题</div>
+              <h2 class="sectionTitle">下载前，先把最关心的问题说清楚。</h2>
+              <p class="sectionCopy">
+                第一个版本会优先打磨 Mac 桌面体验。如果你只想知道“能不能用、怎么开始、会不会丢内容”，看这里就够了。
+              </p>
+            </div>
+            <div class="referenceGrid">
+              <article class="referenceCard reveal">
+                <strong>支持哪些软件？</strong>
+                <span>只要是 Mac 上能输入文字的位置，都可以尝试使用，例如飞书、微信、浏览器、邮件、文档和编辑器。</span>
+                <small>输入框</small>
+              </article>
+              <article class="referenceCard reveal">
+                <strong>为什么要开麦克风和辅助功能？</strong>
+                <span>麦克风用于录音；辅助功能用于把整理好的结果粘贴回当前应用。不开辅助功能也能在结果窗口查看文字。</span>
+                <small>权限</small>
+              </article>
+              <article class="referenceCard reveal">
+                <strong>安装会被 macOS 拦截吗？</strong>
+                <span>当前 Mac 安装包已通过 Developer ID 签名和 Apple 公证，正常下载后可以按系统提示安装。</span>
+                <small>Mac 安装</small>
+              </article>
+              <article class="referenceCard reveal">
+                <strong>下载后能直接用吗？</strong>
+                <span>你需要在模型管理里配置可用的语音识别和文本模型。配置完成后，就可以通过快捷键使用。</span>
+                <small>模型配置</small>
+              </article>
+              <article class="referenceCard reveal">
+                <strong>Windows 支持吗？</strong>
+                <span>Windows 版本还在准备中。当前优先提供 Mac 版本。</span>
+                <small>路线图</small>
+              </article>
+              <article class="referenceCard reveal">
+                <strong>开发者可以接入吗？</strong>
+                <span>可以。CodexMan 保留 HTTP API 能力，适合需要把语音转文字和文本处理接入其它工具的高级用户。</span>
+                <small>高级能力</small>
               </article>
             </div>
           </div>
@@ -2601,14 +2639,23 @@
             <article class="ctaPanel reveal">
               <div class="ctaContent">
                 <div class="sectionKicker">开始使用</div>
-                <h2 class="sectionTitle">按下你设置的快捷键，把说出来的话变成可发送文本。</h2>
+                <h2 class="sectionTitle">下载 Mac 版，先把下一段长消息说出来。</h2>
                 <p class="sectionCopy">
-                  typesass 的核心不是多开一个聊天窗口，而是让语音直接进入你正在使用的输入框。
-                  从口述到总结、润色、翻译、问答和粘贴，整个链路都围绕“少打字、少复制、少切换”。
+                  安装后配置麦克风、快捷键和模型，就可以在日常输入框里使用。
+                  从口述到整理、润色和粘贴，整个过程都围绕“少打字、少复制、少切换”。
                 </p>
                 <div class="heroActions">
-                  <a class="solidButton" href="#features">查看核心功能</a>
-                  <a class="ghostButton" href="#aiAbility">查看 AI 能力</a>
+                  <a
+                    class="solidButton downloadButton"
+                    href="/downloads/codexman_0.1.22_aarch64.dmg"
+                    download="codexman_0.1.22_aarch64.dmg"
+                    aria-label="下载 CodexMan Mac 版本"
+                  >
+                    <svg class="iconPark" aria-hidden="true"><use href="#iconParkApple"></use></svg>
+                    <span>下载 Mac 版</span>
+                    <svg class="iconPark" aria-hidden="true"><use href="#iconParkDownloadOne"></use></svg>
+                  </a>
+                  <a class="ghostButton" href="#faq">查看常见问题</a>
                 </div>
               </div>
             </article>
@@ -2619,13 +2666,13 @@
       <footer class="footer">
         <div class="footerInner">
           <div class="brandLockup">
-            <img class="brandLogo" src="./assets/typesassLogo.png" alt="" />
+            <img class="brandLogo" src="./assets/codexManLogo.png" alt="" />
             <span class="brandText">
-              <span class="brandName">typesass</span>
+              <span class="brandName">CodexMan</span>
               <span class="brandMeta">AI 语音输入工具</span>
             </span>
           </div>
-          <span>把口述、AI 处理和自动粘贴连接成一条桌面输入链路。</span>
+          <span>把口述、AI 整理和自动粘贴连接成顺手的桌面输入体验。</span>
         </div>
       </footer>
     </div>
@@ -2687,21 +2734,21 @@
       const phrases = [
         {
           status: "录音中",
-          original: "今天这个会议讲了很多点，我有点乱，帮我整理一下结论和下一步。",
-          output: "会议结论已整理：先确认需求范围，再补充负责人和时间节点，最后同步到项目群。",
-          hero: "把这段口述整理成适合发到项目群里的中文说明，保留要点和下一步。",
+          original: "客户刚才问能不能今天给方案，我想回复说我们下午先确认需求，明早给第一版。",
+          output: "可以的，我们今天下午先和您确认需求范围，明天上午给到第一版方案。",
+          hero: "说得乱也没关系，CodexMan 会整理成能直接发送的文字。",
         },
         {
           status: "转写中",
-          original: "把这句话翻译成英文，语气自然一点，不要像机器翻译。",
-          output: "英文表达已整理成自然语气，可直接用于跨语言沟通。",
-          hero: "翻译结果已生成，目标语言、术语和语气偏好来自本地设置。",
+          original: "今天会里主要说了三个事，一个是需求边界，一个是负责人，还有下周要给时间表。",
+          output: "会议结论：先确认需求边界，再明确负责人，下周补充时间表。",
+          hero: "会议想法、日报周报、客户回复，都可以先说出来。",
         },
         {
           status: "思考中",
-          original: "我刚才说得有点乱，帮我改成一段适合发给同事的说明。",
-          output: "已整理成同事可读的说明：目标、背景、当前问题和下一步都会分清楚。",
-          hero: "问答结果已保留在结果窗口，不会在没有输入焦点时误粘贴。",
+          original: "这段话帮我改得客气一点，但是不要太官方，适合发给合作方。",
+          output: "我们这边会尽快确认细节，并在整理完成后第一时间同步给您。",
+          hero: "选中文字也能一键改语气，让表达更自然。",
         },
       ];
 
@@ -2739,22 +2786,16 @@
 
       const modeData = {
         dictate: {
-          title: "口述模式",
-          shortcut: "快捷键可配置",
+          title: "任务看板",
+          shortcut: "高级工作台",
           image: "./assets/modesView.png",
-          alt: "typesass 语音模式设置截图",
+          alt: "CodexMan 任务管理截图",
         },
-        translate: {
-          title: "翻译模式",
-          shortcut: "快捷键可配置",
-          image: "./assets/modesView.png",
-          alt: "typesass 翻译模式设置截图",
-        },
-        ask: {
-          title: "随便问模式",
+        polish: {
+          title: "文本润色",
           shortcut: "快捷键可配置",
           image: "./assets/historyView.png",
-          alt: "typesass 历史结果截图",
+          alt: "CodexMan 文本润色历史截图",
         },
       };
 

@@ -20,7 +20,7 @@ fn build_process_tap_helper() {
         let target = env::var("TARGET").unwrap_or_else(|_| "aarch64-apple-darwin".to_string());
         let output_dir = manifest_dir.join("binaries");
         std::fs::create_dir_all(&output_dir).expect("failed to create helper binary directory");
-        let output = output_dir.join(format!("typesass-process-tap-{}", target));
+        let output = output_dir.join(format!("codexman-process-tap-{}", target));
         println!("cargo:rerun-if-changed={}", source.display());
         let status = Command::new("xcrun")
             .args([

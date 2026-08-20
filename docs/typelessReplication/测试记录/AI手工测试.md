@@ -91,7 +91,7 @@
 
 结论：
 
-- 最新 `.app` 启动后后台驻留，窗口列表中没有 typesass 可见窗口，符合“快捷键唤起悬浮条，不常驻屏幕”的要求。
+- 最新 `.app` 启动后后台驻留，窗口列表中没有 CodexMan 可见窗口，符合“快捷键唤起悬浮条，不常驻屏幕”的要求。
 - Hub 预览保持深色侧栏、紧凑卡片、紫色主操作和状态胶囊风格，视觉方向与用户参考图一致。
 - 首页没有 demo/mock 数据：统计为本地历史计算值，最近结果为空时复制/重新整理处于禁用态。
 - 设置页中的快捷键、Mimo、麦克风、开机启动、Dock、辅助功能诊断均有真实代码入口。
@@ -167,9 +167,9 @@
 
 检查对象：
 
-- `output/playwright/typesass-shortcut-diagnostic-home-20260724.png`
-- `output/playwright/typesass-shortcut-diagnostic-settings-bottom-20260724.png`
-- `src-tauri/target/release/bundle/macos/typesass.app/Contents/Resources/icon.icns`
+- `output/playwright/codexman-shortcut-diagnostic-home-20260724.png`
+- `output/playwright/codexman-shortcut-diagnostic-settings-bottom-20260724.png`
+- `src-tauri/target/release/bundle/macos/CodexMan.app/Contents/Resources/icon.icns`
 
 结论：
 
@@ -187,10 +187,10 @@
 
 检查对象：
 
-- `output/playwright/typesass-polished-home-20260724.png`
-- `output/playwright/typesass-polished-shortcuts-20260724.png`
-- `output/playwright/typesass-polished-history-timing-20260724.png`
-- `output/playwright/typesass-polished-floating-pill-20260724.png`
+- `output/playwright/codexman-polished-home-20260724.png`
+- `output/playwright/codexman-polished-shortcuts-20260724.png`
+- `output/playwright/codexman-polished-history-timing-20260724.png`
+- `output/playwright/codexman-polished-floating-pill-20260724.png`
 
 结论：
 
@@ -208,8 +208,8 @@
 
 检查对象：
 
-- `output/playwright/typesass-accessibility-watch-state-20260724.png`
-- `output/playwright/typesass-short-recording-toast-20260724.png`
+- `output/playwright/codexman-accessibility-watch-state-20260724.png`
+- `output/playwright/codexman-short-recording-toast-20260724.png`
 
 结论：
 
@@ -222,7 +222,7 @@
 
 检查对象：
 
-- `output/playwright/typesass-diagnostic-log-20260724.png`
+- `output/playwright/codexman-diagnostic-log-20260724.png`
 - `src/main.ts`
 - `src-tauri/src/lib.rs`
 
@@ -248,13 +248,13 @@
 
 待用户确认：
 
-- 在真实 macOS 辅助功能设置中勾选当前 `typesass.app` 后，Hub 是否自动刷新为已授权。
+- 在真实 macOS 辅助功能设置中勾选当前 `CodexMan.app` 后，Hub 是否自动刷新为已授权。
 
 ## 2026-07-24 翻译目标下拉选择视觉复核
 
 检查对象：
 
-- `output/playwright/typesass-translation-target-select-20260724.png`
+- `output/playwright/codexman-translation-target-select-20260724.png`
 
 结论：
 
@@ -271,11 +271,11 @@
 
 检查对象：
 
-- `output/playwright/typesass-mode-settings-split-20260724.png`
-- `output/playwright/typesass-dictate-settings-20260724.png`
-- `output/playwright/typesass-translate-settings-20260724.png`
-- `output/playwright/typesass-ask-settings-20260724.png`
-- `output/playwright/typesass-system-settings-split-20260724.png`
+- `output/playwright/codexman-mode-settings-split-20260724.png`
+- `output/playwright/codexman-dictate-settings-20260724.png`
+- `output/playwright/codexman-translate-settings-20260724.png`
+- `output/playwright/codexman-ask-settings-20260724.png`
+- `output/playwright/codexman-system-settings-split-20260724.png`
 
 结论：
 
@@ -294,8 +294,8 @@
 
 检查对象：
 
-- `output/playwright/typesass-dictation-output-language-enabled-20260724.png`
-- `output/playwright/typesass-dictation-output-language-disabled-20260724.png`
+- `output/playwright/codexman-dictation-output-language-enabled-20260724.png`
+- `output/playwright/codexman-dictation-output-language-disabled-20260724.png`
 
 结论：
 
@@ -318,7 +318,7 @@
 结论：
 
 - 原逻辑只在 Hub 初始化、手动刷新、保存设置或从 App 内打开辅助功能设置后刷新诊断。
-- 如果用户直接在 macOS 系统设置中移除 `typesass.app` 辅助功能权限，Hub 可能短时间保留旧的“已授权”展示。
+- 如果用户直接在 macOS 系统设置中移除 `CodexMan.app` 辅助功能权限，Hub 可能短时间保留旧的“已授权”展示。
 - 本批新增 Hub 诊断自动刷新：窗口重新聚焦、页面重新可见、以及 Hub 打开时每 4 秒自动刷新一次。
 - 自动刷新仍读取 Rust `get_runtime_diagnostics` 的真实 `accessibilityTrusted`，不是前端缓存或 mock 状态。
 
@@ -356,7 +356,7 @@
 
 - 已确认 macOS 基准粘贴可用：TextEdit 正文获得焦点后，剪贴板内容可以通过 `System Events` 的 `Cmd+V` 写入文档。
 - 已确认自动化脚本模拟 `Control + P` 不稳定：AppleScript / CoreGraphics 发送的 `Control + P` 不总是被 Tauri 全局快捷键插件当成真实快捷键，因此不能替代用户物理按键验收。
-- 修复方向改为产品逻辑层：打开 Hub 前记住最近一次非 typesass 前台 App；Hub 前台启动录音时隐藏 Hub 并把目标 App 传给悬浮录音条；粘贴前隐藏 main/result/hub 三类临时窗口。
+- 修复方向改为产品逻辑层：打开 Hub 前记住最近一次非 CodexMan 前台 App；Hub 前台启动录音时隐藏 Hub 并把目标 App 传给悬浮录音条；粘贴前隐藏 main/result/hub 三类临时窗口。
 - 自动粘贴触发从单一 CoreGraphics 改为 `System Events` 优先，失败时回退 CoreGraphics，贴近本机基准粘贴成功路径。
 - 本地自动化能确认写剪贴板和系统粘贴动作，但物理 `Control + P -> 录音 -> 停止 -> 粘贴` 仍需要用户手按确认。
 
@@ -370,13 +370,13 @@
 
 - `src-tauri/src/lib.rs` 的 `get_recording_target_app` 和 `paste_text` 目标 App 兜底。
 - `src/main.ts` 的录音开始目标 App 确认逻辑。
-- 最新打包产物 `src-tauri/target/release/bundle/macos/typesass.app`，打包时间 `2026-07-25 01:07`。
+- 最新打包产物 `src-tauri/target/release/bundle/macos/CodexMan.app`，打包时间 `2026-07-25 01:07`。
 
 结论：
 
 - 用户反馈退出并重新打开 App 后，转写能完成，但结果没有追加到当前输入框。
 - 该现象更符合“重启后目标 App 为空或丢失，粘贴指令没有回到输入框所在应用”，不是 ASR 失败。
-- 本批新增 Rust 侧录音目标读取命令：当前前台是 typesass 时回退到最近一次外部 App。
+- 本批新增 Rust 侧录音目标读取命令：当前前台是 CodexMan 时回退到最近一次外部 App。
 - 自动粘贴时若前端传入目标为空，会依次使用发送前的外部前台 App、Rust 运行期最近外部 App 作为兜底，再激活目标后发送 Cmd+V。
 - 前端开始录音时也会主动读取 Rust 侧保存的目标 App，避免重启后第一次使用时 targetApp 在事件 payload 中丢失。
 - 构建和静态检查已通过；未使用脚本模拟真实录音，避免污染用户体验结论。
@@ -392,7 +392,7 @@
 
 待用户确认：
 
-- 退出 typesass 后重新打开，聚焦真实输入框，按物理 `Control + P` 开始录音，说 2-4 秒，再按 `Control + P` 停止，确认文本是否直接追加到输入框。
+- 退出 CodexMan 后重新打开，聚焦真实输入框，按物理 `Control + P` 开始录音，说 2-4 秒，再按 `Control + P` 停止，确认文本是否直接追加到输入框。
 - 如果仍失败，打开“诊断日志”查看最新粘贴记录中的目标、发送前、激活后、发送后和粘贴方式。
 
 ## 2026-07-25 ChatGPT WebView 粘贴事件复核
@@ -411,7 +411,7 @@
 - 本批将系统粘贴改为优先使用更接近物理键盘事件的 `CoreGraphics`，仅在键盘事件创建失败时回退 `System Events`。
 - 自动粘贴日志中“粘贴指令已发送”改为信息级别，不再把命令发出等同于实际插入成功。
 - 诊断日志新增目标 App 内的焦点元素摘要：发送前、激活后、发送后，用于判断 ChatGPT 这类 WebView 是否还聚焦在输入框。
-- 最新打包产物 `typesass.app/Contents/MacOS/ai-tool` 时间为 `2026-07-25 08:20:41`，已启动。
+- 最新打包产物 `CodexMan.app/Contents/MacOS/ai-tool` 时间为 `2026-07-25 08:20:41`，已启动。
 
 验证命令：
 
@@ -442,7 +442,7 @@
 - 本批新增一次性补救：发送粘贴后如果前台不是目标 App，会重新激活目标 App，等待前台稳定后再补发一次 `Cmd+V`。
 - 为避免重复粘贴，只有“发送后前台不是目标 App”时才会补发；发送后仍是目标 App 时不会重试。
 - 日志中的“方式”会记录补救链路，例如 `CoreGraphics -> 前台被System Settings抢占，恢复目标后重试 -> 重试：CoreGraphics`。
-- 最新打包产物 `typesass.app/Contents/MacOS/ai-tool` 时间为 `2026-07-25 08:26:10`，已启动。
+- 最新打包产物 `CodexMan.app/Contents/MacOS/ai-tool` 时间为 `2026-07-25 08:26:10`，已启动。
 
 验证命令：
 
@@ -464,17 +464,17 @@
 检查对象：
 
 - `src-tauri/src/lib.rs` 的 `trigger_voice_mode`、`show_main_window` 和 `paste_text`。
-- 最新打包产物 `src-tauri/target/release/bundle/macos/typesass.app`。
+- 最新打包产物 `src-tauri/target/release/bundle/macos/CodexMan.app`。
 
 结论：
 
-- 问题原因是 Rust 原生层在开始录音时主动执行了 `hub.hide()`，这是之前为了减少自动粘贴时焦点落回 typesass 的保护逻辑。
+- 问题原因是 Rust 原生层在开始录音时主动执行了 `hub.hide()`，这是之前为了减少自动粘贴时焦点落回 CodexMan 的保护逻辑。
 - 本批删除“开始录音/Hub 发起录音时隐藏 Hub”的逻辑，Hub 打开时按快捷键不会被主动收起。
-- 当当前前台就是 typesass Hub 时，录音会发给后台录音窗口处理，不再弹出顶部悬浮胶囊，也不恢复外部 App 焦点，避免录制动作影响 Hub 主页面显示。
+- 当当前前台就是 CodexMan Hub 时，录音会发给后台录音窗口处理，不再弹出顶部悬浮胶囊，也不恢复外部 App 焦点，避免录制动作影响 Hub 主页面显示。
 - 从 Hub 主界面发起的录音完成后会跳过自动粘贴，结果只更新到最近结果和历史记录，避免结束录音后 `paste_text` 隐藏 Hub。
 - 当当前前台是外部输入 App 时，仍显示顶部悬浮胶囊并保留目标 App 焦点，保持快捷口述体验。
-- 自动粘贴阶段仍保留隐藏 `main`、`result` 和 `hub` 的逻辑，避免最终文本粘贴回 typesass 自己。
-- 最新 `.app` 已重新构建并启动，进程为 `typesass.app/Contents/MacOS/ai-tool`。
+- 自动粘贴阶段仍保留隐藏 `main`、`result` 和 `hub` 的逻辑，避免最终文本粘贴回 CodexMan 自己。
+- 最新 `.app` 已重新构建并启动，进程为 `CodexMan.app/Contents/MacOS/ai-tool`。
 
 验证命令：
 
@@ -500,8 +500,8 @@
 
 结论：
 
-- 根因确认：旧逻辑在当前前台是 typesass 时，会回退使用“上一次外部 App”作为本次录音/粘贴目标；这会导致 Hub 主界面录音结束后误进自动粘贴流程，并触发 `hub.hide()`。
-- 已新增 Rust 单元测试锁定四条规则：Hub 前台不复用历史外部目标、外部 App 前台才作为粘贴目标、无明确目标且 typesass 前台不隐藏 Hub、显式目标才允许隐藏 Hub 并激活目标。
+- 根因确认：旧逻辑在当前前台是 CodexMan 时，会回退使用“上一次外部 App”作为本次录音/粘贴目标；这会导致 Hub 主界面录音结束后误进自动粘贴流程，并触发 `hub.hide()`。
+- 已新增 Rust 单元测试锁定四条规则：Hub 前台不复用历史外部目标、外部 App 前台才作为粘贴目标、无明确目标且 CodexMan 前台不隐藏 Hub、显式目标才允许隐藏 Hub 并激活目标。
 - 已把录音触发和自动粘贴统一接入同一套决策函数，避免前后两段逻辑各自判断。
 - 已执行 TextEdit 真实系统粘贴诊断：剪贴板写入和系统 `Cmd+V` 能进入 TextEdit 文档，说明系统粘贴基础链路可用。
 - 最新 `.app` 已重新构建并启动。
@@ -515,7 +515,7 @@
 - `cargo check --manifest-path src-tauri/Cargo.toml`：通过。
 - `git diff --check`：通过。
 - `npx tauri build --bundles app`：通过。
-- TextEdit 粘贴诊断：通过，写入剪贴板的 `typesass-paste-check-*` 文本成功进入 TextEdit 文档。
+- TextEdit 粘贴诊断：通过，写入剪贴板的 `codexman-paste-check-*` 文本成功进入 TextEdit 文档。
 
 剩余风险：
 

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>codexMan 请求列表</title>
+    <link rel="stylesheet" href="networkPanel.css">
+  </head>
+  <body>
+    <main class="network-panel">
+      <header class="network-panel__header">
+        <div>
+          <strong>请求列表</strong>
+          <span id="requestCountText">0 个请求</span>
+        </div>
+        <div class="network-panel__tools">
+          <input id="filterInput" type="search" placeholder="筛选 URL / Method / 状态">
+          <select id="typeFilterSelect" aria-label="按请求类型筛选">
+            <option value="">全部类型</option>
+          </select>
+          <button id="clearButton" type="button">清空</button>
+        </div>
+      </header>
+
+      <section class="network-panel__body">
+        <section class="network-panel__list">
+          <div class="network-panel__table-wrap">
+            <table class="network-panel__table">
+              <thead>
+                <tr>
+                  <th>Method</th>
+                  <th>状态</th>
+                  <th>URL</th>
+                  <th>类型</th>
+                  <th>耗时</th>
+                  <th>Fix</th>
+                </tr>
+              </thead>
+              <tbody id="requestTableBody"></tbody>
+            </table>
+            <div id="emptyState" class="network-panel__empty">暂无请求，刷新页面后会自动收集。</div>
+          </div>
+        </section>
+
+        <aside class="network-panel__detail">
+          <div id="detailEmptyState" class="network-panel__detail-empty">点击左侧任意请求查看详情。</div>
+          <div id="detailContent" class="network-panel__detail-content" hidden>
+            <header class="network-panel__detail-header">
+              <div>
+                <strong id="detailTitle"></strong>
+                <span id="detailSubtitle"></span>
+              </div>
+            </header>
+
+            <section class="network-panel__detail-section">
+              <h2>请求信息</h2>
+              <dl class="network-panel__meta">
+                <div><dt>Method</dt><dd id="detailMethod"></dd></div>
+                <div><dt>Status</dt><dd id="detailStatus"></dd></div>
+                <div><dt>Type</dt><dd id="detailType"></dd></div>
+                <div><dt>Time</dt><dd id="detailTime"></dd></div>
+              </dl>
+              <label>URL</label>
+              <pre id="detailUrl"></pre>
+            </section>
+
+            <section class="network-panel__detail-section">
+              <h2>请求头</h2>
+              <pre id="detailRequestHeaders"></pre>
+            </section>
+
+            <section class="network-panel__detail-section">
+              <h2>请求体</h2>
+              <pre id="detailRequestBody"></pre>
+            </section>
+
+            <section class="network-panel__detail-section">
+              <h2>响应头</h2>
+              <pre id="detailResponseHeaders"></pre>
+            </section>
+
+            <section class="network-panel__detail-section">
+              <h2>响应结果</h2>
+              <pre id="detailResponseBody"></pre>
+            </section>
+          </div>
+          <div id="detailFooter" class="network-panel__detail-footer" hidden>
+            <button id="copyCurlButton" class="network-panel__detail-action network-panel__detail-action--secondary" type="button">复制 cURL</button>
+            <button id="detailCreateFixButton" class="network-panel__detail-action" type="button">创建 fix 任务</button>
+          </div>
+        </aside>
+      </section>
+
+      <footer class="network-panel__footer">
+        <span id="messageText">选择接口后点击“创建 fix 任务”，会把 cURL、响应状态和响应内容一起写入新任务。</span>
+      </footer>
+
+      <div id="fixTaskDialog" class="network-panel__dialog-backdrop" hidden>
+        <section class="network-panel__dialog" role="dialog" aria-modal="true" aria-labelledby="fixTaskDialogTitle">
+          <header class="network-panel__dialog-header">
+            <div>
+              <strong id="fixTaskDialogTitle">创建 fix 任务</strong>
+              <span id="fixTaskDialogSubtitle"></span>
+            </div>
+            <button id="closeFixTaskDialogButton" class="network-panel__icon-button" type="button" aria-label="关闭">×</button>
+          </header>
+
+          <section class="network-panel__dialog-section">
+            <label for="projectSelect">任务项目</label>
+            <select id="projectSelect">
+              <option value="">选择项目后发送</option>
+            </select>
+          </section>
+
+          <section class="network-panel__dialog-section">
+            <label for="problemDescriptionInput">发送内容</label>
+            <textarea id="problemDescriptionInput" placeholder="将自动填入要发送给任务的完整请求、cURL 和响应内容，可在发送前编辑"></textarea>
+          </section>
+
+          <footer class="network-panel__dialog-footer">
+            <button id="cancelFixTaskButton" class="network-panel__dialog-button network-panel__dialog-button--secondary" type="button">取消</button>
+            <button id="confirmFixTaskButton" class="network-panel__dialog-button" type="button">创建 fix 任务</button>
+          </footer>
+        </section>
+      </div>
+    </main>
+    <script src="networkPanel.js"></script>
+  </body>
+</html>

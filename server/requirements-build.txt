@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# 固定 sidecar 打包器版本，确保干净机器生成结果可复现并兼容 Python 3.9。
+pyinstaller==6.22.0
