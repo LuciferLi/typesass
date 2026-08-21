@@ -31,9 +31,9 @@ use crate::{
     complete_session_task_core, create_session_project_core, create_session_task_core,
     delete_session_project_core, delete_session_task_core, get_codex_connection_core,
     list_codex_threads_core, list_codex_workspaces_core, load_session_workspace_data_core,
-    open_session_external_thread_core, queue_session_task_core, request_access_token_approval_core,
-    restart_codex_core, update_session_project_core, update_session_task_core,
-    CodexThreadListRequest,
+    open_session_external_thread_core, queue_session_task_core, read_codex_thread_messages_core,
+    request_access_token_approval_core, restart_codex_core, update_session_project_core,
+    update_session_task_core, CodexThreadListRequest,
 };
 
 /// 私有 RPC 单次请求 JSON 的最大长度；与公开 HTTP body 上限对齐，覆盖我的应用 zip data URL 上传。
@@ -52,7 +52,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 /// worker 全忙时允许短暂排队的连接数；超过后立即返回 RPC_BUSY，不形成无界线程或内存队列。
 const MAX_PENDING_CONNECTIONS: usize = 8;
 /// FastAPI 可调用的私有 RPC 方法全集；未登记方法在进入业务分发器前默认拒绝。
-const ALLOWED_METHODS: [&str; 22] = [
+const ALLOWED_METHODS: [&str; 23] = [
     "requestAccessTokenApproval",
     "loadWorkspaceData",
     "createProject",
@@ -66,6 +66,7 @@ const ALLOWED_METHODS: [&str; 22] = [
     "listCodexWorkspaces",
     "listCodexThreads",
     "openCodexThread",
+    "readCodexThreadMessages",
     "getCodexConnection",
     "restartCodex",
     "listMyApps",
@@ -761,6 +762,14 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                 open_session_external_thread_core(request.thread_id),
                 "CODEX_UNAVAILABLE",
                 "Codex 会话服务暂不可用。",
+            )
+        }
+        "readCodexThreadMessages" => {
+            let request = decode_params::<ThreadIdParams>(params)?;
+            serialize_business_result(
+                read_codex_thread_messages_core(request.thread_id),
+                "CODEX_UNAVAILABLE",
+                "Codex 会话详情暂不可用。",
             )
         }
         "getCodexConnection" => {

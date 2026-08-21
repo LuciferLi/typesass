@@ -330,6 +330,76 @@ class CodexThreadResponse(BaseModel):
     )
 
 
+class CodexThreadMessageResponse(BaseModel):
+    """CodeX 会话正文中的可展示消息。
+
+    流程：Rust 从 app-server 快照或受限 JSONL 中抽取用户与助手消息；HTTP 仅补充分页展示所需的 messageOrder。
+    边界：不返回工具原始日志、本机路径、token 或不可展示内部事件。
+    """
+
+    message_order: int = Field(
+        alias="messageOrder",
+        ge=1,
+        description="会话消息展示顺序，用于前端排序和后续历史分页锚点。",
+        examples=[1],
+    )
+    role: Literal["user", "assistant"] = Field(
+        description="消息角色；第一版只展示用户和助手消息。", examples=["assistant"]
+    )
+    content: str = Field(
+        description="已由 Rust 做单条长度保护的消息正文。", examples=["接口已经补齐。"]
+    )
+    created_at: str = Field(
+        alias="createdAt",
+        description="消息创建时间；来源不可用时允许为空字符串。",
+        examples=["1786406400000"],
+    )
+
+
+class CodexThreadMessageRangeResponse(BaseModel):
+    """CodeX 会话消息窗口范围。
+
+    用途：让前端区分历史分页游标和 SSE eventSeq，避免把两类游标混用。
+    """
+
+    start_message_order: int = Field(
+        alias="startMessageOrder", ge=0, description="当前窗口第一条消息顺序。", examples=[1]
+    )
+    end_message_order: int = Field(
+        alias="endMessageOrder", ge=0, description="当前窗口最后一条消息顺序。", examples=[80]
+    )
+    has_more_before: bool = Field(
+        alias="hasMoreBefore", description="窗口前方是否还有更早历史。", examples=[False]
+    )
+    has_more_after: bool = Field(
+        alias="hasMoreAfter", description="窗口后方是否还有更新消息。", examples=[False]
+    )
+
+
+class CodexThreadMessagesResponse(BaseModel):
+    """CodeX 会话正文窗口响应。
+
+    流程：对外只返回当前有界窗口；后续 JSONL actor 完成后可保持本模型不变并补齐向前分页。
+    边界：messages 为空代表会话存在但暂无可展示正文，不代表接口失败。
+    """
+
+    thread_id: str = Field(
+        alias="threadId",
+        description="CodeX thread 稳定 ID。",
+        examples=["0198f25a-1111-7000-8000-000000000001"],
+    )
+    title: str = Field(description="会话标题。", examples=["完善 HTTP 接口文档"])
+    updated_at: str = Field(
+        alias="updatedAt",
+        description="会话更新时间；来源不可用时允许为空字符串。",
+        examples=["1786406400000"],
+    )
+    messages: List[CodexThreadMessageResponse] = Field(
+        default_factory=list, description="当前窗口内可展示消息。"
+    )
+    range: CodexThreadMessageRangeResponse = Field(description="当前消息窗口范围。")
+
+
 class CodexConnectionResponse(BaseModel):
     """CodeX Desktop 本机连接状态响应。
 

@@ -61,8 +61,11 @@
                         collapsible>
                         <ui-accordion-item
                             :value="group.parent.id"
-                            class="overflow-hidden rounded-md border border-border/80 bg-background/45">
-                            <div class="flex min-w-0 items-start gap-2 p-2">
+                            class="overflow-hidden rounded-md border border-border/80 bg-background/45"
+                            :class="selectedThreadId === group.parent.id ? 'border-primary/60 bg-primary/10' : ''">
+                            <div
+                                class="flex min-w-0 items-start gap-2 p-2"
+                                @click="emit('select', group.parent.id)">
                                 <div class="flex min-w-0 flex-1 items-start gap-2">
                                     <span
                                         class="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-md border border-border bg-muted/45 text-muted-foreground">
@@ -115,6 +118,8 @@
                                         :key="child.id"
                                         type="button"
                                         class="group grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-muted/45"
+                                        :class="selectedThreadId === child.id ? 'bg-primary/10' : ''"
+                                        @click="emit('select', child.id)"
                                         @dblclick="emit('open', child.id)">
                                         <span
                                             class="mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded border border-primary/25 bg-primary/10 text-primary">
@@ -155,7 +160,11 @@
                         v-else
                         type="button"
                         class="group grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-md border border-border/75 bg-background/45 p-2 text-left hover:bg-muted/45"
-                        :class="group.parent.parentThreadId ? 'border-dashed' : ''"
+                        :class="[
+                            group.parent.parentThreadId ? 'border-dashed' : '',
+                            selectedThreadId === group.parent.id ? 'border-primary/60 bg-primary/10' : ''
+                        ]"
+                        @click="emit('select', group.parent.id)"
                         @dblclick="emit('open', group.parent.id)">
                         <span
                             class="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-md border border-border bg-muted/45 text-muted-foreground">
@@ -275,6 +284,8 @@
         loading: boolean;
         // 当前工作空间下 CodeX 原生会话列表。
         codexThreads: CodexThreadSummaryModel[];
+        // 当前右侧内容区选中的 CodeX thread ID。
+        selectedThreadId: string;
         // 当前任务系统中已经绑定 CodeX thread 的真实会话记录。
         sessions: SessionRecordModel[];
         // 是否已选中 CodeX 工作空间。
@@ -294,6 +305,8 @@
         search: [keyword: string];
         // 追加加载更多会话。
         loadMore: [];
+        // 切换右侧会话内容。
+        select: [threadId: string];
         // 打开外部 CodeX 会话。
         open: [threadId: string];
     }>();

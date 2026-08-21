@@ -21,6 +21,8 @@ import type {
 import type { RuntimeDiagnosticsModel, ShortcutProfileModel } from '@/model/permission';
 import type {
     CodexThreadListRequestModel,
+    CodexThreadMessagesResponseModel,
+    CodexThreadStreamEventModel,
     CodexThreadSummaryModel,
     CodexWorkspaceModel,
     CreateSessionProjectRequestModel,
@@ -108,6 +110,9 @@ export function isPublicApiRequestErrorCode(error: unknown, code: string): error
 
 /** 公共 API 请求支持的 HTTP 方法，避免通过是否存在请求体隐式推断方法。 */
 type PublicApiRequestMethod = 'GET' | 'POST';
+
+/** CodeX 会话 SSE 事件处理函数。 */
+export type CodexThreadStreamEventHandler = (event: CodexThreadStreamEventModel) => void;
 
 /** 公共 API 单次业务调用配置。 */
 interface PublicApiRequestOptions {
@@ -1021,6 +1026,111 @@ export async function listCodexThreads(request: CodexThreadListRequestModel): Pr
         method: 'POST',
         payload: request
     });
+}
+
+/**
+ * 读取 CodeX 会话正文窗口。
+ * 流程：通过公开 HTTP `/messages` 获取服务端有界窗口；messageOrder 仅用于历史分页和排序，不与 SSE seq 混用。
+ * 参数：threadId 为搜索接口返回的真实会话 ID。
+ * 返回：当前会话正文窗口。
+ * 异常：HTTP 鉴权、私有桥接或 CodeX 会话读取失败时透传稳定错误。
+ */
+export async function readCodexThreadMessages(threadId: string): Promise<CodexThreadMessagesResponseModel> {
+    return requestPublicApi<CodexThreadMessagesResponseModel>(
+        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages?limit=80`,
+        { method: 'GET' }
+    );
+}
+
+/**
+ * 判断未知对象是否为 CodeX 会话 SSE 事件。
+ * 流程：只校验前端合并所需的公共字段，避免把协议异常对象写入消息区。
+ * 参数：value 为从 SSE data 中解析出的 JSON 值。
+ * 返回：满足当前事件联合类型时返回 true。
+ * 边界：额外字段允许存在，以兼容后续服务端扩展。
+ */
+function isCodexThreadStreamEvent(value: unknown): value is CodexThreadStreamEventModel {
+    if (!value || typeof value !== 'object') return false;
+    const record = value as Record<string, unknown>;
+    return typeof record.seq === 'number' && typeof record.threadId === 'string' && typeof record.type === 'string';
+}
+
+/**
+ * 解析一段 SSE 原始事件块。
+ * 流程：拼接所有 data 行并按 JSON 解析，再用类型守卫限制为 CodeX 会话事件。
+ * 参数：chunk 为以空行分隔出的单个 SSE 事件块。
+ * 返回：合法事件返回模型，否则返回 null。
+ * 边界：heartbeat、snapshot 和后续 messageDelta 共用同一解析入口。
+ */
+function parseCodexThreadSseChunk(chunk: string): CodexThreadStreamEventModel | null {
+    const dataText = chunk
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n');
+    if (!dataText) return null;
+    try {
+        const event = JSON.parse(dataText) as unknown;
+        return isCodexThreadStreamEvent(event) ? event : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 订阅 CodeX 会话 SSE。
+ * 流程：使用 fetch readable stream 携带 Bearer Token 和 X-Request-Id，逐块解析 SSE 并回调类型化事件。
+ * 参数：threadId 为真实会话 ID，signal 用于页面切换或卸载时取消连接，onEvent 接收 snapshot/heartbeat/delta。
+ * 返回：流正常结束 Promise。
+ * 异常：HTTP 非 2xx、服务不可达或读取失败时抛出用户可读错误；AbortError 由调用方按取消处理。
+ */
+export async function streamCodexThreadEvents(
+    threadId: string,
+    signal: AbortSignal,
+    onEvent: CodexThreadStreamEventHandler
+): Promise<void> {
+    const requestId = createPublicApiRequestId();
+    const publicApiToken = await getPublicApiToken();
+    const headers: Record<string, string> = {
+        Accept: 'text/event-stream',
+        'X-Request-Id': requestId
+    };
+    if (publicApiToken) headers.Authorization = `Bearer ${publicApiToken}`;
+    const response = await fetch(
+        `${PUBLIC_API_BASE_URL}/v1/codex/threads/${encodeURIComponent(threadId)}/stream?windowSize=80`,
+        {
+            method: 'GET',
+            headers,
+            cache: 'no-store',
+            signal
+        }
+    );
+    if (!response.ok) {
+        throw new Error(`会话流连接失败（HTTP ${response.status}，请求 ID：${requestId}）`);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error(`会话流响应不可读取（请求 ID：${requestId}）`);
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let shouldRead = true;
+    while (shouldRead) {
+        const { done, value } = await reader.read();
+        if (done) {
+            shouldRead = false;
+            break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split(/\r?\n\r?\n/);
+        buffer = chunks.pop() ?? '';
+        for (const chunk of chunks) {
+            const event = parseCodexThreadSseChunk(chunk);
+            if (event) onEvent(event);
+        }
+    }
+    const tail = decoder.decode();
+    if (tail) buffer += tail;
+    const finalEvent = parseCodexThreadSseChunk(buffer);
+    if (finalEvent) onEvent(finalEvent);
 }
 
 /**

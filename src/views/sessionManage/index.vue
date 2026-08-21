@@ -7,6 +7,7 @@
                 :search-keyword="store.codexThreadKeyword"
                 :loading="store.loading"
                 :codex-threads="store.codexThreads"
+                :selected-thread-id="selectedThreadId"
                 :sessions="store.sessions"
                 :has-workspace="Boolean(store.selectedWorkspaceCwd)"
                 :has-more="store.hasMoreCodexThreads"
@@ -15,8 +16,9 @@
                 @select-workspace="handleSelectWorkspace"
                 @search="handleSearchThreads"
                 @load-more="handleLoadMoreThreads"
+                @select="handleSelectThread"
                 @open="handleOpenThread" />
-            <session-manage-session-content-placeholder />
+            <session-manage-session-thread-viewer :selected-thread="selectedThread" />
         </div>
     </section>
 </template>
@@ -24,8 +26,8 @@
 <script setup lang="ts">
     import { toast } from 'vue-sonner';
 
-    import SessionManageSessionContentPlaceholder from '@/components/sessionManage/sessionContentPlaceholder.vue';
     import SessionManageSessionList from '@/components/sessionManage/sessionList.vue';
+    import SessionManageSessionThreadViewer from '@/components/sessionManage/sessionThreadViewer.vue';
     import { useSessionManageStore } from '@/stores/sessionManage';
 
     defineOptions({
@@ -33,7 +35,12 @@
     });
 
     const store = useSessionManageStore();
+    const selectedThreadId = ref('');
     let disposeTaskUpdates: (() => void) | null = null;
+
+    const selectedThread = computed(() => {
+        return store.codexThreads.find((thread) => thread.id === selectedThreadId.value) ?? null;
+    });
 
     /**
      * 弹出会话管理操作失败提示。
@@ -56,6 +63,7 @@
      * 边界：切换失败时由 store 写入提示文案，页面保留原选中态。
      */
     function handleSelectWorkspace(workspaceCwd: string): void {
+        selectedThreadId.value = '';
         void store.selectCodexWorkspace(workspaceCwd).catch((error: unknown) => {
             showSessionOperationError('切换工作空间失败', error, '读取工作空间会话失败。');
         });
@@ -69,9 +77,16 @@
      * 边界：没有选中工作空间时由 store 返回空会话列表。
      */
     function handleRefreshSessions(): void {
-        void store.refreshCodexThreads(undefined, true).catch((error: unknown) => {
-            showSessionOperationError('刷新会话失败', error, '读取 CodeX 会话失败。');
-        });
+        void store
+            .refreshCodexThreads(undefined, true)
+            .then(() => {
+                if (!store.codexThreads.some((thread) => thread.id === selectedThreadId.value)) {
+                    selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+                }
+            })
+            .catch((error: unknown) => {
+                showSessionOperationError('刷新会话失败', error, '读取 CodeX 会话失败。');
+            });
     }
 
     /**
@@ -82,9 +97,14 @@
      * 边界：空关键词恢复默认会话列表。
      */
     function handleSearchThreads(keyword: string): void {
-        void store.searchCodexThreads(keyword).catch((error: unknown) => {
-            showSessionOperationError('搜索会话失败', error, '读取搜索结果失败。');
-        });
+        void store
+            .searchCodexThreads(keyword)
+            .then(() => {
+                selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+            })
+            .catch((error: unknown) => {
+                showSessionOperationError('搜索会话失败', error, '读取搜索结果失败。');
+            });
     }
 
     /**
@@ -98,6 +118,16 @@
         void store.loadMoreCodexThreads().catch((error: unknown) => {
             showSessionOperationError('加载更多会话失败', error, '读取更多会话失败。');
         });
+    }
+
+    /**
+     * 切换右侧会话内容。
+     * 流程：左侧列表单击只更新当前 thread ID，右侧组件负责取消旧流并加载新内容。
+     * 参数：threadId 为 CodeX 会话 ID。
+     * 返回：无返回值。
+     */
+    function handleSelectThread(threadId: string): void {
+        selectedThreadId.value = threadId;
     }
 
     /**
@@ -117,6 +147,9 @@
         void store
             .initTaskManage()
             .then(() => store.refreshCodexThreads(undefined, true))
+            .then(() => {
+                selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+            })
             .then(() => store.listenTaskUpdates())
             .then((dispose) => {
                 disposeTaskUpdates = dispose;

@@ -180,13 +180,13 @@
                 class="windowDragRegion absolute inset-x-0 bottom-0 h-4"
                 data-tauri-drag-region="deep"></div>
             <div
-                class="windowNoDrag relative min-h-0 flex-1 rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6"
+                class="windowNoDrag relative min-h-0 flex-1"
                 :class="
                     route.name === HubRouteName.SessionManage
-                        ? 'overflow-hidden p-0 md:p-0'
+                        ? 'overflow-hidden rounded-lg border border-border/70 bg-card/65 p-0 backdrop-blur'
                         : route.name === HubRouteName.TaskManage
-                          ? 'overflow-hidden'
-                          : 'overflow-y-auto'
+                          ? 'overflow-hidden rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6'
+                          : 'overflow-y-auto rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6'
                 ">
                 <router-view v-slot="{ Component, route: viewRoute }">
                     <transition

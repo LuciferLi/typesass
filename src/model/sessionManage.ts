@@ -214,3 +214,86 @@ export type CodexThreadListRequestModel = {
     // 搜索关键词，可匹配会话标题或 thread ID。
     keyword: string;
 };
+
+/** CodeX 会话消息角色类型。 */
+export type CodexThreadMessageRoleType = 'user' | 'assistant';
+
+/** CodeX 会话正文中的单条可展示消息。 */
+export interface CodexThreadMessageModel {
+    /** 历史分页和排序使用的消息顺序，不与 SSE seq 混用。 */
+    messageOrder: number;
+    /** 消息角色。 */
+    role: CodexThreadMessageRoleType;
+    /** 已由服务端做长度保护的消息正文。 */
+    content: string;
+    /** 消息创建时间；来源不可用时为空字符串。 */
+    createdAt: string;
+}
+
+/** CodeX 会话消息窗口范围。 */
+export interface CodexThreadMessageRangeModel {
+    /** 当前窗口第一条消息顺序。 */
+    startMessageOrder: number;
+    /** 当前窗口最后一条消息顺序。 */
+    endMessageOrder: number;
+    /** 窗口前方是否还有更早历史。 */
+    hasMoreBefore: boolean;
+    /** 窗口后方是否还有更新消息。 */
+    hasMoreAfter: boolean;
+}
+
+/** CodeX 会话正文窗口响应。 */
+export interface CodexThreadMessagesResponseModel {
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 会话标题。 */
+    title: string;
+    /** 会话更新时间；来源不可用时为空字符串。 */
+    updatedAt: string;
+    /** 当前窗口内可展示消息。 */
+    messages: CodexThreadMessageModel[];
+    /** 当前消息窗口范围。 */
+    range: CodexThreadMessageRangeModel;
+}
+
+/** CodeX 会话 SSE snapshot 事件。 */
+export interface CodexThreadSnapshotEventModel {
+    /** SSE 增量事件序号。 */
+    seq: number;
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 固定为 snapshot。 */
+    type: 'snapshot';
+    /** 首包窗口消息。 */
+    messages: CodexThreadMessageModel[];
+    /** 首包消息范围。 */
+    range: CodexThreadMessageRangeModel;
+}
+
+/** CodeX 会话 SSE 心跳事件。 */
+export interface CodexThreadHeartbeatEventModel {
+    /** SSE 增量事件序号。 */
+    seq: number;
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 固定为 heartbeat。 */
+    type: 'heartbeat';
+}
+
+/** CodeX 会话 SSE 消息增量事件。 */
+export interface CodexThreadMessageDeltaEventModel {
+    /** SSE 增量事件序号。 */
+    seq: number;
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 固定为 messageDelta。 */
+    type: 'messageDelta';
+    /** 发生变化的消息。 */
+    message: CodexThreadMessageModel;
+}
+
+/** CodeX 会话流事件联合类型。 */
+export type CodexThreadStreamEventModel =
+    | CodexThreadSnapshotEventModel
+    | CodexThreadHeartbeatEventModel
+    | CodexThreadMessageDeltaEventModel;

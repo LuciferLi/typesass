@@ -4,14 +4,15 @@ import asyncio
 from contextlib import asynccontextmanager
 import hmac
 import ipaddress
+import json
 import logging
 from typing import Annotated, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, Path, Request
+from fastapi import Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import httpx
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -38,6 +39,7 @@ from .models import (
     ModelCatalogResponse,
     CodexConnectionResponse,
     CodexRestartAcceptedResponse,
+    CodexThreadMessagesResponse,
     CodexThreadResponse,
     CodexThreadSearchRequest,
     CodexWorkspaceResponse,
@@ -1414,6 +1416,31 @@ CODEX_THREAD_EXAMPLE = [
         "updatedAt": "1786406400000",
     }
 ]
+CODEX_THREAD_MESSAGES_EXAMPLE = {
+    "threadId": "0198f25a-1111-7000-8000-000000000001",
+    "title": "完善 HTTP 接口文档",
+    "updatedAt": "1786406400000",
+    "messages": [
+        {
+            "messageOrder": 1,
+            "role": "user",
+            "content": "请补齐接口文档。",
+            "createdAt": "1786406400000",
+        },
+        {
+            "messageOrder": 2,
+            "role": "assistant",
+            "content": "已补齐 HTTP 接口说明。",
+            "createdAt": "1786406400000",
+        },
+    ],
+    "range": {
+        "startMessageOrder": 1,
+        "endMessageOrder": 2,
+        "hasMoreBefore": False,
+        "hasMoreAfter": False,
+    },
+}
 WORKSPACE_DATA_EXAMPLE = {
     "projects": [
         {
@@ -1549,6 +1576,18 @@ CODEX_OPEN_ERROR_CODES = {
             "code": "CODEX_THREAD_NOT_FOUND",
             "retryable": False,
             "action": "会话不存在或已归档；刷新 thread 搜索结果，禁止为未知 ID 构造打开请求。",
+        }
+    ],
+    **CODEX_LIST_ERROR_CODES,
+}
+CODEX_THREAD_MESSAGES_ERROR_CODES = {
+    "400": CODEX_OPEN_ERROR_CODES["400"],
+    "404": CODEX_OPEN_ERROR_CODES["404"],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "修正 threadId、beforeMessageOrder 或 limit 参数。",
         }
     ],
     **CODEX_LIST_ERROR_CODES,
@@ -2397,6 +2436,203 @@ async def search_codex_threads(
 
     return await _call_private(
         request, "listCodexThreads", payload.model_dump(by_alias=True)
+    )
+
+
+def build_codex_thread_messages_response(
+    raw_detail: object, limit: int, before_message_order: Optional[int]
+) -> CodexThreadMessagesResponse:
+    """把 Rust 会话详情快照转换为公开消息窗口。
+
+    流程：为 Rust 返回的有序消息补充稳定 messageOrder，再按 beforeMessageOrder/limit 截取窗口。
+    参数：``raw_detail`` 为私有 RPC 返回对象；``limit`` 和 ``before_message_order`` 为已校验分页参数。
+    返回：公开 HTTP 消息窗口模型。
+    异常边界：私有 RPC 结构异常时按协议错误失败，不猜测或补造正文。
+    """
+
+    if not isinstance(raw_detail, dict):
+        raise ApiError(502, "PRIVATE_SERVICE_PROTOCOL_ERROR", "会话详情响应格式无效。")
+    raw_messages = raw_detail.get("messages")
+    if not isinstance(raw_messages, list):
+        raise ApiError(502, "PRIVATE_SERVICE_PROTOCOL_ERROR", "会话消息响应格式无效。")
+    ordered_messages = []
+    for index, message in enumerate(raw_messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        ordered_messages.append(
+            {
+                "messageOrder": index + 1,
+                "role": role,
+                "content": str(message.get("content") or ""),
+                "createdAt": str(message.get("createdAt") or ""),
+            }
+        )
+    upper_bound = before_message_order or (len(ordered_messages) + 1)
+    window_messages = [
+        message
+        for message in ordered_messages
+        if int(message["messageOrder"]) < upper_bound
+    ][-limit:]
+    start_order = int(window_messages[0]["messageOrder"]) if window_messages else 0
+    end_order = int(window_messages[-1]["messageOrder"]) if window_messages else 0
+    return CodexThreadMessagesResponse.model_validate(
+        {
+            "threadId": str(raw_detail.get("id") or ""),
+            "title": str(raw_detail.get("title") or "未命名会话"),
+            "updatedAt": str(raw_detail.get("updatedAt") or ""),
+            "messages": window_messages,
+            "range": {
+                "startMessageOrder": start_order,
+                "endMessageOrder": end_order,
+                "hasMoreBefore": start_order > 1,
+                "hasMoreAfter": end_order < len(ordered_messages),
+            },
+        }
+    )
+
+
+def encode_sse_event(event_name: str, event_id: int, payload: object) -> str:
+    """编码单条 SSE 事件。
+
+    流程：按标准 event/id/data 三段输出，每条事件以空行结束，data 使用紧凑 JSON 且不包含私有路径。
+    参数：``event_name`` 为事件类型，``event_id`` 为单连接内事件序号，``payload`` 为可 JSON 序列化对象。
+    返回：可直接写入 ``text/event-stream`` 的字符串。
+    异常边界：调用方只传入公开模型或固定心跳对象，不写入 token、路径或请求头。
+    """
+
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_name}\nid: {event_id}\ndata: {data}\n\n"
+
+
+async def stream_codex_thread_events(
+    request: Request, response: CodexThreadMessagesResponse
+) -> AsyncIterator[str]:
+    """生成 CodeX 会话 SSE 事件流。
+
+    流程：第一版先发送有界 snapshot，并保持 heartbeat；后续 Rust ThreadStreamHub 接入后可在本生成器内替换为增量事件。
+    参数：``request`` 用于检测客户端断开，``response`` 为已通过鉴权读取到的尾部窗口。
+    返回：SSE 字符串异步迭代器。
+    异常边界：客户端断开后自然结束，不保留 subscriber；事件正文不进入服务端日志。
+    """
+
+    event_seq = max(1, response.range.end_message_order)
+    yield encode_sse_event(
+        "snapshot",
+        event_seq,
+        {
+            "seq": event_seq,
+            "threadId": response.thread_id,
+            "type": "snapshot",
+            "messages": [message.model_dump(by_alias=True) for message in response.messages],
+            "range": response.range.model_dump(by_alias=True),
+        },
+    )
+    while not await request.is_disconnected():
+        await asyncio.sleep(15)
+        event_seq += 1
+        yield encode_sse_event(
+            "heartbeat",
+            event_seq,
+            {"seq": event_seq, "threadId": response.thread_id, "type": "heartbeat"},
+        )
+
+
+@app.get(
+    "/v1/codex/threads/{threadId}/messages",
+    response_model=CodexThreadMessagesResponse,
+    responses=private_route_responses(CODEX_THREAD_MESSAGES_EXAMPLE, CODEX_THREAD_MESSAGES_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["会话管理"],
+    summary="读取 CodeX 会话正文窗口",
+    description=(
+        "读取指定 thread 的最近会话正文窗口。第一版返回有界窗口，不返回本机 JSONL 路径、socket、token 或内部事件；"
+        "beforeMessageOrder 用于向前分页，不能与 SSE seq 混用。"
+    ),
+    openapi_extra=private_route_openapi(CODEX_THREAD_MESSAGES_ERROR_CODES),
+)
+async def read_codex_thread_messages(
+    request: Request,
+    thread_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="threadId",
+            description="从会话搜索结果取得的 CodeX thread 稳定 ID。",
+            examples=["0198f25a-1111-7000-8000-000000000001"],
+        ),
+    ],
+    before_message_order: Annotated[
+        Optional[int],
+        Query(
+            alias="beforeMessageOrder",
+            ge=1,
+            description="向前加载该 messageOrder 之前的消息；省略时返回尾部窗口。",
+        ),
+    ] = None,
+    limit: Annotated[int, Query(ge=20, le=100, description="本次窗口消息数量。")] = 80,
+) -> CodexThreadMessagesResponse:
+    """读取 CodeX 会话正文窗口。
+
+    流程：Bearer 依赖完成鉴权后调用 Rust 只读详情入口，再在 HTTP 层补充 messageOrder 与窗口范围。
+    参数：``thread_id`` 为真实 thread ID；``before_message_order`` 和 ``limit`` 为历史分页参数。
+    返回：有界消息窗口。
+    异常边界：Python 不扫描本机文件、不读取任意 path，也不把内部错误正文写入响应。
+    """
+
+    raw_detail = await _call_private(
+        request, "readCodexThreadMessages", {"threadId": thread_id}
+    )
+    return build_codex_thread_messages_response(raw_detail, limit, before_message_order)
+
+
+@app.get(
+    "/v1/codex/threads/{threadId}/stream",
+    responses=private_route_responses(CODEX_THREAD_MESSAGES_EXAMPLE, CODEX_THREAD_MESSAGES_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["会话管理"],
+    summary="订阅 CodeX 会话 SSE",
+    description=(
+        "使用 text/event-stream 返回会话 snapshot 和 heartbeat。浏览器端应使用 fetch readable stream 携带 Bearer，"
+        "不要使用原生 EventSource 携带 Authorization Header。"
+    ),
+    openapi_extra=private_route_openapi(CODEX_THREAD_MESSAGES_ERROR_CODES),
+)
+async def stream_codex_thread(
+    request: Request,
+    thread_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="threadId",
+            description="从会话搜索结果取得的 CodeX thread 稳定 ID。",
+            examples=["0198f25a-1111-7000-8000-000000000001"],
+        ),
+    ],
+    window_size: Annotated[
+        int, Query(alias="windowSize", ge=20, le=200, description="首包 snapshot 消息数量。")
+    ] = 80,
+    after_seq: Annotated[
+        Optional[int], Query(alias="afterSeq", ge=0, description="断线续传事件序号；第一版 miss 时返回 snapshot。")
+    ] = None,
+) -> StreamingResponse:
+    """订阅 CodeX 会话事件流。
+
+    流程：先按当前窗口读取一次 snapshot，再以 SSE 持续保活；afterSeq 暂作为兼容参数保留。
+    参数：``thread_id`` 为真实 thread ID，``window_size`` 为首包窗口大小，``after_seq`` 为后续增量续传游标。
+    返回：``text/event-stream`` 响应。
+    异常边界：鉴权失败或 snapshot 读取失败时不会建立流；事件不包含本机路径、token 或私有 RPC 细节。
+    """
+
+    _ = after_seq
+    raw_detail = await _call_private(
+        request, "readCodexThreadMessages", {"threadId": thread_id}
+    )
+    response = build_codex_thread_messages_response(raw_detail, window_size, None)
+    return StreamingResponse(
+        stream_codex_thread_events(request, response),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
 
 

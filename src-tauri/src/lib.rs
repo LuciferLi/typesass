@@ -1687,7 +1687,7 @@ pub(crate) struct CodexWorkspaceSummary {
 /// Codex 会话详情中的可展示消息。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexThreadMessage {
+pub(crate) struct CodexThreadMessage {
     /// 消息角色，MVP 只返回 user 和 assistant。
     role: String,
     /// 消息正文，已经做最大长度保护。
@@ -1699,7 +1699,7 @@ struct CodexThreadMessage {
 /// Codex 本地会话详情。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexThreadDetail {
+pub(crate) struct CodexThreadDetail {
     /// Codex 会话 ID。
     id: String,
     /// Codex 会话标题。
@@ -4421,6 +4421,40 @@ pub(crate) fn open_session_external_thread_core(thread_id: String) -> Result<Str
     validate_codex_thread_id(normalized_id)?;
     ensure_codex_thread_exists(normalized_id)?;
     open_codex_desktop_thread(normalized_id)
+}
+
+/// 读取真实 CodeX 会话的尾部消息窗口。
+/// 流程：先校验 threadId 并确认会话存在，再优先使用 Codex app-server 的 thread/read 权威快照；失败时回退到受限 JSONL 文件解析。
+/// 参数：thread_id 为前端从搜索接口取得的真实 CodeX thread ID。
+/// 返回：有界会话详情，消息数量与单条正文长度均受现有常量保护。
+/// 异常/边界：非法 ID、未知会话、超大文件或 schema 不兼容时返回稳定错误，不暴露本机路径。
+pub(crate) fn read_codex_thread_messages_core(
+    thread_id: String,
+) -> Result<CodexThreadDetail, String> {
+    let normalized_id = thread_id.trim();
+    if normalized_id.is_empty() {
+        return Err("会话 ID 不能为空".to_string());
+    }
+    validate_codex_thread_id(normalized_id)?;
+    ensure_codex_thread_exists(normalized_id)?;
+    match run_codex_app_server_thread_detail(normalized_id) {
+        Ok(detail) => Ok(detail),
+        Err(app_server_error) => {
+            let session_file = find_codex_session_file(normalized_id).map_err(|_| {
+                format!(
+                    "读取 Codex 会话详情失败：{}",
+                    trim_error_message(&app_server_error)
+                )
+            })?;
+            let messages = read_codex_session_messages(&session_file)?;
+            Ok(CodexThreadDetail {
+                id: normalized_id.to_string(),
+                title: "未命名会话".to_string(),
+                updated_at: String::new(),
+                messages,
+            })
+        }
+    }
 }
 
 /// 通过 Codex app-server stdio 读取已有任务中的工作空间列表。
