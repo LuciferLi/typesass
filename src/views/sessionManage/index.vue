@@ -1,24 +1,22 @@
 <template>
     <section class="h-full min-h-0">
-        <div class="grid h-full min-h-0 gap-3 lg:grid-cols-[280px_minmax(0,1fr)]">
-            <session-manage-workspace-list
+        <div class="grid h-full min-h-0 gap-0 lg:grid-cols-[420px_minmax(0,1fr)]">
+            <session-manage-session-list
                 :workspaces="store.codexWorkspaces"
                 :selected-workspace-cwd="store.selectedWorkspaceCwd"
+                :search-keyword="store.codexThreadKeyword"
                 :loading="store.loading"
-                @refresh="handleRefreshWorkspaces"
-                @select="handleSelectWorkspace" />
-            <session-manage-session-list
                 :codex-threads="store.codexThreads"
                 :sessions="store.sessions"
                 :has-workspace="Boolean(store.selectedWorkspaceCwd)"
                 :has-more="store.hasMoreCodexThreads"
-                :loading="store.loading"
                 :loading-more="store.loadingMoreThreads"
-                :search-keyword="store.codexThreadKeyword"
                 @refresh="handleRefreshSessions"
+                @select-workspace="handleSelectWorkspace"
                 @search="handleSearchThreads"
                 @load-more="handleLoadMoreThreads"
                 @open="handleOpenThread" />
+            <session-manage-session-content-placeholder />
         </div>
     </section>
 </template>
@@ -26,8 +24,8 @@
 <script setup lang="ts">
     import { toast } from 'vue-sonner';
 
+    import SessionManageSessionContentPlaceholder from '@/components/sessionManage/sessionContentPlaceholder.vue';
     import SessionManageSessionList from '@/components/sessionManage/sessionList.vue';
-    import SessionManageWorkspaceList from '@/components/sessionManage/workspaceList.vue';
     import { useSessionManageStore } from '@/stores/sessionManage';
 
     defineOptions({
@@ -60,19 +58,6 @@
     function handleSelectWorkspace(workspaceCwd: string): void {
         void store.selectCodexWorkspace(workspaceCwd).catch((error: unknown) => {
             showSessionOperationError('切换工作空间失败', error, '读取工作空间会话失败。');
-        });
-    }
-
-    /**
-     * 刷新工作空间数据。
-     * 流程：刷新 CodeX 工作空间，再按当前工作空间刷新右侧会话。
-     * 参数：无。
-     * 返回：无返回值。
-     * 边界：CodeX 不可用时显示空工作空间列表。
-     */
-    function handleRefreshWorkspaces(): void {
-        void store.initSessionManage().catch((error: unknown) => {
-            showSessionOperationError('刷新工作空间失败', error, '读取工作空间失败。');
         });
     }
 

@@ -181,7 +181,13 @@
                 data-tauri-drag-region="deep"></div>
             <div
                 class="windowNoDrag relative min-h-0 flex-1 rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6"
-                :class="route.name === HubRouteName.TaskManage ? 'overflow-hidden' : 'overflow-y-auto'">
+                :class="
+                    route.name === HubRouteName.SessionManage
+                        ? 'overflow-hidden p-0 md:p-0'
+                        : route.name === HubRouteName.TaskManage
+                          ? 'overflow-hidden'
+                          : 'overflow-y-auto'
+                ">
                 <router-view v-slot="{ Component, route: viewRoute }">
                     <transition
                         mode="out-in"
