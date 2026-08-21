@@ -2,151 +2,168 @@
     <ui-dialog
         :open="open"
         @update:open="emit('update:open', $event)">
-        <ui-dialog-content class="sm:max-w-[560px]">
-            <ui-dialog-header>
+        <ui-dialog-content
+            class="grid max-h-[min(720px,calc(100vh-2rem))] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-[560px]">
+            <ui-dialog-header class="px-6 pb-4 pt-6">
                 <ui-dialog-title>{{ title }}</ui-dialog-title>
                 <ui-dialog-description class="sr-only">创建或修改我的应用。</ui-dialog-description>
             </ui-dialog-header>
             <form
-                class="grid gap-4"
+                class="contents"
                 @submit.prevent="handleSubmit">
-                <ui-field-group>
-                    <ui-field>
-                        <ui-field-label>应用 logo</ui-field-label>
-                        <div class="flex items-center gap-3">
-                            <button
-                                class="group relative grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-lg border border-border bg-muted transition-colors hover:border-primary/55 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                type="button"
-                                title="上传 logo"
-                                @click="handleSelectLogo">
-                                <img
-                                    v-if="form.logoDataUrl"
-                                    class="h-full w-full object-cover"
-                                    :src="form.logoDataUrl"
-                                    alt="" />
-                                <application-menu
-                                    v-else
-                                    theme="outline"
-                                    size="22"
-                                    class="text-muted-foreground" />
-                                <span
-                                    class="absolute inset-0 grid place-items-center bg-background/65 text-[11px] font-medium text-foreground opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
-                                    {{ form.logoDataUrl ? '更换' : '上传' }}
-                                </span>
-                            </button>
-                            <div class="grid min-w-0 flex-1 gap-1.5">
-                                <input
-                                    ref="logoInputRef"
-                                    class="hidden"
-                                    accept="image/png,image/jpeg,image/webp,image/svg+xml"
-                                    type="file"
-                                    @change="handleLogoChanged" />
-                                <ui-field-description>支持 png、jpeg、webp、svg，可不上传。</ui-field-description>
-                            </div>
-                        </div>
-                    </ui-field>
-
-                    <ui-field>
-                        <ui-field-label>应用名称</ui-field-label>
-                        <ui-input
-                            v-model="form.name"
-                            maxlength="80"
-                            placeholder="请输入应用名称" />
-                    </ui-field>
-
-                    <ui-field>
-                        <ui-field-label>访问方式</ui-field-label>
-                        <ui-select-root v-model="form.accessType">
-                            <ui-select-trigger>
-                                <ui-select-value placeholder="选择访问方式" />
-                            </ui-select-trigger>
-                            <ui-select-content>
-                                <ui-select-item value="local">本地服务器托管</ui-select-item>
-                                <ui-select-item value="remote">远程 URL 访问</ui-select-item>
-                            </ui-select-content>
-                        </ui-select-root>
-                    </ui-field>
-
-                    <template v-if="form.accessType === 'local'">
+                <div class="min-h-0 overflow-y-auto px-6 py-1">
+                    <ui-field-group>
                         <ui-field>
-                            <ui-field-label>服务端口</ui-field-label>
-                            <div class="flex gap-2">
-                                <ui-input
-                                    v-model="form.port"
-                                    inputmode="numeric"
-                                    placeholder="例如 18123" />
-                                <ui-button
-                                    class="shrink-0"
-                                    variant="outline"
+                            <ui-field-label>应用 logo</ui-field-label>
+                            <div class="flex items-center gap-3">
+                                <button
+                                    class="group relative grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-lg border border-border bg-muted transition-colors hover:border-primary/55 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                                     type="button"
-                                    :disabled="allocatingPort || saving"
-                                    @click="handleAllocatePort">
-                                    {{ allocatingPort ? '分配中' : '自动分配' }}
-                                </ui-button>
-                            </div>
-                            <ui-field-description
-                                >创建后会固定使用该端口；服务监听 0.0.0.0，允许局域网访问。</ui-field-description
-                            >
-                        </ui-field>
-
-                        <ui-field>
-                            <ui-field-label>静态页面 zip</ui-field-label>
-                            <button
-                                class="flex min-h-14 w-full items-center gap-3 rounded-lg border border-dashed border-border bg-muted/25 px-3 py-3 text-left transition-colors hover:border-primary/55 hover:bg-accent/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                type="button"
-                                @click="handleSelectZip">
-                                <span
-                                    class="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
-                                    <file-zip
-                                        v-if="form.zipFileName"
-                                        theme="outline"
-                                        size="19" />
-                                    <upload
+                                    title="上传 logo"
+                                    @click="handleSelectLogo">
+                                    <img
+                                        v-if="form.logoDataUrl"
+                                        class="h-full w-full object-cover"
+                                        :src="form.logoDataUrl"
+                                        alt="" />
+                                    <application-menu
                                         v-else
                                         theme="outline"
-                                        size="18" />
-                                </span>
-                                <span class="grid min-w-0 flex-1 gap-0.5">
-                                    <span class="truncate text-[13px] font-medium text-foreground">
-                                        {{ form.zipFileName || '请上传 zip 压缩包' }}
+                                        size="22"
+                                        class="text-muted-foreground" />
+                                    <span
+                                        class="absolute inset-0 grid place-items-center bg-background/65 text-[11px] font-medium text-foreground opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
+                                        {{ form.logoDataUrl ? '更换' : '上传' }}
                                     </span>
-                                    <span class="truncate text-[12px] text-muted-foreground">
-                                        {{
-                                            form.zipFileName
-                                                ? '点击可重新上传'
-                                                : '根目录或第一层目录需要包含 index.html'
-                                        }}
-                                    </span>
-                                </span>
-                            </button>
-                            <input
-                                ref="zipInputRef"
-                                class="hidden"
-                                accept=".zip,application/zip,application/x-zip-compressed"
-                                type="file"
-                                @change="handleZipChanged" />
-                            <ui-field-description>
-                                {{ zipDescription }}
-                            </ui-field-description>
+                                </button>
+                                <div class="grid min-w-0 flex-1 gap-1.5">
+                                    <input
+                                        ref="logoInputRef"
+                                        class="hidden"
+                                        accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                                        type="file"
+                                        @change="handleLogoChanged" />
+                                    <ui-field-description>支持 png、jpeg、webp、svg，可不上传。</ui-field-description>
+                                </div>
+                            </div>
                         </ui-field>
-                    </template>
 
-                    <ui-field v-else>
-                        <ui-field-label>远程 URL</ui-field-label>
-                        <ui-input
-                            v-model="form.remoteUrl"
-                            placeholder="https://example.com/dashboard" />
-                    </ui-field>
-                </ui-field-group>
+                        <ui-field>
+                            <ui-field-label>应用名称</ui-field-label>
+                            <ui-input
+                                v-model="form.name"
+                                maxlength="80"
+                                placeholder="请输入应用名称" />
+                        </ui-field>
 
-                <p
-                    v-if="errorMessage"
-                    class="text-[13px] leading-5 text-destructive"
-                    role="alert">
-                    {{ errorMessage }}
-                </p>
+                        <ui-field>
+                            <ui-field-label>访问方式</ui-field-label>
+                            <ui-select-root v-model="form.accessType">
+                                <ui-select-trigger>
+                                    <ui-select-value placeholder="选择访问方式" />
+                                </ui-select-trigger>
+                                <ui-select-content>
+                                    <ui-select-item value="local">本地服务器托管</ui-select-item>
+                                    <ui-select-item value="remote">远程 URL 访问</ui-select-item>
+                                </ui-select-content>
+                            </ui-select-root>
+                        </ui-field>
 
-                <ui-dialog-footer>
+                        <template v-if="form.accessType === 'local'">
+                            <ui-field>
+                                <ui-field-label>服务端口</ui-field-label>
+                                <div class="flex gap-2">
+                                    <ui-input
+                                        v-model="form.port"
+                                        inputmode="numeric"
+                                        placeholder="例如 18123" />
+                                    <ui-button
+                                        class="shrink-0"
+                                        variant="outline"
+                                        type="button"
+                                        :disabled="allocatingPort || saving"
+                                        @click="handleAllocatePort">
+                                        {{ allocatingPort ? '分配中' : '自动分配' }}
+                                    </ui-button>
+                                </div>
+                                <ui-field-description
+                                    >创建后会固定使用该端口；服务监听 0.0.0.0，允许局域网访问。</ui-field-description
+                                >
+                            </ui-field>
+
+                            <ui-field>
+                                <ui-field-label>公网二级域名</ui-field-label>
+                                <div class="flex items-center gap-2">
+                                    <ui-input
+                                        v-model="form.publicSubdomain"
+                                        maxlength="63"
+                                        placeholder="例如 demo" />
+                                    <span class="shrink-0 text-[13px] text-muted-foreground">.tolern.com</span>
+                                </div>
+                                <ui-field-description>
+                                    填写后启动服务会自动开放 https://二级域名.tolern.com；留空则仅本机和局域网访问。
+                                </ui-field-description>
+                            </ui-field>
+
+                            <ui-field>
+                                <ui-field-label>静态页面 zip</ui-field-label>
+                                <button
+                                    class="flex min-h-14 w-full items-center gap-3 rounded-lg border border-dashed border-border bg-muted/25 px-3 py-3 text-left transition-colors hover:border-primary/55 hover:bg-accent/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                    type="button"
+                                    @click="handleSelectZip">
+                                    <span
+                                        class="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-border bg-background text-muted-foreground">
+                                        <file-zip
+                                            v-if="form.zipFileName"
+                                            theme="outline"
+                                            size="19" />
+                                        <upload
+                                            v-else
+                                            theme="outline"
+                                            size="18" />
+                                    </span>
+                                    <span class="grid min-w-0 flex-1 gap-0.5">
+                                        <span class="truncate text-[13px] font-medium text-foreground">
+                                            {{ form.zipFileName || '请上传 zip 压缩包' }}
+                                        </span>
+                                        <span class="truncate text-[12px] text-muted-foreground">
+                                            {{
+                                                form.zipFileName
+                                                    ? '点击可重新上传'
+                                                    : '根目录或第一层目录需要包含 index.html'
+                                            }}
+                                        </span>
+                                    </span>
+                                </button>
+                                <input
+                                    ref="zipInputRef"
+                                    class="hidden"
+                                    accept=".zip,application/zip,application/x-zip-compressed"
+                                    type="file"
+                                    @change="handleZipChanged" />
+                                <ui-field-description>
+                                    {{ zipDescription }}
+                                </ui-field-description>
+                            </ui-field>
+                        </template>
+
+                        <ui-field v-else>
+                            <ui-field-label>远程 URL</ui-field-label>
+                            <ui-input
+                                v-model="form.remoteUrl"
+                                placeholder="https://example.com/dashboard" />
+                        </ui-field>
+                    </ui-field-group>
+
+                    <p
+                        v-if="errorMessage"
+                        class="mt-4 text-[13px] leading-5 text-destructive"
+                        role="alert">
+                        {{ errorMessage }}
+                    </p>
+                </div>
+
+                <ui-dialog-footer class="border-t border-border px-6 pb-6 pt-4">
                     <ui-button
                         variant="outline"
                         type="button"
@@ -197,6 +214,8 @@
         MY_APP_NAME_MAX_LENGTH,
         MY_APP_PORT_MAX,
         MY_APP_PORT_MIN,
+        MY_APP_PUBLIC_SUBDOMAIN_MAX_LENGTH,
+        MY_APP_PUBLIC_SUBDOMAIN_PATTERN,
         MY_APP_ZIP_DATA_URL_MAX_LENGTH
     } from '@/model/myApp';
 
@@ -246,6 +265,7 @@
             accessType: 'local',
             port: '',
             remoteUrl: '',
+            publicSubdomain: '',
             zipDataUrl: '',
             zipFileName: ''
         };
@@ -267,6 +287,7 @@
                   accessType: app.accessType,
                   port: app.port ? String(app.port) : '',
                   remoteUrl: app.remoteUrl || '',
+                  publicSubdomain: app.publicSubdomain || '',
                   zipDataUrl: '',
                   zipFileName: ''
               }
@@ -397,6 +418,10 @@
         if (form.accessType === 'local') {
             const port = Number(form.port);
             if (!Number.isInteger(port) || port < MY_APP_PORT_MIN || port > MY_APP_PORT_MAX) return '请填写合法端口。';
+            const subdomain = form.publicSubdomain.trim();
+            if (subdomain.length > MY_APP_PUBLIC_SUBDOMAIN_MAX_LENGTH) return '公网二级域名前缀最多 63 个字符。';
+            if (subdomain && !MY_APP_PUBLIC_SUBDOMAIN_PATTERN.test(subdomain.toLowerCase()))
+                return '公网二级域名仅支持小写字母、数字和短横线，且不能以短横线开头或结尾。';
             if (!props.app && !form.zipDataUrl) return '请上传静态页面 zip 包。';
             if (props.app?.accessType === 'remote' && !form.zipDataUrl)
                 return '从远程 URL 改为本地托管时需要上传 zip 包。';

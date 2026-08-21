@@ -362,6 +362,7 @@
     function getLinkOptions(app: MyAppModel): MyAppLinkOption[] {
         if (app.accessType === 'local') {
             return [
+                { label: '公网访问地址', value: app.publicUrl },
                 { label: '本地访问地址', value: app.localUrl },
                 { label: '局域网访问地址', value: app.lanUrl }
             ];
@@ -461,6 +462,10 @@
                 accessType: form.accessType,
                 port,
                 remoteUrl: form.accessType === 'remote' ? form.remoteUrl.trim() : undefined,
+                publicSubdomain:
+                    form.accessType === 'local' && form.publicSubdomain.trim()
+                        ? form.publicSubdomain.trim().toLowerCase()
+                        : undefined,
                 zipDataUrl: form.zipDataUrl || undefined
             };
             await store.saveApp(form.id ? { id: form.id, ...request } : request);

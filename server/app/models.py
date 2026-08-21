@@ -649,6 +649,15 @@ class MyAppCreateRequest(StrictRequestModel):
         description="远程 URL；仅 remote 类型使用，必须是 http 或 https。",
         examples=["https://example.com/dashboard"],
     )
+    public_subdomain: Optional[str] = Field(
+        default=None,
+        alias="publicSubdomain",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        description="本地托管应用的公网二级域名前缀；例如 demo 会生成 https://demo.tolern.com。",
+        examples=["demo"],
+    )
     zip_data_url: Optional[str] = Field(
         default=None,
         alias="zipDataUrl",
@@ -704,6 +713,13 @@ class MyAppResponse(BaseModel):
     remote_url: Optional[str] = Field(default=None, alias="remoteUrl", description="远程 URL。")
     local_url: str = Field(alias="localUrl", description="本机访问地址；远程 URL 应用为空。")
     lan_url: str = Field(alias="lanUrl", description="局域网访问地址；远程 URL 应用为空。")
+    public_url: str = Field(alias="publicUrl", description="公网访问地址；未配置二级域名或远程 URL 应用为空。")
+    public_subdomain: Optional[str] = Field(
+        default=None,
+        alias="publicSubdomain",
+        description="公网访问二级域名前缀；未配置时为空。",
+        examples=["demo"],
+    )
     open_url: str = Field(alias="openUrl", description="默认打开地址。")
     service_status: Literal["starting", "running", "paused", "failed", "unavailable"] = Field(
         alias="serviceStatus",

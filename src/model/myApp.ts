@@ -22,6 +22,12 @@ export const MY_APP_PORT_MIN = 1024;
 /** 我的应用端口最大值。 */
 export const MY_APP_PORT_MAX = 65_535;
 
+/** 我的应用公网二级域名前缀长度上限。 */
+export const MY_APP_PUBLIC_SUBDOMAIN_MAX_LENGTH = 63;
+
+/** 我的应用公网二级域名前缀校验规则。 */
+export const MY_APP_PUBLIC_SUBDOMAIN_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
 /** 我的应用列表项。 */
 export interface MyAppModel {
     /** 应用稳定 ID。 */
@@ -40,6 +46,10 @@ export interface MyAppModel {
     localUrl: string;
     /** 局域网访问地址；远程 URL 应用为空。 */
     lanUrl: string;
+    /** 公网访问地址；未配置二级域名或远程 URL 应用为空。 */
+    publicUrl: string;
+    /** 公网访问二级域名前缀；未配置时为空。 */
+    publicSubdomain: string | null;
     /** 默认打开地址。 */
     openUrl: string;
     /** 当前服务状态。 */
@@ -64,6 +74,8 @@ export interface CreateMyAppRequestModel {
     port?: number;
     /** 远程 URL。 */
     remoteUrl?: string;
+    /** 公网访问二级域名前缀。 */
+    publicSubdomain?: string;
     /** 本地托管 zip data URL。 */
     zipDataUrl?: string;
 }
@@ -94,6 +106,8 @@ export interface MyAppFormModel {
     port: string;
     /** 远程 URL。 */
     remoteUrl: string;
+    /** 公网访问二级域名前缀。 */
+    publicSubdomain: string;
     /** 本次上传的 zip data URL。 */
     zipDataUrl: string;
     /** 本次上传的 zip 文件名。 */

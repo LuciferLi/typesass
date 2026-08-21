@@ -30,6 +30,7 @@ import type {
     UpdateSessionProjectRequestModel,
     UpdateSessionTaskRequestModel
 } from '@/model/sessionManage';
+import type { PublicApiTunnelStatusModel } from '@/model/settings';
 import type { ApplicationOptionModel } from '@/model/shortcutBinding';
 import type { PasteResponseModel, SelectedTextResponseModel } from '@/model/textPolish';
 import type {
@@ -651,6 +652,28 @@ export async function readPublicApiOpenApi(): Promise<HttpApiOpenApiDocumentMode
 }
 
 /**
+ * 读取公共 HTTP API 外网访问状态。
+ * 流程：桌面端通过 Tauri IPC 读取固定域名和 frpc 运行态；普通 Web 无此管理权限。
+ * 参数：无。
+ * 返回：外网访问开关、固定域名、远程地址和运行态。
+ * 异常：非桌面环境或 IPC 失败时抛出明确错误。
+ */
+export async function getPublicApiTunnelStatus(): Promise<PublicApiTunnelStatusModel> {
+    return invokeDesktop<PublicApiTunnelStatusModel>('get_public_api_tunnel_status');
+}
+
+/**
+ * 切换公共 HTTP API 外网访问。
+ * 流程：开启时由 Rust 优先使用用户英文名作为二级域名，未设置时生成 6 位随机兜底域名并启动 frpc；关闭时保留域名并停止 frpc。
+ * 参数：enabled 为目标开关状态。
+ * 返回：切换后的外网访问状态。
+ * 异常：域名生成、配置写入或 frpc 启停失败时透传错误。
+ */
+export async function setPublicApiTunnelEnabled(enabled: boolean): Promise<PublicApiTunnelStatusModel> {
+    return invokeDesktop<PublicApiTunnelStatusModel>('set_public_api_tunnel_enabled', { enabled });
+}
+
+/**
  * 读取公共服务模型目录。
  * 流程：桌面端通过受保护 IPC 读取本机安全目录，普通 Web 通过 GET `/v1/models` 读取 HTTP 授权后的安全目录。
  * 参数：无。
@@ -1178,6 +1201,7 @@ export async function updateMyApp(request: UpdateMyAppRequestModel): Promise<MyA
             accessType: request.accessType,
             port: request.port,
             remoteUrl: request.remoteUrl,
+            publicSubdomain: request.publicSubdomain,
             zipDataUrl: request.zipDataUrl
         },
         timeoutMs: 70_000

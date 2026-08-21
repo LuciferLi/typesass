@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::thread;
@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use uuid::Uuid;
 use zip::ZipArchive;
+
+use crate::frp_tunnel::{
+    public_url_for_subdomain, resolve_existing_frpc_binary, resolve_frpc_binary, write_frpc_config,
+    FrpHttpTunnelConfig,
+};
 
 /// 我的应用配置文件名；保存用户创建的本地托管和远程 URL 应用元数据。
 const MY_APPS_FILE_NAME: &str = "my-apps.json";
@@ -27,6 +32,10 @@ const AUTO_PORT_MIN: u16 = 18_100;
 const AUTO_PORT_MAX: u16 = 28_999;
 /// 单个静态服务请求读取上限；只需要首行和基础 Header，避免异常客户端占用内存。
 const STATIC_REQUEST_MAX_BYTES: usize = 4096;
+/// 公网二级域名可用性探测使用的本地丢弃端口；frpc 注册阶段不依赖该端口真实提供服务。
+const PUBLIC_SUBDOMAIN_PROBE_LOCAL_PORT: u16 = 9;
+/// 公网二级域名可用性探测等待时长，留给 frps 返回重复域名拒绝结果。
+const PUBLIC_SUBDOMAIN_PROBE_WAIT_MS: u64 = 900;
 
 /// 我的应用运行时状态管理器。
 #[derive(Default)]
@@ -40,6 +49,8 @@ pub struct RuntimeMyApps {
 struct MyAppsRuntimeState {
     /// appId 到静态服务线程的映射。
     servers: HashMap<String, ManagedSiteServer>,
+    /// appId 到公网 FRP 客户端进程的映射。
+    frpc_clients: HashMap<String, ManagedFrpcClient>,
     /// appId 到最近服务状态的映射。
     statuses: HashMap<String, MyAppRuntimeStatus>,
 }
@@ -52,6 +63,14 @@ struct ManagedSiteServer {
     thread: thread::JoinHandle<()>,
     /// 当前服务监听端口。
     port: u16,
+}
+
+/// 单个受管 FRP 客户端进程。
+struct ManagedFrpcClient {
+    /// frpc 子进程句柄；停止应用时只终止 CodexMan 自己启动的进程。
+    child: Child,
+    /// 当前注册到服务器侧 frps 的二级域名前缀。
+    subdomain: String,
 }
 
 /// 我的应用持久化文档。
@@ -80,6 +99,9 @@ pub struct MyAppRecord {
     pub port: Option<u16>,
     /// 远程 URL；本地托管为空。
     pub remote_url: Option<String>,
+    /// 公网访问二级域名前缀；为空时仅保留本机和局域网访问。
+    #[serde(default)]
+    pub public_subdomain: Option<String>,
     /// 创建时间，UTC ISO 字符串。
     pub created_at: String,
     /// 更新时间，UTC ISO 字符串。
@@ -142,6 +164,10 @@ pub struct MyAppResponse {
     pub local_url: String,
     /// 局域网访问地址。
     pub lan_url: String,
+    /// 公网访问地址；未配置二级域名或远程 URL 应用为空。
+    pub public_url: String,
+    /// 公网访问二级域名前缀。
+    pub public_subdomain: Option<String>,
     /// CodexMan 默认打开地址。
     pub open_url: String,
     /// 当前服务状态。
@@ -171,6 +197,9 @@ pub struct CreateMyAppParams {
     /// 远程 URL。
     #[serde(default)]
     pub remote_url: Option<String>,
+    /// 公网访问二级域名前缀。
+    #[serde(default)]
+    pub public_subdomain: Option<String>,
     /// 本地托管 zip data URL。
     #[serde(default)]
     pub zip_data_url: Option<String>,
@@ -195,6 +224,9 @@ pub struct UpdateMyAppParams {
     /// 远程 URL。
     #[serde(default)]
     pub remote_url: Option<String>,
+    /// 公网访问二级域名前缀。
+    #[serde(default)]
+    pub public_subdomain: Option<String>,
     /// 可选新 zip data URL；为空时复用现有解压目录。
     #[serde(default)]
     pub zip_data_url: Option<String>,
@@ -325,6 +357,8 @@ impl RuntimeMyApps {
         let zip_data_url = params.zip_data_url.clone().unwrap_or_default();
         let record = normalize_create_params(&id, &now, params)?;
         ensure_unique_port(&document.apps, None, record.port)?;
+        ensure_unique_public_subdomain(&document.apps, None, record.public_subdomain.as_deref())?;
+        ensure_remote_public_subdomain_available(app, record.public_subdomain.as_deref())?;
         if record.access_type == MyAppAccessType::Local {
             extract_site_zip(app, &id, &zip_data_url)?;
         }
@@ -369,6 +403,14 @@ impl RuntimeMyApps {
         let zip_data_url = params.zip_data_url.clone().unwrap_or_default();
         let next = normalize_update_params(&previous, &now, params)?;
         ensure_unique_port(&document.apps, Some(&next.id), next.port)?;
+        ensure_unique_public_subdomain(
+            &document.apps,
+            Some(&next.id),
+            next.public_subdomain.as_deref(),
+        )?;
+        if next.public_subdomain != previous.public_subdomain {
+            ensure_remote_public_subdomain_available(app, next.public_subdomain.as_deref())?;
+        }
         let should_replace_site =
             next.access_type == MyAppAccessType::Local && !zip_data_url.trim().is_empty();
         if next.access_type == MyAppAccessType::Local
@@ -545,6 +587,8 @@ impl RuntimeMyApps {
                 .map_err(|_| "我的应用运行状态锁已损坏".to_string())?;
             if let Some(server) = state.servers.get(&record.id) {
                 if server.port == port {
+                    drop(state);
+                    self.start_frpc(app, record, port)?;
                     return Ok(());
                 }
             }
@@ -596,6 +640,18 @@ impl RuntimeMyApps {
                 message: "服务已启动。".to_string(),
             },
         );
+        drop(state);
+        if let Err(error) = self.start_frpc(app, record, port) {
+            self.stop(&record.id)?;
+            return Err(error);
+        }
+        if record.public_subdomain.is_some() {
+            self.set_status(
+                &record.id,
+                MyAppServiceStatus::Running,
+                "服务已启动，公网访问已连接。".to_string(),
+            )?;
+        }
         Ok(())
     }
 
@@ -618,6 +674,7 @@ impl RuntimeMyApps {
                 .join()
                 .map_err(|_| "静态服务线程异常退出。".to_string())?;
         }
+        self.stop_frpc(app_id)?;
         self.set_status(
             app_id,
             MyAppServiceStatus::Paused,
@@ -643,6 +700,85 @@ impl RuntimeMyApps {
         state
             .statuses
             .insert(app_id.to_string(), MyAppRuntimeStatus { status, message });
+        Ok(())
+    }
+
+    /// 停止单个受管 FRP 客户端。
+    /// 流程：只终止当前 Runtime 记录的 frpc 子进程，先发送 kill 再等待退出。
+    /// 参数：app_id 为应用稳定 ID。
+    /// 返回：停止结果。
+    /// 异常/边界：未配置或未启动公网访问时视为成功；不会扫描或结束系统中其它 frpc 进程。
+    fn stop_frpc(&self, app_id: &str) -> Result<(), String> {
+        let managed = self
+            .state
+            .lock()
+            .map_err(|_| "我的应用运行状态锁已损坏".to_string())?
+            .frpc_clients
+            .remove(app_id);
+        if let Some(mut managed_client) = managed {
+            let _ = managed_client.child.kill();
+            managed_client
+                .child
+                .wait()
+                .map_err(|error| format!("停止公网访问客户端失败：{}", error))?;
+        }
+        Ok(())
+    }
+
+    /// 启动单个应用的 FRP 公网访问。
+    /// 流程：根据二级域名前缀生成临时 frpc 配置，解析或自动安装 frpc 后启动 HTTP 代理进程。
+    /// 参数：app 为 Tauri App 句柄，record 为本地应用记录，port 为本地静态服务端口。
+    /// 返回：启动结果。
+    /// 异常/边界：未填写二级域名时直接跳过；已用同一二级域名运行时视为成功。
+    fn start_frpc(&self, app: &AppHandle, record: &MyAppRecord, port: u16) -> Result<(), String> {
+        let Some(subdomain) = record.public_subdomain.as_deref() else {
+            return Ok(());
+        };
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "我的应用运行状态锁已损坏".to_string())?;
+            if let Some(client) = state.frpc_clients.get(&record.id) {
+                if client.subdomain == subdomain {
+                    return Ok(());
+                }
+            }
+        }
+        self.stop_frpc(&record.id)?;
+        let frpc_path = resolve_frpc_binary(app)?;
+        let tunnel_config = FrpHttpTunnelConfig {
+            name: &record.id,
+            subdomain,
+            local_port: port,
+        };
+        let config_path = write_frpc_config(app, &tunnel_config)?;
+        let mut child = Command::new(frpc_path)
+            .arg("-c")
+            .arg(config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("启动公网访问客户端失败：{}", error))?;
+        thread::sleep(Duration::from_millis(350));
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "公网访问客户端启动后退出，状态码：{}。",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "我的应用运行状态锁已损坏".to_string())?;
+        state.frpc_clients.insert(
+            record.id.clone(),
+            ManagedFrpcClient {
+                child,
+                subdomain: subdomain.to_string(),
+            },
+        );
         Ok(())
     }
 }
@@ -688,6 +824,7 @@ fn normalize_create_params(
                 access_type: MyAppAccessType::Local,
                 port: Some(port),
                 remote_url: None,
+                public_subdomain: normalize_public_subdomain(params.public_subdomain.as_deref())?,
                 created_at: now.to_string(),
                 updated_at: now.to_string(),
             })
@@ -701,6 +838,7 @@ fn normalize_create_params(
                 access_type: MyAppAccessType::Remote,
                 port: None,
                 remote_url: Some(remote_url),
+                public_subdomain: None,
                 created_at: now.to_string(),
                 updated_at: now.to_string(),
             })
@@ -733,6 +871,7 @@ fn normalize_update_params(
                 access_type: MyAppAccessType::Local,
                 port: Some(port),
                 remote_url: None,
+                public_subdomain: normalize_public_subdomain(params.public_subdomain.as_deref())?,
                 created_at: previous.created_at.clone(),
                 updated_at: now.to_string(),
             })
@@ -746,6 +885,7 @@ fn normalize_update_params(
                 access_type: MyAppAccessType::Remote,
                 port: None,
                 remote_url: Some(remote_url),
+                public_subdomain: None,
                 created_at: previous.created_at.clone(),
                 updated_at: now.to_string(),
             })
@@ -818,6 +958,32 @@ fn validate_remote_url(url: &str) -> Result<String, String> {
     Ok(parsed.to_string())
 }
 
+/// 规范化公网二级域名前缀。
+/// 流程：允许为空；非空时转换为小写并校验 DNS label 字符、长度和首尾字符。
+/// 参数：subdomain 为用户填写的二级域名前缀。
+/// 返回：规范化后的可选前缀。
+/// 异常/边界：只接受单级前缀，不接受点号、协议、根域名或通配符，避免用户绕过服务器侧泛域名约束。
+fn normalize_public_subdomain(subdomain: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = subdomain.unwrap_or("").trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized.len() > 63 {
+        return Err("公网二级域名前缀最多 63 个字符。".to_string());
+    }
+    if normalized.starts_with('-') || normalized.ends_with('-') {
+        return Err("公网二级域名前缀不能以短横线开头或结尾。".to_string());
+    }
+    let valid = normalized
+        .bytes()
+        .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'-');
+    if !valid {
+        return Err("公网二级域名仅支持小写字母、数字和短横线。".to_string());
+    }
+    Ok(Some(normalized))
+}
+
 /// 校验端口在记录内唯一。
 /// 流程：排除当前编辑记录后检查其它本地应用端口。
 /// 参数：records 为现有记录，current_id 为当前编辑 ID，port 为目标端口。
@@ -838,6 +1004,135 @@ fn ensure_unique_port(
         return Err("该端口已被其它我的应用占用。".to_string());
     }
     Ok(())
+}
+
+/// 校验公网二级域名前缀在我的应用记录中唯一。
+/// 流程：排除当前编辑记录后，比较其它本地应用已配置的二级域名前缀。
+/// 参数：records 为现有记录，current_id 为当前编辑 ID，subdomain 为目标前缀。
+/// 返回：校验结果。
+/// 异常/边界：未配置公网访问时直接通过；远程 URL 应用不会保留该字段。
+fn ensure_unique_public_subdomain(
+    records: &[MyAppRecord],
+    current_id: Option<&str>,
+    subdomain: Option<&str>,
+) -> Result<(), String> {
+    let Some(target_subdomain) = subdomain else {
+        return Ok(());
+    };
+    let duplicated = records.iter().any(|record| {
+        record.public_subdomain.as_deref() == Some(target_subdomain)
+            && current_id.map(|id| id != record.id).unwrap_or(true)
+    });
+    if duplicated {
+        return Err("该公网二级域名已被其它我的应用占用。".to_string());
+    }
+    Ok(())
+}
+
+/// 探测公网二级域名是否已被远端 frps 占用。
+/// 流程：对用户填写的二级域名启动一次短生命周期 frpc 预注册；成功连上后立即停止，重复注册或检测失败则阻止保存。
+/// 参数：app 为 Tauri App 句柄，subdomain 为已通过本地格式校验的二级域名前缀。
+/// 返回：域名可用时为空。
+/// 异常/边界：空域名不探测；探测不会写入应用记录，也不会长期占用域名。
+fn ensure_remote_public_subdomain_available(
+    app: &AppHandle,
+    subdomain: Option<&str>,
+) -> Result<(), String> {
+    let Some(subdomain) = subdomain else {
+        return Ok(());
+    };
+    let probe_name = format!(
+        "my-app-domain-probe-{}-{}",
+        subdomain,
+        Uuid::new_v4().simple()
+    );
+    let tunnel_config = FrpHttpTunnelConfig {
+        name: &probe_name,
+        subdomain,
+        local_port: PUBLIC_SUBDOMAIN_PROBE_LOCAL_PORT,
+    };
+    let frpc_path = resolve_existing_frpc_binary(app).map_err(|error| {
+        format!(
+            "检测公网二级域名可用性失败：{}请安装内置 frpc 的新版 CodexMan，或配置 AITOOL_FRPC_PATH 后重试。",
+            error
+        )
+    })?;
+    let config_path = write_frpc_config(app, &tunnel_config)?;
+    let mut child = Command::new(frpc_path)
+        .arg("-c")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("检测公网二级域名可用性失败：{}", error))?;
+    thread::sleep(Duration::from_millis(PUBLIC_SUBDOMAIN_PROBE_WAIT_MS));
+    let exit_status = child
+        .try_wait()
+        .map_err(|error| format!("检测公网二级域名可用性失败：{}", error))?;
+    if exit_status.is_none() {
+        let _ = child.kill();
+        child
+            .wait()
+            .map_err(|error| format!("结束公网二级域名检测客户端失败：{}", error))?;
+        let output = read_finished_process_output(&mut child);
+        if is_frpc_public_subdomain_conflict_output(&output) {
+            return Err(format!(
+                "公网二级域名 {} 已被占用，请更换后再保存。",
+                public_url_for_subdomain(subdomain)
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(status) = exit_status {
+        let output = read_finished_process_output(&mut child);
+        if is_frpc_public_subdomain_conflict_output(&output) {
+            return Err(format!(
+                "公网二级域名 {} 已被占用，请更换后再保存。",
+                public_url_for_subdomain(subdomain)
+            ));
+        }
+        let message = output
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().chars().take(180).collect::<String>())
+            .unwrap_or_else(|| format!("frpc 退出状态码 {}", status.code().unwrap_or(-1)));
+        return Err(format!("检测公网二级域名可用性失败：{}。", message));
+    }
+    Ok(())
+}
+
+/// 读取已退出 frpc 进程的输出。
+/// 流程：分别读取 stdout/stderr 的 UTF-8 文本并拼接为诊断摘要。
+/// 参数：child 为已经退出或即将退出的 frpc 子进程。
+/// 返回：合并后的输出文本。
+/// 异常/边界：读取失败时忽略对应流，避免遮蔽原始启动失败状态。
+fn read_finished_process_output(child: &mut Child) -> String {
+    let mut output = String::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        let _ = stdout.read_to_string(&mut output);
+    }
+    if let Some(stderr) = child.stderr.as_mut() {
+        let _ = stderr.read_to_string(&mut output);
+    }
+    output
+}
+
+/// 判断 frpc 输出是否表示远端二级域名冲突。
+/// 流程：兼容 frp 不同版本常见重复代理、重复 custom domain、重复 subdomain 文案。
+/// 参数：output 为 frpc 启动失败输出。
+/// 返回：命中占用语义时 true。
+/// 异常/边界：其它网络、认证、配置错误不伪装成已占用，交给调用方展示检测失败。
+fn is_frpc_public_subdomain_conflict_output(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    (normalized.contains("already")
+        || normalized.contains("duplicate")
+        || normalized.contains("repeated")
+        || normalized.contains("conflict"))
+        && (normalized.contains("subdomain")
+            || normalized.contains("custom domain")
+            || normalized.contains("domain")
+            || normalized.contains("proxy"))
 }
 
 /// 判断端口是否可绑定。
@@ -1247,6 +1542,12 @@ fn build_app_response(
         .port
         .map(|port| format!("http://{}:{}", lan_ip, port))
         .unwrap_or_default();
+    let public_url = record
+        .public_subdomain
+        .as_deref()
+        .filter(|_| record.access_type == MyAppAccessType::Local)
+        .map(public_url_for_subdomain)
+        .unwrap_or_default();
     MyAppResponse {
         id: record.id.clone(),
         name: record.name.clone(),
@@ -1256,6 +1557,8 @@ fn build_app_response(
         remote_url: record.remote_url.clone(),
         local_url: local_url.clone(),
         lan_url,
+        public_url,
+        public_subdomain: record.public_subdomain.clone(),
         open_url: app_open_url(record),
         service_status: status.status,
         service_message: status.message,
@@ -1442,5 +1745,27 @@ mod tests {
         assert_eq!(resolved, dist_dir);
 
         fs::remove_dir_all(temp_dir).expect("测试临时目录必须清理成功");
+    }
+
+    /// 验证 frpc 重复域名输出能被识别为占用冲突。
+    /// 流程：分别传入重复 subdomain、普通网络失败和空输出，确认只把重复域名类失败映射为占用。
+    /// 参数：无。
+    /// 返回：无。
+    /// 异常/边界：不启动真实 frpc，避免单测依赖公网服务。
+    #[test]
+    fn frpc_public_subdomain_conflict_output_is_detected() {
+        assert!(is_frpc_public_subdomain_conflict_output(
+            "proxy [codexman-demo] start error: subdomain demo is already registered"
+        ));
+        assert!(is_frpc_public_subdomain_conflict_output(
+            "custom domain demo.tolern.com already exists"
+        ));
+        assert!(is_frpc_public_subdomain_conflict_output(
+            "[codexman-demo] proxy added\n[codexman-demo] start error: router config conflict"
+        ));
+        assert!(!is_frpc_public_subdomain_conflict_output(
+            "login to server failed: dial tcp i/o timeout"
+        ));
+        assert!(!is_frpc_public_subdomain_conflict_output(""));
     }
 }

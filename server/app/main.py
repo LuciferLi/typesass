@@ -1857,7 +1857,7 @@ MY_APP_COMMON_ERROR_CODES = {
         {
             "code": "VALIDATION_ERROR",
             "retryable": False,
-            "action": "按请求 schema 修正名称、端口、URL、zipDataUrl、打开目标或额外字段。",
+            "action": "按请求 schema 修正名称、端口、URL、publicSubdomain、zipDataUrl、打开目标或额外字段。",
         }
     ],
 }
@@ -1884,7 +1884,7 @@ MY_APP_CREATE_ERROR_CODES = {
         {
             "code": "MY_APP_CREATE_FAILED",
             "retryable": False,
-            "action": "检查名称、端口、远程 URL 或静态站点 zip；本地托管必须包含 index.html。",
+            "action": "检查名称、端口、公网二级域名、远程 URL 或静态站点 zip；本地托管必须包含 index.html。",
         }
     ],
     **MY_APP_COMMON_ERROR_CODES,
@@ -1894,7 +1894,7 @@ MY_APP_UPDATE_ERROR_CODES = {
         {
             "code": "MY_APP_UPDATE_FAILED",
             "retryable": False,
-            "action": "检查名称、端口、远程 URL 或 zip；端口变化只会重启 CodexMan 当前持有的服务。",
+            "action": "检查名称、端口、公网二级域名、远程 URL 或 zip；端口变化只会重启 CodexMan 当前持有的服务。",
         }
     ],
     "404": [
@@ -1928,7 +1928,7 @@ MY_APP_RESTART_ERROR_CODES = {
         {
             "code": "MY_APP_RESTART_FAILED",
             "retryable": False,
-            "action": "端口被占用、站点目录缺失或 zip 内容无效；不要结束未知进程，修改端口或重新上传后再启动。",
+            "action": "端口被占用、站点目录缺失、公网访问客户端不可用或 zip 内容无效；不要结束未知进程，修改端口或重新上传后再启动。",
         }
     ],
     "422": MY_APP_COMMON_ERROR_CODES["422"],
@@ -1960,6 +1960,8 @@ MY_APP_EXAMPLE = {
     "remoteUrl": "",
     "localUrl": "http://127.0.0.1:18123",
     "lanUrl": "http://192.168.1.23:18123",
+    "publicUrl": "https://demo.tolern.com",
+    "publicSubdomain": "demo",
     "openUrl": "http://127.0.0.1:18123",
     "serviceStatus": "running",
     "serviceMessage": "服务已启动。",
@@ -2112,7 +2114,7 @@ async def allocate_my_app_port(request: Request) -> object:
     summary="创建我的应用",
     description=(
         "创建本地托管或远程 URL 应用。本地托管需要 zipDataUrl 和端口，Rust 会安全解压到 App 数据目录，"
-        "随后绑定 0.0.0.0:<port> 以允许局域网访问。"
+        "随后绑定 0.0.0.0:<port> 以允许局域网访问；填写 publicSubdomain 时会通过 frpc 注册公网二级域名。"
     ),
     openapi_extra=private_route_openapi(
         MY_APP_CREATE_ERROR_CODES,
@@ -2122,6 +2124,7 @@ async def allocate_my_app_port(request: Request) -> object:
             "accessType": "local",
             "port": 18123,
             "remoteUrl": "",
+            "publicSubdomain": "demo",
             "zipDataUrl": "data:application/zip;base64,UEsDBBQAAAA...",
         },
     ),
@@ -2157,6 +2160,7 @@ async def create_my_app(request: Request, payload: MyAppCreateRequest) -> object
             "accessType": "local",
             "port": 18124,
             "remoteUrl": "",
+            "publicSubdomain": "demo-v2",
             "zipDataUrl": "",
         },
     ),

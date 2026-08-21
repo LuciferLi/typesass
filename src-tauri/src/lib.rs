@@ -4,9 +4,11 @@ mod app_audio;
 mod codex_cdp;
 mod codex_desktop;
 mod desktop_error;
+mod frp_tunnel;
 mod my_apps;
 mod private_models;
 mod private_rpc;
+mod public_api_tunnel;
 mod realtime_asr;
 mod sidecar;
 mod task_store;
@@ -37,6 +39,10 @@ use codex_desktop::{CodexConnectionStatus, CodexRestartAccepted, RuntimeCodexDes
 use my_apps::RuntimeMyApps;
 use private_models::{PrivateModelRecord, PublicModelCatalogRecord, SavePrivateModelRequest};
 use private_rpc::RuntimePrivateRpc;
+use public_api_tunnel::{
+    generate_public_api_subdomain, validate_public_api_subdomain, PublicApiTunnelStatus,
+    RuntimePublicApiTunnel,
+};
 use sidecar::RuntimeSidecar;
 use task_store::{
     CreateProjectRequest, CreateTaskRequest, CreateTaskResponse, RunningTaskRecord,
@@ -1248,6 +1254,55 @@ fn read_local_config_snapshot(window: tauri::WebviewWindow) -> Result<LocalConfi
     read_local_config_document(&app)
 }
 
+/// 读取公共 HTTP API 外网访问状态。
+/// 流程：校验 hub 权限后读取设置分区，再结合当前受管 frpc 进程状态返回页面展示模型。
+/// 参数：window 为调用窗口，tunnel 为 API 隧道运行时。
+/// 返回：外网访问开关、用户英文名优先的固定域名、远程地址和运行态。
+/// 异常/边界：配置文件损坏或窗口无权限时显式失败，不伪造公网地址。
+#[tauri::command]
+fn get_public_api_tunnel_status(
+    window: tauri::WebviewWindow,
+    tunnel: State<'_, RuntimePublicApiTunnel>,
+) -> Result<PublicApiTunnelStatus, String> {
+    ensure_sensitive_management_window(window.label())?;
+    let app = window.app_handle().clone();
+    let settings = read_public_api_tunnel_settings(&app)?;
+    tunnel.status(settings.enabled, settings.subdomain)
+}
+
+/// 切换公共 HTTP API 外网访问。
+/// 流程：开启时优先使用用户英文名作为二级域名；未设置英文名时首次生成 6 位随机兜底域名并写入配置，再启动 frpc；关闭时保留域名只停止 frpc。
+/// 参数：window 为调用窗口，tunnel 为 API 隧道运行时，enabled 为目标开关状态。
+/// 返回：最新外网访问状态。
+/// 异常/边界：开启失败不会写入已开启状态；关闭失败会返回真实停止错误并保留旧配置。
+#[tauri::command]
+fn set_public_api_tunnel_enabled(
+    window: tauri::WebviewWindow,
+    tunnel: State<'_, RuntimePublicApiTunnel>,
+    enabled: bool,
+) -> Result<PublicApiTunnelStatus, String> {
+    ensure_sensitive_management_window(window.label())?;
+    let app = window.app_handle().clone();
+    let mut settings = read_public_api_tunnel_settings(&app)?;
+    settings.enabled = enabled;
+    if enabled && settings.subdomain.is_none() {
+        settings.subdomain = Some(generate_public_api_subdomain());
+    }
+    if enabled {
+        let subdomain = settings
+            .subdomain
+            .clone()
+            .ok_or_else(|| "HTTP API 公网域名生成失败，请重试。".to_string())?;
+        let status = tunnel.start(&app, &subdomain)?;
+        write_public_api_tunnel_settings(&app, &settings)?;
+        Ok(status)
+    } else {
+        tunnel.stop()?;
+        write_public_api_tunnel_settings(&app, &settings)?;
+        tunnel.status(false, settings.subdomain)
+    }
+}
+
 /// 启动客户端 JSON 配置文件变化监听；内部通过轻量轮询捕捉外部改文件场景。
 /// 流程：校验 hub 并以运行时锁保证只启动一次，再由后台线程监测修改时间并广播；参数为窗口和监听状态。
 /// 异常/边界：重复调用幂等成功，非 hub 默认拒绝，单次文件读取失败由后续轮询自行恢复。
@@ -1295,6 +1350,72 @@ fn validate_local_config_key(key: &str) -> Result<(), String> {
     if !trimmed.starts_with("codexman.") {
         return Err("配置 key 不在允许的 CodexMan 命名空间内".to_string());
     }
+    Ok(())
+}
+
+/// 公共 HTTP API 外网访问持久化设置。
+struct PublicApiTunnelSettings {
+    /// 是否允许外网访问。
+    enabled: bool,
+    /// 固定二级域名前缀；优先来自用户英文名，未设置时使用随机兜底域名。
+    subdomain: Option<String>,
+}
+
+/// 从系统设置分区读取公共 HTTP API 外网访问配置。
+/// 流程：读取客户端 JSON 的 settings 分区，优先使用合法用户英文名作为公共 API 域名前缀，未设置时回退到历史随机域名。
+/// 参数：app 为 Tauri 句柄。
+/// 返回：规范化后的外网访问设置。
+/// 异常/边界：配置文件损坏直接返回错误；域名字段非法时忽略并等待下次开启重新生成。
+fn read_public_api_tunnel_settings(app: &AppHandle) -> Result<PublicApiTunnelSettings, String> {
+    let document = read_local_config_document(app)?;
+    let settings = document.items.get(LOCAL_CONFIG_SETTINGS_KEY);
+    let enabled = settings
+        .and_then(|value| value.get("publicApiExternalAccessEnabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let user_english_name = settings
+        .and_then(|value| value.get("userEnglishName"))
+        .and_then(Value::as_str)
+        .and_then(|value| validate_public_api_subdomain(value).ok());
+    let persisted_subdomain = settings
+        .and_then(|value| value.get("publicApiSubdomain"))
+        .and_then(Value::as_str)
+        .and_then(|value| validate_public_api_subdomain(value).ok());
+    let subdomain = user_english_name.or(persisted_subdomain);
+    Ok(PublicApiTunnelSettings { enabled, subdomain })
+}
+
+/// 写入公共 HTTP API 外网访问配置到系统设置分区。
+/// 流程：只修改 settings 分区中的 API 外网访问字段，保留其它用户设置，然后广播配置快照。
+/// 参数：app 为 Tauri 句柄，settings 为规范化外网访问设置。
+/// 返回：写入结果。
+/// 异常/边界：settings 分区不是对象时重建为空对象，避免旧非法结构继续扩散。
+fn write_public_api_tunnel_settings(
+    app: &AppHandle,
+    settings: &PublicApiTunnelSettings,
+) -> Result<(), String> {
+    let mut document = read_local_config_document(app)?;
+    let mut settings_value = document
+        .items
+        .get(LOCAL_CONFIG_SETTINGS_KEY)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !settings_value.is_object() {
+        settings_value = json!({});
+    }
+    settings_value["publicApiExternalAccessEnabled"] = Value::Bool(settings.enabled);
+    settings_value["publicApiSubdomain"] = settings
+        .subdomain
+        .as_deref()
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or(Value::Null);
+    document.version = LOCAL_CONFIG_VERSION;
+    document.updated_at = local_config_updated_at();
+    document
+        .items
+        .insert(LOCAL_CONFIG_SETTINGS_KEY.to_string(), settings_value);
+    write_local_config_document(app, &document)?;
+    emit_local_config_changed(app, &document);
     Ok(())
 }
 
@@ -1697,6 +1818,7 @@ pub fn run() {
         .manage(RuntimeAppVoiceRecorder::default())
         .manage(RuntimeVoiceShortcutDebounce::default())
         .manage(RuntimeLocalConfigWatcher::default())
+        .manage(RuntimePublicApiTunnel::default())
         .manage(RuntimeMyApps::default())
         .manage(RuntimePrivateRpc::default())
         .manage(RuntimeSidecar::default())
@@ -1733,6 +1855,24 @@ pub fn run() {
                     None,
                     &error,
                 );
+            }
+            if let Ok(settings) = read_public_api_tunnel_settings(app.handle()) {
+                if settings.enabled {
+                    if let Some(subdomain) = settings.subdomain {
+                        if let Err(error) = app
+                            .state::<RuntimePublicApiTunnel>()
+                            .start(app.handle(), &subdomain)
+                        {
+                            let _ = desktop_error::record_desktop_error(
+                                app.handle(),
+                                "PUBLIC_API_TUNNEL_INITIALIZE_FAILED",
+                                "app_setup",
+                                None,
+                                &error,
+                            );
+                        }
+                    }
+                }
             }
             let sidecar_app = app.handle().clone();
             thread::spawn(move || start_sidecar_in_background(sidecar_app));
@@ -1870,6 +2010,8 @@ pub fn run() {
             write_local_config_value,
             remove_local_config_value,
             read_local_config_snapshot,
+            get_public_api_tunnel_status,
+            set_public_api_tunnel_enabled,
             start_local_config_watch,
             list_private_models,
             list_public_model_catalog,
@@ -1910,6 +2052,15 @@ pub fn run() {
                     let _ = desktop_error::record_desktop_error(
                         app,
                         "MY_APPS_SHUTDOWN_FAILED",
+                        "app_exit",
+                        None,
+                        &error,
+                    );
+                }
+                if let Err(error) = app.state::<RuntimePublicApiTunnel>().stop() {
+                    let _ = desktop_error::record_desktop_error(
+                        app,
+                        "PUBLIC_API_TUNNEL_SHUTDOWN_FAILED",
                         "app_exit",
                         None,
                         &error,

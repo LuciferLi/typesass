@@ -110,6 +110,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 18080 --workers 1
 
 本地托管应用使用用户指定端口绑定 `0.0.0.0:<port>`，因此同局域网电脑可通过 `lanUrl` 访问。创建或修改端口时只会停止 CodexMan 当前持有的静态服务线程，不会 kill 未知进程；如果端口被其它程序占用，接口返回失败并在列表中展示 `failed`。App 启动进入主界面时会自动启动已保存的本地托管服务。
 
+本地托管应用可选填写 `publicSubdomain`，例如 `demo` 会生成 `publicUrl=https://demo.tolern.com`。桌面 Rust 业务核心会在本地静态服务启动成功后自动启动受管 `frpc`，连接服务器侧 `frps` 并注册同名 HTTP 代理；删除、重启或退出 App 时只停止 CodexMan 自己启动的 `frpc` 子进程，不扫描或结束系统中其它进程。`frpc` 路径解析顺序为 `AITOOL_FRPC_PATH`、App 数据目录自动安装产物、Tauri 资源目录 `frpc`、系统 `PATH`；macOS arm64/x64 缺失时会下载安装到 App 数据目录。
+
 zip 上传通过 JSON 字段 `zipDataUrl` 传递，受公开 HTTP body 12 MiB 和私有 RPC 12 MiB 上限约束。zip 根目录或第一层唯一目录必须包含 `index.html`；服务会安全解压到 App data 的隔离目录，并对静态请求做路径穿越防护和 SPA `index.html` 回退。远程 URL 应用只保存 `remoteUrl`，没有本地服务，也没有启动或重启动作。
 
 示例：
@@ -140,10 +142,10 @@ curl -X POST "$BASE_URL/v1/my-apps" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -H 'X-Request-ID: my-app-create-local-001' \
-  -d '{"name":"本地看板","logoDataUrl":"","accessType":"local","port":18123,"zipDataUrl":"data:application/zip;base64,UEsDBBQAAAA..."}'
+  -d '{"name":"本地看板","logoDataUrl":"","accessType":"local","port":18123,"publicSubdomain":"demo","zipDataUrl":"data:application/zip;base64,UEsDBBQAAAA..."}'
 ```
 
-列表响应会包含 `localUrl`、`lanUrl`、`openUrl`、`serviceStatus` 和 `serviceMessage`。`serviceStatus` 固定为 `starting`、`running`、`paused`、`failed` 或 `unavailable`；远程 URL 应用为 `unavailable`。打开应用时传 `target=codexman` 或 `target=browser`：
+列表响应会包含 `localUrl`、`lanUrl`、`publicUrl`、`publicSubdomain`、`openUrl`、`serviceStatus` 和 `serviceMessage`。`serviceStatus` 固定为 `starting`、`running`、`paused`、`failed` 或 `unavailable`；远程 URL 应用为 `unavailable`。打开应用时传 `target=codexman` 或 `target=browser`：
 
 ```bash
 curl -X POST "$BASE_URL/v1/my-apps/app_01J00000000000000000000000/open" \
