@@ -17,7 +17,7 @@ mod web_server;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -103,7 +103,8 @@ const LOCAL_CONFIG_SHORTCUTS_KEY: &str = "codexman.shortcuts.v1";
 const LOCAL_CONFIG_VERSION: u32 = 1;
 const LOCAL_CONFIG_WATCH_INTERVAL_MS: u64 = 500;
 const CODEX_THREAD_LIST_LIMIT: usize = 60;
-const CODEX_THREAD_MESSAGE_LIMIT: usize = 80;
+/// 会话详情内部保留的结构化消息上限；工具调用拆块后数量会明显增加，需要高于前端默认窗口。
+const CODEX_THREAD_MESSAGE_LIMIT: usize = 200;
 const CODEX_MESSAGE_CONTENT_MAX_CHARS: usize = 6000;
 /// 任务结果中最终助手文本字符上限；按最坏 JSON 转义后仍低于 task_store 的 32 KiB 结果上限。
 const CODEX_TASK_RESULT_TEXT_MAX_CHARS: usize = 4000;
@@ -122,6 +123,8 @@ const CODEX_SESSION_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const CODEX_SESSION_TOTAL_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
 /// Codex 官方 session_index.jsonl 最大字节数；打开句柄后最多读取上限加一字节。
 const CODEX_SESSION_INDEX_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 会话列表读取运行态时最多查看 JSONL 尾部字节数，避免高频刷新时读完整大文件。
+const CODEX_SESSION_STATUS_TAIL_BYTES: u64 = 512 * 1024;
 /// 单条本地 session JSONL 事件最大字节数；超限拒绝整个文件且不回显事件正文。
 const CODEX_SESSION_FRAME_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_SESSION_SUMMARY_MAX_LINES: usize = 120;
@@ -1666,6 +1669,8 @@ pub(crate) struct CodexThreadSummary {
     agent_nickname: String,
     /// 子 Agent 角色；普通会话为空。
     agent_role: String,
+    /// 会话运行状态；running 用于左侧列表展示加载态，unknown 表示来源无法确认。
+    status: String,
     /// 最近更新时间，保持 ISO 字符串供前端本地化展示。
     updated_at: String,
 }
@@ -1688,10 +1693,16 @@ pub(crate) struct CodexWorkspaceSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexThreadMessage {
-    /// 消息角色，MVP 只返回 user 和 assistant。
+    /// 消息角色，对外保持 user/assistant 兼容；工具、状态和思考块都归属 assistant。
     role: String,
+    /// 消息类型，用于前端按 Codex 风格区分正文、思考、工具调用、工具结果和状态。
+    kind: String,
+    /// 消息块标题；普通正文为空，工具和状态块用于展示折叠标题。
+    title: String,
     /// 消息正文，已经做最大长度保护。
     content: String,
+    /// 执行状态；仅工具和状态块使用，普通正文为空。
+    status: String,
     /// 消息创建时间，保持 ISO 字符串供前端本地化展示。
     created_at: String,
 }
@@ -1990,6 +2001,7 @@ pub fn run() {
             register_shortcuts,
             suspend_shortcuts_for_recording,
             list_installed_applications,
+            open_local_file_with_default_app,
             get_runtime_diagnostics,
             request_microphone_access,
             open_accessibility_settings,
@@ -4148,6 +4160,20 @@ fn list_installed_applications(
     list_installed_applications_core()
 }
 
+/// 使用系统默认应用打开本机文件。
+/// 流程：校验调用窗口后规范化文件路径，确认目标是普通文件，再交给系统默认应用打开。
+/// 参数：window 为调用窗口，file_path 为前端传入的本机文件绝对路径。
+/// 返回：系统 open 命令发起成功时返回空值。
+/// 异常/边界：非主窗口、路径为空、文件不存在、目录路径或系统打开失败时返回明确错误；不拼接 shell 字符串。
+#[tauri::command]
+fn open_local_file_with_default_app(
+    window: tauri::WebviewWindow,
+    file_path: String,
+) -> Result<(), String> {
+    ensure_sensitive_management_window(window.label())?;
+    open_local_file_with_default_app_core(&file_path)
+}
+
 /// 读取当前桌面端能力状态，供设置页展示真实诊断结果。
 /// 流程：校验 hub 后汇总系统权限和快捷键状态；参数为窗口和运行状态；返回脱敏诊断结构。
 /// 异常/边界：非 hub 默认拒绝，状态锁损坏时显式失败，不向临时窗口暴露系统权限状态。
@@ -4275,7 +4301,8 @@ fn read_codex_state_threads(
                    END AS depth,
                    COALESCE(agent_nickname, '') AS agent_nickname,
                    COALESCE(agent_role, '') AS agent_role,
-                   COALESCE(NULLIF(recency_at_ms, 0), updated_at * 1000) AS updated_at_ms
+                   COALESCE(NULLIF(recency_at_ms, 0), updated_at * 1000) AS updated_at_ms,
+                   rollout_path
               FROM threads
              WHERE archived = 0
                AND cwd = ?1
@@ -4291,6 +4318,7 @@ fn read_codex_state_threads(
         .query_map(
             params![workspace_cwd, limit as i64, offset as i64, keyword_pattern],
             |row| {
+                let rollout_path: String = row.get(7)?;
                 Ok(CodexThreadSummary {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -4298,6 +4326,8 @@ fn read_codex_state_threads(
                     depth: row.get::<_, i64>(3)?.max(0),
                     agent_nickname: row.get(4)?,
                     agent_role: row.get(5)?,
+                    status: read_codex_session_tail_status(Path::new(&rollout_path))
+                        .unwrap_or_else(|_| "unknown".to_string()),
                     updated_at: row.get::<_, i64>(6)?.to_string(),
                 })
             },
@@ -4525,7 +4555,18 @@ fn run_codex_app_server_thread_detail(thread_id: &str) -> Result<CodexThreadDeta
         .get("result")
         .and_then(|result| result.get("thread"))
         .ok_or_else(|| "Codex 任务详情响应缺少 thread".to_string())?;
-    parse_codex_app_thread_detail(thread)
+    let mut detail = parse_codex_app_thread_detail(thread)?;
+    if let Ok(session_file) = find_codex_session_file(thread_id) {
+        if let Ok(jsonl_messages) = read_codex_session_messages(&session_file) {
+            if jsonl_messages
+                .iter()
+                .any(|message| !matches!(message.kind.as_str(), "user" | "assistant"))
+            {
+                detail.messages = jsonl_messages;
+            }
+        }
+    }
+    Ok(detail)
 }
 
 /// 使用 Codex Desktop deeplink 打开指定任务，让真实 Desktop 侧边栏立即选中该任务。
@@ -4599,8 +4640,69 @@ fn parse_codex_app_thread_summary(value: &Value) -> Option<CodexThreadSummary> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        status: extract_codex_thread_status(value),
         updated_at,
     })
+}
+
+/// 从 app-server 的 Thread 对象中提取归一化运行状态。
+/// 流程：兼容顶层状态、最新 turn 状态和嵌套 current/active turn 状态，统一映射为前端稳定枚举。
+/// 参数：value 为 app-server 返回的单个 Thread JSON。
+/// 返回：running/completed/failed/unknown 之一。
+/// 边界：缺字段或新状态返回 unknown，不基于标题、时间等不可靠信息猜测。
+fn extract_codex_thread_status(value: &Value) -> String {
+    let direct_status = value
+        .get("status")
+        .or_else(|| value.get("turnStatus"))
+        .or_else(|| value.get("latestTurnStatus"))
+        .or_else(|| value.get("lastTurnStatus"))
+        .and_then(Value::as_str);
+    if let Some(status) = direct_status {
+        return normalize_codex_thread_status(status).to_string();
+    }
+
+    for key in [
+        "currentTurn",
+        "activeTurn",
+        "latestTurn",
+        "lastTurn",
+        "turn",
+    ] {
+        if let Some(status) = value
+            .get(key)
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str)
+        {
+            return normalize_codex_thread_status(status).to_string();
+        }
+    }
+
+    value
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.last())
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+        .map(normalize_codex_thread_status)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// 将 Codex 内部状态归一化为前端展示用状态。
+/// 流程：只保留列表渲染需要的稳定状态，running 覆盖所有仍在执行或等待用户输入的状态。
+/// 参数：status 为 app-server 或 JSONL 中的原始状态字符串。
+/// 返回：running/completed/failed/unknown 之一。
+/// 边界：未知值保留为 unknown，避免误把已结束任务展示为加载中。
+fn normalize_codex_thread_status(status: &str) -> &'static str {
+    match status {
+        "running" | "inProgress" | "in_progress" | "processing" | "queued" | "waiting"
+        | "waiting_acceptance" | "requires_action" => "running",
+        "completed" | "complete" | "succeeded" | "success" => "completed",
+        "failed" | "failure" | "error" | "interrupted" | "cancelled" | "canceled" | "aborted" => {
+            "failed"
+        }
+        _ => "unknown",
+    }
 }
 
 /// 将 app-server 的 Thread 详情转成前端可展示的消息列表。
@@ -4650,22 +4752,22 @@ fn parse_codex_app_thread_detail(value: &Value) -> Result<CodexThreadDetail, Str
 /// 从 app-server 的单个 ThreadItem 中抽取用户或助手消息。
 fn parse_codex_app_thread_item(value: &Value, created_at: &str) -> Option<CodexThreadMessage> {
     match value.get("type").and_then(Value::as_str)? {
-        "userMessage" => Some(CodexThreadMessage {
-            role: "user".to_string(),
-            content: limit_chars(
-                &extract_codex_app_user_message(value),
-                CODEX_MESSAGE_CONTENT_MAX_CHARS,
-            ),
-            created_at: created_at.to_string(),
-        }),
-        "agentMessage" => Some(CodexThreadMessage {
-            role: "assistant".to_string(),
-            content: limit_chars(
-                value.get("text").and_then(Value::as_str).unwrap_or(""),
-                CODEX_MESSAGE_CONTENT_MAX_CHARS,
-            ),
-            created_at: created_at.to_string(),
-        }),
+        "userMessage" => Some(build_codex_thread_message(
+            "user",
+            "user",
+            "",
+            &extract_codex_app_user_message(value),
+            "",
+            created_at,
+        )),
+        "agentMessage" => Some(build_codex_thread_message(
+            "assistant",
+            "assistant",
+            "",
+            value.get("text").and_then(Value::as_str).unwrap_or(""),
+            "",
+            created_at,
+        )),
         _ => None,
     }
 }
@@ -6418,6 +6520,7 @@ fn read_codex_session_index_path(path: &Path) -> Result<Vec<CodexThreadSummary>,
             depth: 0,
             agent_nickname: String::new(),
             agent_role: String::new(),
+            status: "unknown".to_string(),
             updated_at: updated_at.to_string(),
         };
         if threads.len() < CODEX_SESSION_INDEX_ENTRY_LIMIT {
@@ -6567,6 +6670,7 @@ fn read_codex_session_summary(path: &Path) -> Result<Option<CodexThreadSummary>,
     let mut depth = 0i64;
     let mut agent_nickname = String::new();
     let mut agent_role = String::new();
+    let mut status = "unknown".to_string();
     let mut updated_at = file_modified_timestamp(path);
     for _ in 0..CODEX_SESSION_SUMMARY_MAX_LINES {
         let Some(frame) = read_bounded_codex_session_frame(&mut reader)? else {
@@ -6620,6 +6724,7 @@ fn read_codex_session_summary(path: &Path) -> Result<Option<CodexThreadSummary>,
         if title.is_empty() {
             title = extract_codex_summary_title(&value);
         }
+        update_codex_session_status_from_event(&value, &mut status);
         if !id.is_empty() && !title.is_empty() && !updated_at.is_empty() {
             break;
         }
@@ -6644,8 +6749,128 @@ fn read_codex_session_summary(path: &Path) -> Result<Option<CodexThreadSummary>,
         depth,
         agent_nickname,
         agent_role,
+        status,
         updated_at,
     }))
+}
+
+/// 从 session JSONL 尾部读取最近任务状态。
+/// 流程：先校验普通文件和最大体积，再只读取尾部固定窗口并逐行解析最近事件。
+/// 参数：path 为 state 库记录的 rollout_path。
+/// 返回：running/completed/failed/unknown 之一。
+/// 异常/边界：尾部第一行可能被截断，解析失败会跳过；文件缺失或超限返回错误，调用方降级为 unknown。
+fn read_codex_session_tail_status(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "读取 Codex 会话状态元数据失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err("Codex 会话状态文件不是普通文件".to_string());
+    }
+    if metadata.len() > CODEX_SESSION_FILE_MAX_BYTES {
+        return Err("Codex 会话状态文件超过读取上限".to_string());
+    }
+    let mut file = fs::File::open(path).map_err(|error| {
+        format!(
+            "打开 Codex 会话状态失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let file_len = metadata.len();
+    let start = file_len.saturating_sub(CODEX_SESSION_STATUS_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).map_err(|error| {
+        format!(
+            "定位 Codex 会话状态失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let mut content = String::new();
+    file.read_to_string(&mut content).map_err(|error| {
+        format!(
+            "读取 Codex 会话状态失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let mut status = "unknown".to_string();
+    for (index, line) in content.lines().enumerate() {
+        if start > 0 && index == 0 {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        update_codex_session_status_from_event(&value, &mut status);
+    }
+    Ok(status)
+}
+
+/// 根据单行 Codex JSONL 事件推进会话运行状态。
+/// 流程：用户消息、思考、工具调用和 commentary 表示当前 turn 仍活跃；task_complete/final_answer 表示结束。
+/// 参数：value 为单行事件，status 为累计状态。
+/// 返回：无返回值，直接更新 status。
+/// 边界：token_count、权限提示等内部事件不改状态；工具调用自身 completed 仍视为 turn 活跃，避免过早停止 loading。
+fn update_codex_session_status_from_event(value: &Value, status: &mut String) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            let Some(payload) = value.get("payload") else {
+                return;
+            };
+            match payload.get("type").and_then(Value::as_str) {
+                Some("user_message" | "agent_reasoning" | "task_started") => {
+                    *status = "running".to_string();
+                }
+                Some("agent_message") => {
+                    let phase = payload.get("phase").and_then(Value::as_str).unwrap_or("");
+                    *status = if phase == "final" || phase == "final_answer" {
+                        "completed".to_string()
+                    } else {
+                        "running".to_string()
+                    };
+                }
+                Some("task_complete") => {
+                    *status = "completed".to_string();
+                }
+                Some("turn_aborted") => {
+                    *status = "failed".to_string();
+                }
+                _ => {}
+            }
+        }
+        Some("response_item") => {
+            let Some(payload) = value.get("payload") else {
+                return;
+            };
+            match payload.get("type").and_then(Value::as_str) {
+                Some(
+                    "function_call"
+                    | "custom_tool_call"
+                    | "tool_search_call"
+                    | "function_call_output"
+                    | "custom_tool_call_output"
+                    | "tool_search_output"
+                    | "reasoning",
+                ) => {
+                    *status = "running".to_string();
+                }
+                Some("message") => {
+                    if payload.get("role").and_then(Value::as_str) == Some("assistant") {
+                        *status = "completed".to_string();
+                    }
+                }
+                _ => {
+                    if let Some(raw_status) = payload.get("status").and_then(Value::as_str) {
+                        let normalized_status = normalize_codex_thread_status(raw_status);
+                        if normalized_status != "unknown" {
+                            *status = normalized_status.to_string();
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 读取文件修改时间作为会话排序兜底值，避免为摘要扫描完整大文件。
@@ -7014,28 +7239,535 @@ fn read_bounded_codex_session_frame<R: BufRead>(reader: &mut R) -> Result<Option
 
 /// 从单行 Codex JSONL 事件中抽取一条可展示消息。
 fn extract_codex_event_message(value: &Value, timestamp: &str) -> Option<CodexThreadMessage> {
-    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
-        return None;
-    }
     let payload = value.get("payload")?;
-    match payload.get("type").and_then(Value::as_str)? {
-        "user_message" => Some(CodexThreadMessage {
-            role: "user".to_string(),
-            content: limit_chars(
-                payload.get("message").and_then(Value::as_str).unwrap_or(""),
-                CODEX_MESSAGE_CONTENT_MAX_CHARS,
-            ),
-            created_at: timestamp.to_string(),
-        }),
-        "agent_message" => Some(CodexThreadMessage {
-            role: "assistant".to_string(),
-            content: limit_chars(
-                payload.get("message").and_then(Value::as_str).unwrap_or(""),
-                CODEX_MESSAGE_CONTENT_MAX_CHARS,
-            ),
-            created_at: timestamp.to_string(),
-        }),
+    match value.get("type").and_then(Value::as_str)? {
+        "event_msg" => extract_codex_event_payload_message(payload, timestamp),
+        "response_item" => extract_codex_response_item_message(payload, timestamp),
         _ => None,
+    }
+}
+
+/// 从 Codex event_msg payload 中抽取结构化展示消息。
+/// 流程：按 payload.type 区分用户、助手、思考、补丁结果、MCP 工具结果和任务状态，统一裁剪正文长度。
+/// 参数：payload 为 JSONL 中的 event_msg.payload，timestamp 为外层事件时间。
+/// 返回：可展示消息；不适合给用户阅读的 token_count、thread_settings 等内部事件返回 None。
+fn extract_codex_event_payload_message(
+    payload: &Value,
+    timestamp: &str,
+) -> Option<CodexThreadMessage> {
+    match payload.get("type").and_then(Value::as_str)? {
+        "user_message" => Some(build_codex_thread_message(
+            "user",
+            "user",
+            "",
+            payload.get("message").and_then(Value::as_str).unwrap_or(""),
+            "",
+            timestamp,
+        )),
+        "agent_message" => {
+            let phase = payload.get("phase").and_then(Value::as_str).unwrap_or("");
+            Some(build_codex_thread_message(
+                "assistant",
+                if phase == "final" || phase == "final_answer" {
+                    "finalAnswer"
+                } else {
+                    "commentary"
+                },
+                "",
+                payload.get("message").and_then(Value::as_str).unwrap_or(""),
+                "",
+                timestamp,
+            ))
+        }
+        "agent_reasoning" => Some(build_codex_thread_message(
+            "assistant",
+            "reasoning",
+            "思考",
+            payload.get("text").and_then(Value::as_str).unwrap_or(""),
+            "",
+            timestamp,
+        )),
+        "task_started" => Some(build_codex_thread_message(
+            "assistant",
+            "status",
+            "开始处理",
+            "已开始处理当前请求。",
+            "running",
+            timestamp,
+        )),
+        "task_complete" => {
+            let final_message = payload
+                .get("last_agent_message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(build_codex_thread_message(
+                "assistant",
+                if final_message.trim().is_empty() {
+                    "status"
+                } else {
+                    "finalAnswer"
+                },
+                "完成",
+                if final_message.trim().is_empty() {
+                    "当前请求已完成。"
+                } else {
+                    final_message
+                },
+                "completed",
+                timestamp,
+            ))
+        }
+        "turn_aborted" => Some(build_codex_thread_message(
+            "assistant",
+            "status",
+            "已中断",
+            payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("请求已中断。"),
+            "failed",
+            timestamp,
+        )),
+        "patch_apply_end" => {
+            let stdout = payload.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = payload.get("stderr").and_then(Value::as_str).unwrap_or("");
+            let content = join_non_empty_lines(&[stdout, stderr]);
+            Some(build_codex_thread_message(
+                "assistant",
+                "toolResult",
+                "已编辑",
+                if content.trim().is_empty() {
+                    "文件编辑已完成。"
+                } else {
+                    &content
+                },
+                if payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                timestamp,
+            ))
+        }
+        "mcp_tool_call_end" => Some(build_codex_thread_message(
+            "assistant",
+            "toolResult",
+            &extract_mcp_tool_title(payload),
+            &stringify_public_json_value(payload.get("result").unwrap_or(&Value::Null)),
+            "completed",
+            timestamp,
+        )),
+        _ => None,
+    }
+}
+
+/// 从 Codex response_item payload 中抽取工具调用和工具结果。
+/// 流程：只展示用户可理解的工具名称、参数、输入或输出，不展示模型加密内容和系统消息。
+/// 参数：payload 为 JSONL 中的 response_item.payload，timestamp 为外层事件时间。
+/// 返回：工具相关展示消息；普通 response message/reasoning 返回 None，避免重复和泄露系统上下文。
+fn extract_codex_response_item_message(
+    payload: &Value,
+    timestamp: &str,
+) -> Option<CodexThreadMessage> {
+    match payload.get("type").and_then(Value::as_str)? {
+        "function_call" => Some(build_codex_thread_message(
+            "assistant",
+            "toolCall",
+            &build_codex_tool_call_title(payload, "function_call"),
+            payload
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            payload.get("status").and_then(Value::as_str).unwrap_or(""),
+            timestamp,
+        )),
+        "custom_tool_call" => Some(build_codex_thread_message(
+            "assistant",
+            "toolCall",
+            &build_codex_tool_call_title(payload, "custom_tool_call"),
+            payload.get("input").and_then(Value::as_str).unwrap_or(""),
+            payload.get("status").and_then(Value::as_str).unwrap_or(""),
+            timestamp,
+        )),
+        "tool_search_call" => Some(build_codex_thread_message(
+            "assistant",
+            "toolCall",
+            "查找可用工具",
+            &stringify_public_json_value(payload.get("arguments").unwrap_or(&Value::Null)),
+            payload.get("status").and_then(Value::as_str).unwrap_or(""),
+            timestamp,
+        )),
+        "function_call_output" | "custom_tool_call_output" => Some(build_codex_thread_message(
+            "assistant",
+            "toolResult",
+            &build_codex_tool_result_title(
+                payload.get("output").and_then(Value::as_str).unwrap_or(""),
+            ),
+            payload.get("output").and_then(Value::as_str).unwrap_or(""),
+            "",
+            timestamp,
+        )),
+        "tool_search_output" => Some(build_codex_thread_message(
+            "assistant",
+            "toolResult",
+            "工具查找结果",
+            &stringify_public_json_value(payload.get("tools").unwrap_or(&Value::Null)),
+            payload.get("status").and_then(Value::as_str).unwrap_or(""),
+            timestamp,
+        )),
+        _ => None,
+    }
+}
+
+/// 构建统一的 Codex 会话展示消息。
+/// 流程：集中设置角色、类型、标题、状态和正文裁剪，避免多个解析分支重复处理上限。
+/// 参数：role 为兼容角色，kind 为结构化类型，title 为块标题，content 为正文，status 为执行状态，created_at 为时间。
+/// 返回：可序列化给 HTTP 层的消息。
+fn build_codex_thread_message(
+    role: &str,
+    kind: &str,
+    title: &str,
+    content: &str,
+    status: &str,
+    created_at: &str,
+) -> CodexThreadMessage {
+    CodexThreadMessage {
+        role: role.to_string(),
+        kind: kind.to_string(),
+        title: limit_chars(title, 120),
+        content: limit_chars(
+            &redact_codex_display_content(content),
+            CODEX_MESSAGE_CONTENT_MAX_CHARS,
+        ),
+        status: status.to_string(),
+        created_at: created_at.to_string(),
+    }
+}
+
+/// 脱敏 Codex 会话展示内容。
+/// 流程：仅处理公开 HTTP 可能返回的消息正文，替换常见 Header、token、apiKey、secret、password 等键值。
+/// 参数：content 为从 app-server 或 JSONL 读取的原始正文。
+/// 返回：保留结构但隐藏敏感值的安全正文。
+fn redact_codex_display_content(content: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<Value>(content.trim()) {
+        redact_json_secret_values(&mut value);
+        return stringify_public_json_value(&value);
+    }
+    let mut redacted_lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("authorization:")
+            || lower.starts_with("cookie:")
+            || lower.starts_with("set-cookie:")
+        {
+            let indent = &line[..line.len().saturating_sub(trimmed.len())];
+            let key = trimmed.split(':').next().unwrap_or("secret");
+            redacted_lines.push(format!("{indent}{key}: [已脱敏]"));
+            continue;
+        }
+        redacted_lines.push(redact_long_hex_tokens(&redact_secret_assignments(line)));
+    }
+    redacted_lines.join("\n")
+}
+
+/// 脱敏连续长十六进制串。
+/// 流程：扫描单行字符，连续 32 位以上 hex 字符按高熵密钥处理，替换为固定占位。
+/// 参数：line 为单行文本。
+/// 返回：替换长 hex 串后的文本。
+fn redact_long_hex_tokens(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut buffer = String::new();
+    for char in line.chars() {
+        if char.is_ascii_hexdigit() {
+            buffer.push(char);
+            continue;
+        }
+        if !buffer.is_empty() {
+            if buffer.len() >= 32 {
+                result.push_str("[已脱敏]");
+            } else {
+                result.push_str(&buffer);
+            }
+            buffer.clear();
+        }
+        result.push(char);
+    }
+    if !buffer.is_empty() {
+        if buffer.len() >= 32 {
+            result.push_str("[已脱敏]");
+        } else {
+            result.push_str(&buffer);
+        }
+    }
+    result
+}
+
+/// 递归脱敏 JSON 对象中的敏感字段。
+/// 流程：遍历对象和数组，命中 token、apiKey、secret、password、authorization、cookie 等字段时替换值。
+/// 参数：value 为可变 JSON 值。
+/// 返回：无返回值，直接修改传入 JSON。
+fn redact_json_secret_values(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let normalized_key = key.to_ascii_lowercase();
+                let is_secret_key = normalized_key.contains("token")
+                    || normalized_key.contains("apikey")
+                    || normalized_key.contains("api_key")
+                    || normalized_key.contains("secret")
+                    || normalized_key.contains("password")
+                    || normalized_key == "authorization"
+                    || normalized_key == "cookie"
+                    || normalized_key == "set-cookie";
+                if is_secret_key {
+                    *item = Value::String("[已脱敏]".to_string());
+                } else {
+                    redact_json_secret_values(item);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_secret_values(item);
+            }
+        }
+        Value::String(text) => {
+            *text = redact_long_hex_tokens(&redact_secret_assignments(text));
+        }
+        _ => {}
+    }
+}
+
+/// 脱敏单行中的常见密钥赋值。
+/// 流程：扫描 key/value 分隔符，命中敏感 key 时只保留 key 和分隔符，值替换为固定占位。
+/// 参数：line 为单行文本。
+/// 返回：脱敏后的单行文本。
+fn redact_secret_assignments(line: &str) -> String {
+    let separators = [" = ", "=", ": "];
+    for separator in separators {
+        if let Some(index) = line.find(separator) {
+            let key = line[..index].trim().trim_matches(['"', '\'']);
+            let normalized_key = key
+                .chars()
+                .filter(|char| char.is_ascii_alphanumeric() || *char == '_' || *char == '-')
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let is_secret_key = normalized_key.contains("token")
+                || normalized_key.contains("apikey")
+                || normalized_key.contains("api_key")
+                || normalized_key.contains("secret")
+                || normalized_key.contains("password");
+            if is_secret_key {
+                return format!("{}{}[已脱敏]", &line[..index], separator);
+            }
+        }
+    }
+    line.to_string()
+}
+
+/// 拼接非空文本行。
+/// 流程：过滤空字符串后用换行连接，用于组合 stdout/stderr 等工具输出。
+/// 参数：lines 为候选文本切片。
+/// 返回：合并后的文本；全部为空时返回空字符串。
+fn join_non_empty_lines(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 构建 Codex 工具调用折叠标题。
+/// 流程：先读取原始工具名，再按用户可理解的动作语义和参数标题归一，避免前端直接展示 exec_command、apply_patch 等内部名。
+/// 参数：payload 为 response_item 工具调用 payload，fallback 为协议类型兜底名称。
+/// 返回：适合右侧聊天详情折叠块展示的短标题。
+fn build_codex_tool_call_title(payload: &Value, fallback: &str) -> String {
+    let raw_title = extract_named_tool_title(payload, fallback);
+    let content = payload
+        .get("arguments")
+        .or_else(|| payload.get("input"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match raw_title.as_str() {
+        "exec_command" => build_exec_command_title(content),
+        "apply_patch" => "编辑文件".to_string(),
+        "multi_tool_use.parallel" => "并行读取项目上下文".to_string(),
+        "tool_search_tool" => "查找可用工具".to_string(),
+        "mcp__node_repl__js" => build_node_repl_title(content),
+        "imagegen" | "image_generation" => "生成图片".to_string(),
+        _ => humanize_codex_tool_name(&raw_title),
+    }
+}
+
+/// 根据命令参数生成 exec_command 的动作标题。
+/// 流程：解析 JSON 参数中的 cmd，识别常见只读、编辑、构建和浏览器连接场景，未知命令保留短命令摘要。
+/// 参数：content 为 function_call.arguments 原文。
+/// 返回：短动作标题。
+fn build_exec_command_title(content: &str) -> String {
+    let command = parse_json_string_field(content, "cmd").unwrap_or_else(|| content.to_string());
+    let trimmed_command = command.trim();
+    if trimmed_command.is_empty() {
+        return "运行命令".to_string();
+    }
+    if trimmed_command.contains("browser-client.mjs") {
+        return "连接本地页面浏览器".to_string();
+    }
+    if trimmed_command.starts_with("sed ")
+        || trimmed_command.starts_with("rg ")
+        || trimmed_command.starts_with("git diff")
+        || trimmed_command.starts_with("git status")
+        || trimmed_command.starts_with("tail ")
+        || trimmed_command.starts_with("head ")
+        || trimmed_command.starts_with("nl ")
+    {
+        return "读取项目上下文".to_string();
+    }
+    if trimmed_command.starts_with("npm run lint") {
+        return "运行前端检查".to_string();
+    }
+    if trimmed_command.starts_with("cargo check") {
+        return "运行 Rust 检查".to_string();
+    }
+    if trimmed_command.starts_with("cargo fmt") {
+        return "检查 Rust 格式".to_string();
+    }
+    if trimmed_command.starts_with("python3 -m py_compile") {
+        return "检查 Python 语法".to_string();
+    }
+    if trimmed_command.starts_with("npm run build") {
+        return "构建前端产物".to_string();
+    }
+    format!("运行命令：{}", limit_chars(trimmed_command, 48))
+}
+
+/// 根据 Node REPL 参数生成浏览器或脚本工具标题。
+/// 流程：优先读取调用方传入的 title；缺失时从 JS 代码判断是否属于浏览器连接、页面截图或页面状态读取。
+/// 参数：content 为工具调用入参 JSON。
+/// 返回：短动作标题。
+fn build_node_repl_title(content: &str) -> String {
+    if let Some(title) = parse_json_string_field(content, "title") {
+        if !title.trim().is_empty() {
+            return limit_chars(title.trim(), 48);
+        }
+    }
+    let code = parse_json_string_field(content, "code").unwrap_or_default();
+    if code.contains("setupBrowserRuntime") || code.contains("getForUrl") {
+        return "连接本地页面浏览器".to_string();
+    }
+    if code.contains("screenshot") {
+        return "保存页面截图".to_string();
+    }
+    if code.contains("domSnapshot") || code.contains("evaluate") {
+        return "读取页面状态".to_string();
+    }
+    "运行本地脚本".to_string()
+}
+
+/// 构建工具结果折叠标题。
+/// 流程：根据输出内容识别编辑、命令、浏览器、工具查找和上下文压缩结果，避免所有结果都显示成同一个标题。
+/// 参数：output 为工具结果正文。
+/// 返回：结果折叠块标题。
+fn build_codex_tool_result_title(output: &str) -> String {
+    let trimmed_output = output.trim();
+    if trimmed_output.contains("Success. Updated the following files:")
+        || trimmed_output.contains("Exit code: 0")
+            && trimmed_output.contains("Output:")
+            && trimmed_output.contains("apply_patch")
+    {
+        return "已编辑".to_string();
+    }
+    if trimmed_output.contains("上下文已压缩") || trimmed_output.contains("context compact") {
+        return "上下文已压缩".to_string();
+    }
+    if trimmed_output.contains("Found ") && trimmed_output.contains(" tools") {
+        return "工具查找结果".to_string();
+    }
+    if trimmed_output.contains("Browser") || trimmed_output.contains("Selected Browser") {
+        return "浏览器已连接".to_string();
+    }
+    if trimmed_output.contains("Exit code:") || trimmed_output.contains("Wall time:") {
+        return "命令结果".to_string();
+    }
+    "工具结果".to_string()
+}
+
+/// 解析 JSON 字符串字段。
+/// 流程：仅从工具参数这类本地 JSON 中读取一层字符串字段，解析失败时返回 None 让调用方使用安全兜底。
+/// 参数：source 为 JSON 文本，field 为字段名。
+/// 返回：字段存在且是字符串时返回内容。
+fn parse_json_string_field(source: &str, field: &str) -> Option<String> {
+    serde_json::from_str::<Value>(source)
+        .ok()
+        .and_then(|value| value.get(field).and_then(Value::as_str).map(str::to_string))
+}
+
+/// 将工具名转换成更适合展示的短标题。
+/// 流程：保留命名空间最后一段并替换下划线，无法识别时仍给出稳定标题。
+/// 参数：tool_name 为原始工具名。
+/// 返回：人可读工具名。
+fn humanize_codex_tool_name(tool_name: &str) -> String {
+    let short_name = tool_name
+        .rsplit(['.', ':'])
+        .next()
+        .unwrap_or(tool_name)
+        .replace('_', " ");
+    if short_name.trim().is_empty() {
+        "工具调用".to_string()
+    } else {
+        limit_chars(short_name.trim(), 48)
+    }
+}
+
+/// 提取命名工具标题。
+/// 流程：优先读取 name 字段，缺失时使用 fallback，标题只用于 UI 展示。
+/// 参数：payload 为工具调用 payload，fallback 为协议类型兜底名称。
+/// 返回：工具块标题。
+fn extract_named_tool_title(payload: &Value, fallback: &str) -> String {
+    payload
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// 提取 MCP 工具结果标题。
+/// 流程：从 invocation.server/tool 组合可读标题，字段缺失时降级为 mcp_tool。
+/// 参数：payload 为 mcp_tool_call_end payload。
+/// 返回：MCP 工具块标题。
+fn extract_mcp_tool_title(payload: &Value) -> String {
+    let invocation = payload.get("invocation").unwrap_or(&Value::Null);
+    let server = invocation
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let tool = invocation.get("tool").and_then(Value::as_str).unwrap_or("");
+    if server.is_empty() && tool.is_empty() {
+        "mcp_tool".to_string()
+    } else if server.is_empty() {
+        tool.to_string()
+    } else if tool.is_empty() {
+        server.to_string()
+    } else {
+        format!("{}.{}", server, tool)
+    }
+}
+
+/// 将公开可展示 JSON 值转成文本。
+/// 流程：紧凑序列化对象或数组；字符串直接返回；null 返回空字符串。
+/// 参数：value 为工具参数或结果中的公开字段。
+/// 返回：可展示文本；序列化失败时返回空字符串。
+fn stringify_public_json_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.to_string(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_default(),
     }
 }
 
@@ -9417,6 +10149,38 @@ fn open_application_bundle(_app_path: &str) -> Result<(), String> {
     Err("当前版本只支持在 macOS 打开 APP".to_string())
 }
 
+/// 使用系统默认应用打开本机普通文件。
+/// 流程：清理入参、canonicalize 目标路径、拒绝目录和非文件，再调用平台默认打开命令。
+/// 参数：file_path 为本机文件绝对路径。
+/// 返回：系统打开命令发起成功时返回空值。
+/// 异常/边界：路径为空、文件不存在、目标不是普通文件或平台不支持时返回错误；命令参数独立传递，不经过 shell。
+#[cfg(target_os = "macos")]
+fn open_local_file_with_default_app_core(file_path: &str) -> Result<(), String> {
+    let trimmed_path = file_path.trim();
+    if trimmed_path.is_empty() {
+        return Err("文件路径不能为空".to_string());
+    }
+    let path = PathBuf::from(trimmed_path)
+        .canonicalize()
+        .map_err(|error| format!("文件不存在或无法访问：{}", error))?;
+    if !path.is_file() {
+        return Err("只能打开本机文件，不能打开目录".to_string());
+    }
+    Command::new("open")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("打开文件失败：{}", error))?;
+    Ok(())
+}
+
+/// 非 macOS 平台暂不支持使用系统默认应用打开本机文件。
+#[cfg(not(target_os = "macos"))]
+fn open_local_file_with_default_app_core(_file_path: &str) -> Result<(), String> {
+    Err("当前版本只支持在 macOS 打开本机文件".to_string())
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -9853,6 +10617,7 @@ mod tests {
             depth: 0,
             agent_nickname: String::new(),
             agent_role: String::new(),
+            status: "unknown".to_string(),
             updated_at: "2026-08-10T10:00:00Z".to_string(),
         };
         let merged = merge_codex_thread_summaries(
@@ -10141,6 +10906,58 @@ mod tests {
             Some("message-80")
         );
         fs::remove_dir_all(&temp_dir).expect("应删除精确测试临时目录");
+    }
+
+    /// Codex 工具调用标题必须归一成人可读动作，避免前端直接显示 exec_command 或 mcp__node_repl__js。
+    #[test]
+    fn codex_tool_call_titles_are_human_readable() {
+        let read_context = json!({
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"sed -n '1,120p' aiTool/src-tauri/src/lib.rs\"}"
+        });
+        assert_eq!(
+            build_codex_tool_call_title(&read_context, "function_call"),
+            "读取项目上下文"
+        );
+
+        let browser_connect = json!({
+            "name": "mcp__node_repl__js",
+            "arguments": "{\"title\":\"连接本地页面浏览器\",\"code\":\"await setupBrowserRuntime()\"}"
+        });
+        assert_eq!(
+            build_codex_tool_call_title(&browser_connect, "function_call"),
+            "连接本地页面浏览器"
+        );
+
+        let patch_call = json!({
+            "name": "apply_patch",
+            "arguments": "*** Begin Patch\n*** End Patch"
+        });
+        assert_eq!(
+            build_codex_tool_call_title(&patch_call, "function_call"),
+            "编辑文件"
+        );
+    }
+
+    /// Codex 工具结果标题必须按输出内容区分编辑、命令和浏览器连接结果。
+    #[test]
+    fn codex_tool_result_titles_are_contextual() {
+        assert_eq!(
+            build_codex_tool_result_title("Success. Updated the following files:\nM demo.rs"),
+            "已编辑"
+        );
+        assert_eq!(
+            build_codex_tool_result_title("Exit code: 0\nWall time: 0.1 seconds\nOutput:\nok"),
+            "命令结果"
+        );
+        assert_eq!(
+            build_codex_tool_result_title("# Selected Browser\n- Name: Codex In-app Browser"),
+            "浏览器已连接"
+        );
+        assert_eq!(
+            build_codex_tool_result_title("上下文已压缩，可以继续。"),
+            "上下文已压缩"
+        );
     }
 
     /// 任务对账只能从同一 turn 的 task_complete 恢复最终回复，不能串用同文件其它 turn 的助手消息。

@@ -185,6 +185,9 @@ export type CodexWorkspaceModel = {
     updatedAt: string;
 };
 
+// CodeX 会话运行状态，用于左侧列表展示实时执行态。
+export type CodexThreadStatusType = 'running' | 'completed' | 'failed' | 'unknown';
+
 // CodeX 会话摘要模型，用于展示外部已有会话。
 export type CodexThreadSummaryModel = {
     // CodeX thread ID。
@@ -199,6 +202,8 @@ export type CodexThreadSummaryModel = {
     agentNickname: string;
     // 子 Agent 角色；普通用户会话为空字符串。
     agentRole: string;
+    // 会话运行状态；running 时左侧列表展示加载图标。
+    status: CodexThreadStatusType;
     // 最近更新时间。
     updatedAt: string;
 };
@@ -218,14 +223,31 @@ export type CodexThreadListRequestModel = {
 /** CodeX 会话消息角色类型。 */
 export type CodexThreadMessageRoleType = 'user' | 'assistant';
 
+/** CodeX 会话消息结构化展示类型。 */
+export type CodexThreadMessageKindType =
+    | 'user'
+    | 'assistant'
+    | 'commentary'
+    | 'finalAnswer'
+    | 'reasoning'
+    | 'toolCall'
+    | 'toolResult'
+    | 'status';
+
 /** CodeX 会话正文中的单条可展示消息。 */
 export interface CodexThreadMessageModel {
     /** 历史分页和排序使用的消息顺序，不与 SSE seq 混用。 */
     messageOrder: number;
     /** 消息角色。 */
     role: CodexThreadMessageRoleType;
+    /** 结构化消息类型，用于区分助手正文、思考、工具调用、工具结果和状态。 */
+    kind: CodexThreadMessageKindType;
+    /** 消息块标题；普通正文为空，工具和状态块展示折叠标题。 */
+    title: string;
     /** 已由服务端做长度保护的消息正文。 */
     content: string;
+    /** 执行状态；普通正文为空，工具和状态块可能为 running/completed/failed。 */
+    status: string;
     /** 消息创建时间；来源不可用时为空字符串。 */
     createdAt: string;
 }

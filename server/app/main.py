@@ -6,13 +6,16 @@ import hmac
 import ipaddress
 import json
 import logging
+import mimetypes
+import time
+from pathlib import Path as LocalPath
 from typing import Annotated, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import httpx
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -70,6 +73,7 @@ bearer_scheme = HTTPBearer(
     scheme_name="AppAccessToken",
     description="公网来源携带 App 系统设置页维护的授权码；开发环境可使用固定开发授权码。",
 )
+LOCAL_IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
 
 
 @asynccontextmanager
@@ -462,6 +466,76 @@ def _is_internal_origin(origin: str) -> bool:
     return address.is_private or address.is_loopback
 
 
+def _is_loopback_origin(origin: str) -> bool:
+    """判断来源是否为本机页面。
+
+    流程：解析 Origin 或 Referer，只有 localhost、127.0.0.1、::1 和 tauri.localhost 放行。
+    参数：``origin`` 为请求头中的来源地址。
+    返回：来源明确为本机时返回 True。
+    异常边界：非法、空字符串、私网 IP 或普通域名均不放行，避免本机图片预览接口被局域网网页复用。
+    """
+
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    return parsed.hostname in ("localhost", "127.0.0.1", "::1", "tauri.localhost")
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """判断请求 TCP 客户端是否来自本机。
+
+    流程：读取 ASGI client host 并按 IP 解析，只有 loopback 地址放行。
+    参数：``request`` 为当前 FastAPI 请求。
+    返回：客户端地址为 loopback 时返回 True。
+    异常边界：缺少 client、非法 IP 或局域网地址均不放行。
+    """
+
+    if request.client is None:
+        return False
+    try:
+        return ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_local_image_preview_access(request: Request) -> None:
+    """校验本机图片预览接口访问权限。
+
+    流程：要求 TCP 客户端和 Origin/Referer 同时为本机来源，避免无鉴权图片标签暴露任意本地图片。
+    参数：``request`` 为当前 FastAPI 请求。
+    返回：校验通过无返回。
+    异常边界：浏览器图片请求通常不带 Authorization，因此本接口不复用 Bearer，但严格限制来源。
+    """
+
+    source = request.headers.get("origin", "").strip() or request.headers.get("referer", "").strip()
+    if not _is_loopback_client(request) or not _is_loopback_origin(source):
+        raise ApiError(401, "LOCAL_IMAGE_PREVIEW_FORBIDDEN", "本机图片预览只允许本机页面访问。")
+
+
+def resolve_local_image_preview_path(raw_path: str) -> LocalPath:
+    """解析并校验本机图片预览路径。
+
+    流程：解析绝对路径，限制在当前用户 home 目录内，并只允许常见图片后缀的真实文件。
+    参数：``raw_path`` 为前端从 Markdown 图片语法中提取的本机路径。
+    返回：通过校验的本机图片路径。
+    异常边界：非 home 目录、非图片、目录、缺失文件或符号链接逃逸均返回稳定错误。
+    """
+
+    try:
+        image_path = LocalPath(raw_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ApiError(404, "LOCAL_IMAGE_NOT_FOUND", "本机图片不存在。") from error
+    home_path = LocalPath.home().resolve()
+    try:
+        image_path.relative_to(home_path)
+    except ValueError as error:
+        raise ApiError(403, "LOCAL_IMAGE_PATH_FORBIDDEN", "本机图片路径不在允许范围内。") from error
+    if not image_path.is_file() or image_path.suffix.lower() not in LOCAL_IMAGE_PREVIEW_EXTENSIONS:
+        raise ApiError(415, "LOCAL_IMAGE_TYPE_UNSUPPORTED", "只支持预览常见图片文件。")
+    return image_path
+
+
 def _api_access_origin(request: Request) -> str:
     """读取业务接口来源标识。
 
@@ -608,6 +682,88 @@ async def health() -> HealthResponse:
     """
 
     return HealthResponse(ok=True, name="codexman-ai-api")
+
+
+@app.get(
+    "/v1/local-images/preview",
+    responses=build_error_responses(
+        {
+            401: ("本机图片预览只允许本机页面访问。", "LOCAL_IMAGE_PREVIEW_FORBIDDEN"),
+            403: ("本机图片路径不在允许范围内。", "LOCAL_IMAGE_PATH_FORBIDDEN"),
+            404: ("本机图片不存在。", "LOCAL_IMAGE_NOT_FOUND"),
+            415: ("只支持预览常见图片文件。", "LOCAL_IMAGE_TYPE_UNSUPPORTED"),
+        }
+    ),
+    tags=["基础"],
+    summary="预览本机 Markdown 图片",
+    description=(
+        "供 CodexMan 本机页面把会话 Markdown 中的本机图片路径渲染为图片。"
+        "接口不使用 Bearer Header，必须同时满足 TCP 客户端和来源页面均为本机，并且只返回当前用户 home 目录内的图片文件。"
+    ),
+    openapi_extra={
+        "parameters": [request_id_openapi_parameter()],
+        "x-error-codes": build_error_code_documentation(
+            {
+                "401": [
+                    {
+                        "code": "LOCAL_IMAGE_PREVIEW_FORBIDDEN",
+                        "retryable": False,
+                        "action": "只能从本机 localhost 或 Tauri 页面加载该图片预览地址。",
+                    }
+                ],
+                "403": [
+                    {
+                        "code": "LOCAL_IMAGE_PATH_FORBIDDEN",
+                        "retryable": False,
+                        "action": "只传入当前用户 home 目录内的图片绝对路径。",
+                    }
+                ],
+                "404": [
+                    {
+                        "code": "LOCAL_IMAGE_NOT_FOUND",
+                        "retryable": False,
+                        "action": "确认 Markdown 图片路径仍存在且当前用户可读取。",
+                    }
+                ],
+                "415": [
+                    {
+                        "code": "LOCAL_IMAGE_TYPE_UNSUPPORTED",
+                        "retryable": False,
+                        "action": "仅支持 png、jpg、jpeg、webp、gif、bmp、svg 图片。",
+                    }
+                ],
+            }
+        ),
+    },
+)
+async def preview_local_markdown_image(
+    request: Request,
+    image_path: Annotated[
+        str,
+        Query(
+            alias="path",
+            min_length=1,
+            max_length=4096,
+            description="Markdown 图片语法中的本机图片绝对路径。",
+        ),
+    ],
+) -> FileResponse:
+    """预览本机 Markdown 图片。
+
+    流程：先校验请求来自本机页面，再解析图片路径并以 no-store 方式返回文件。
+    参数：``request`` 为当前请求，``image_path`` 为 Markdown 中提取的本机图片路径。
+    返回：图片文件响应。
+    异常边界：不返回非图片文件、不允许 home 目录外路径、不记录或回显完整文件内容。
+    """
+
+    require_local_image_preview_access(request)
+    local_image_path = resolve_local_image_preview_path(image_path)
+    media_type = mimetypes.guess_type(str(local_image_path))[0] or "application/octet-stream"
+    return FileResponse(
+        local_image_path,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 ACCESS_TOKEN_RECORD_EXAMPLE = {
@@ -2455,6 +2611,16 @@ def build_codex_thread_messages_response(
     raw_messages = raw_detail.get("messages")
     if not isinstance(raw_messages, list):
         raise ApiError(502, "PRIVATE_SERVICE_PROTOCOL_ERROR", "会话消息响应格式无效。")
+    allowed_kinds = {
+        "user",
+        "assistant",
+        "commentary",
+        "finalAnswer",
+        "reasoning",
+        "toolCall",
+        "toolResult",
+        "status",
+    }
     ordered_messages = []
     for index, message in enumerate(raw_messages):
         if not isinstance(message, dict):
@@ -2462,11 +2628,17 @@ def build_codex_thread_messages_response(
         role = message.get("role")
         if role not in {"user", "assistant"}:
             continue
+        kind = str(message.get("kind") or role)
+        if kind not in allowed_kinds:
+            kind = role
         ordered_messages.append(
             {
                 "messageOrder": index + 1,
                 "role": role,
+                "kind": kind,
+                "title": str(message.get("title") or ""),
                 "content": str(message.get("content") or ""),
+                "status": str(message.get("status") or ""),
                 "createdAt": str(message.get("createdAt") or ""),
             }
         )
@@ -2507,37 +2679,104 @@ def encode_sse_event(event_name: str, event_id: int, payload: object) -> str:
     return f"event: {event_name}\nid: {event_id}\ndata: {data}\n\n"
 
 
+def build_codex_thread_response_signature(response: CodexThreadMessagesResponse) -> str:
+    """构建会话窗口变化签名。
+
+    流程：只取公开消息窗口中的顺序、类型、标题、状态和正文生成紧凑 JSON，供 SSE 轮询判断是否需要推送新快照。
+    参数：``response`` 为已转换好的公开消息窗口。
+    返回：稳定字符串签名；同一窗口内容不变时签名一致。
+    异常边界：不包含本机路径以外的私有 RPC 元数据、请求头或 token。
+    """
+
+    return json.dumps(
+        {
+            "range": response.range.model_dump(by_alias=True),
+            "messages": [
+                {
+                    "messageOrder": message.message_order,
+                    "role": message.role,
+                    "kind": message.kind,
+                    "title": message.title,
+                    "status": message.status,
+                    "content": message.content,
+                    "createdAt": message.created_at,
+                }
+                for message in response.messages
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def build_codex_thread_snapshot_payload(
+    response: CodexThreadMessagesResponse, event_seq: int
+) -> dict[str, object]:
+    """构建会话 SSE snapshot 载荷。
+
+    流程：把公开响应模型转换为前端 SSE 协议使用的 camelCase 字典，避免首包和增量刷新重复拼装。
+    参数：``response`` 为公开消息窗口，``event_seq`` 为当前 SSE 事件序号。
+    返回：可序列化的 snapshot payload。
+    异常边界：只输出公开响应字段，不暴露本机 JSONL 路径或私有 RPC 细节。
+    """
+
+    return {
+        "seq": event_seq,
+        "threadId": response.thread_id,
+        "type": "snapshot",
+        "messages": [message.model_dump(by_alias=True) for message in response.messages],
+        "range": response.range.model_dump(by_alias=True),
+    }
+
+
 async def stream_codex_thread_events(
-    request: Request, response: CodexThreadMessagesResponse
+    request: Request, thread_id: str, window_size: int, response: CodexThreadMessagesResponse
 ) -> AsyncIterator[str]:
     """生成 CodeX 会话 SSE 事件流。
 
-    流程：第一版先发送有界 snapshot，并保持 heartbeat；后续 Rust ThreadStreamHub 接入后可在本生成器内替换为增量事件。
-    参数：``request`` 用于检测客户端断开，``response`` 为已通过鉴权读取到的尾部窗口。
+    流程：先发送有界 snapshot，再短轮询读取同一会话窗口；内容变化时推送新的 snapshot，未变化时定期 heartbeat。
+    参数：``request`` 用于检测客户端断开，``thread_id`` 为会话 ID，``window_size`` 为窗口大小，``response`` 为首包窗口。
     返回：SSE 字符串异步迭代器。
-    异常边界：客户端断开后自然结束，不保留 subscriber；事件正文不进入服务端日志。
+    异常边界：客户端断开后自然结束；轮询失败时推送 heartbeat 保持连接，不把内部错误正文写进事件流。
     """
 
     event_seq = max(1, response.range.end_message_order)
+    response_signature = build_codex_thread_response_signature(response)
+    heartbeat_deadline = time.monotonic() + 15
     yield encode_sse_event(
         "snapshot",
         event_seq,
-        {
-            "seq": event_seq,
-            "threadId": response.thread_id,
-            "type": "snapshot",
-            "messages": [message.model_dump(by_alias=True) for message in response.messages],
-            "range": response.range.model_dump(by_alias=True),
-        },
+        build_codex_thread_snapshot_payload(response, event_seq),
     )
     while not await request.is_disconnected():
-        await asyncio.sleep(15)
-        event_seq += 1
-        yield encode_sse_event(
-            "heartbeat",
-            event_seq,
-            {"seq": event_seq, "threadId": response.thread_id, "type": "heartbeat"},
-        )
+        await asyncio.sleep(2)
+        try:
+            raw_detail = await _call_private(
+                request, "readCodexThreadMessages", {"threadId": thread_id}
+            )
+            next_response = build_codex_thread_messages_response(raw_detail, window_size, None)
+            next_signature = build_codex_thread_response_signature(next_response)
+            if next_signature != response_signature:
+                event_seq += 1
+                response = next_response
+                response_signature = next_signature
+                heartbeat_deadline = time.monotonic() + 15
+                yield encode_sse_event(
+                    "snapshot",
+                    event_seq,
+                    build_codex_thread_snapshot_payload(response, event_seq),
+                )
+                continue
+        except Exception:
+            pass
+        if time.monotonic() >= heartbeat_deadline:
+            event_seq += 1
+            heartbeat_deadline = time.monotonic() + 15
+            yield encode_sse_event(
+                "heartbeat",
+                event_seq,
+                {"seq": event_seq, "threadId": response.thread_id, "type": "heartbeat"},
+            )
 
 
 @app.get(
@@ -2571,7 +2810,7 @@ async def read_codex_thread_messages(
             description="向前加载该 messageOrder 之前的消息；省略时返回尾部窗口。",
         ),
     ] = None,
-    limit: Annotated[int, Query(ge=20, le=100, description="本次窗口消息数量。")] = 80,
+    limit: Annotated[int, Query(ge=20, le=200, description="本次窗口消息数量。")] = 80,
 ) -> CodexThreadMessagesResponse:
     """读取 CodeX 会话正文窗口。
 
@@ -2594,7 +2833,7 @@ async def read_codex_thread_messages(
     tags=["会话管理"],
     summary="订阅 CodeX 会话 SSE",
     description=(
-        "使用 text/event-stream 返回会话 snapshot 和 heartbeat。浏览器端应使用 fetch readable stream 携带 Bearer，"
+        "使用 text/event-stream 返回会话 snapshot、变化快照和 heartbeat。浏览器端应使用 fetch readable stream 携带 Bearer，"
         "不要使用原生 EventSource 携带 Authorization Header。"
     ),
     openapi_extra=private_route_openapi(CODEX_THREAD_MESSAGES_ERROR_CODES),
@@ -2618,7 +2857,7 @@ async def stream_codex_thread(
 ) -> StreamingResponse:
     """订阅 CodeX 会话事件流。
 
-    流程：先按当前窗口读取一次 snapshot，再以 SSE 持续保活；afterSeq 暂作为兼容参数保留。
+    流程：先按当前窗口读取一次 snapshot，再短轮询同一会话窗口，检测到变化时推送新 snapshot；afterSeq 暂作为兼容参数保留。
     参数：``thread_id`` 为真实 thread ID，``window_size`` 为首包窗口大小，``after_seq`` 为后续增量续传游标。
     返回：``text/event-stream`` 响应。
     异常边界：鉴权失败或 snapshot 读取失败时不会建立流；事件不包含本机路径、token 或私有 RPC 细节。
@@ -2630,7 +2869,7 @@ async def stream_codex_thread(
     )
     response = build_codex_thread_messages_response(raw_detail, window_size, None)
     return StreamingResponse(
-        stream_codex_thread_events(request, response),
+        stream_codex_thread_events(request, thread_id, window_size, response),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

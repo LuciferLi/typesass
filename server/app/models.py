@@ -322,6 +322,11 @@ class CodexThreadResponse(BaseModel):
         description="子 Agent 角色；普通用户会话为空字符串。",
         examples=["worker"],
     )
+    status: Literal["running", "completed", "failed", "unknown"] = Field(
+        default="unknown",
+        description="会话运行状态；running 表示当前会话仍在执行，用于左侧列表展示加载态。",
+        examples=["running"],
+    )
     updated_at: str = Field(
         alias="updatedAt",
         pattern=r"^$|^[0-9]+$",
@@ -333,8 +338,8 @@ class CodexThreadResponse(BaseModel):
 class CodexThreadMessageResponse(BaseModel):
     """CodeX 会话正文中的可展示消息。
 
-    流程：Rust 从 app-server 快照或受限 JSONL 中抽取用户与助手消息；HTTP 仅补充分页展示所需的 messageOrder。
-    边界：不返回工具原始日志、本机路径、token 或不可展示内部事件。
+    流程：Rust 从 app-server 快照或受限 JSONL 中抽取用户、助手、工具和状态消息；HTTP 仅补充分页展示所需的 messageOrder。
+    边界：保留 role/content 兼容旧前端，新增 kind/title/status 供 Codex 风格详情渲染。
     """
 
     message_order: int = Field(
@@ -344,10 +349,34 @@ class CodexThreadMessageResponse(BaseModel):
         examples=[1],
     )
     role: Literal["user", "assistant"] = Field(
-        description="消息角色；第一版只展示用户和助手消息。", examples=["assistant"]
+        description="消息角色；工具、思考和状态块统一归属 assistant。", examples=["assistant"]
+    )
+    kind: Literal[
+        "user",
+        "assistant",
+        "commentary",
+        "finalAnswer",
+        "reasoning",
+        "toolCall",
+        "toolResult",
+        "status",
+    ] = Field(
+        default="assistant",
+        description="消息结构化类型；用于前端按 Codex 风格渲染正文、思考、工具调用、工具结果和状态。",
+        examples=["toolResult"],
+    )
+    title: str = Field(
+        default="",
+        description="消息块标题；普通正文为空，工具和状态块用于折叠标题。",
+        examples=["exec_command"],
     )
     content: str = Field(
         description="已由 Rust 做单条长度保护的消息正文。", examples=["接口已经补齐。"]
+    )
+    status: str = Field(
+        default="",
+        description="执行状态；普通正文为空，工具和状态块可返回 running/completed/failed 等。",
+        examples=["completed"],
     )
     created_at: str = Field(
         alias="createdAt",

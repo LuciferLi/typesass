@@ -338,16 +338,20 @@
 
     /**
      * 构建执行中 CodeX thread ID 索引。
-     * 流程：从任务聚合的会话记录中筛选 running 状态，并按 externalThreadId 建立集合供列表渲染查询。
-     * 参数：无显式参数，依赖 props.sessions。
+     * 流程：优先使用 CodeX 会话摘要自身的 running 状态，再合并任务聚合中绑定 externalThreadId 的 running 会话。
+     * 参数：无显式参数，依赖 props.codexThreads 与 props.sessions。
      * 返回：执行中的 CodeX thread ID 集合。
-     * 边界：未绑定 externalThreadId 的会话不参与展示，避免把本地会话 ID 误认为 CodeX thread ID。
+     * 边界：未知状态不展示 loading，避免把历史会话误标成执行中。
      */
     const runningThreadIdSet = computed<Set<string>>(() => {
-        return props.sessions.reduce<Set<string>>((threadIdSet, session) => {
-            if (session.status === 'running' && session.externalThreadId) threadIdSet.add(session.externalThreadId);
-            return threadIdSet;
+        const threadIdSet = props.codexThreads.reduce<Set<string>>((nextThreadIdSet, thread) => {
+            if (thread.status === 'running') nextThreadIdSet.add(thread.id);
+            return nextThreadIdSet;
         }, new Set<string>());
+        return props.sessions.reduce<Set<string>>((nextThreadIdSet, session) => {
+            if (session.status === 'running' && session.externalThreadId) nextThreadIdSet.add(session.externalThreadId);
+            return nextThreadIdSet;
+        }, threadIdSet);
     });
 
     // 需要监听父级关键词变化：切换工作空间时 Store 会清空搜索词，输入框必须同步清空但不触发请求。
@@ -427,13 +431,16 @@
 
     /**
      * 判断当前 CodeX 会话是否正在执行。
-     * 流程：用当前列表 threadId 到任务聚合 running 会话索引中查询，命中时展示 loading 图标。
+     * 流程：优先直接读取当前 props.codexThreads 中的状态，再用 running 会话索引兜底查询。
      * 参数：threadId 为 CodeX 会话列表中的真实 thread ID。
      * 返回：处于执行中时为 true。
      * 边界：只展示后端已确认的 running，不根据更新时间或标题猜测状态。
      */
     function isThreadRunning(threadId: string): boolean {
-        return runningThreadIdSet.value.has(threadId);
+        return (
+            props.codexThreads.some((thread) => thread.id === threadId && thread.status === 'running') ||
+            runningThreadIdSet.value.has(threadId)
+        );
     }
 
     /**

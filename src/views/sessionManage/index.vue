@@ -37,6 +37,8 @@
     const store = useSessionManageStore();
     const selectedThreadId = ref('');
     let disposeTaskUpdates: (() => void) | null = null;
+    let codexThreadStatusRefreshTimer: ReturnType<typeof window.setInterval> | null = null;
+    let refreshingCodexThreadStatus = false;
 
     const selectedThread = computed(() => {
         return store.codexThreads.find((thread) => thread.id === selectedThreadId.value) ?? null;
@@ -143,12 +145,40 @@
         });
     }
 
+    /**
+     * 静默刷新左侧 CodeX 会话摘要状态。
+     * 流程：页面保持打开时定时刷新第一页摘要，让 running/completed 状态驱动列表 loading 图标。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：没有工作空间、正在追加加载或上一轮未结束时跳过，避免打断用户当前选择和分页操作。
+     */
+    function refreshCodexThreadStatusSilently(): void {
+        if (!store.selectedWorkspaceCwd || store.loadingMoreThreads || refreshingCodexThreadStatus) return;
+        refreshingCodexThreadStatus = true;
+        void store.refreshCodexThreads(undefined, true).finally(() => {
+            refreshingCodexThreadStatus = false;
+        });
+    }
+
+    /**
+     * 启动左侧会话状态静默刷新。
+     * 流程：初始化完成后创建固定间隔轮询，组件卸载时统一清理。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：重复调用会先清理旧 timer，避免页面重进后多重轮询。
+     */
+    function startCodexThreadStatusRefresh(): void {
+        if (codexThreadStatusRefreshTimer) window.clearInterval(codexThreadStatusRefreshTimer);
+        codexThreadStatusRefreshTimer = window.setInterval(refreshCodexThreadStatusSilently, 5_000);
+    }
+
     onMounted(() => {
         void store
             .initTaskManage()
             .then(() => store.refreshCodexThreads(undefined, true))
             .then(() => {
                 selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+                startCodexThreadStatusRefresh();
             })
             .then(() => store.listenTaskUpdates())
             .then((dispose) => {
@@ -162,5 +192,7 @@
     onUnmounted(() => {
         disposeTaskUpdates?.();
         disposeTaskUpdates = null;
+        if (codexThreadStatusRefreshTimer) window.clearInterval(codexThreadStatusRefreshTimer);
+        codexThreadStatusRefreshTimer = null;
     });
 </script>

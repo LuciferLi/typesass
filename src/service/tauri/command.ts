@@ -222,6 +222,17 @@ const PUBLIC_API_RETRYABLE_ERROR_CODES = new Set([
 let browserPublicApiToken = '';
 
 /**
+ * 构建本机 Markdown 图片预览地址。
+ * 流程：把 Markdown 中的本机图片绝对路径编码成同源预览接口地址；开发态由 Vite 代理到 sidecar。
+ * 参数：filePath 为会话正文中的本机图片路径。
+ * 返回：可放入 img src 的本机 HTTP 预览地址。
+ * 边界：真正的路径范围、文件类型和来源权限由 sidecar 再次校验。
+ */
+export function buildLocalMarkdownImagePreviewUrl(filePath: string): string {
+    return `/v1/local-images/preview?path=${encodeURIComponent(filePath)}`;
+}
+
+/**
  * 保存当前浏览器会话使用的公共 API 授权码。
  * 流程：普通浏览器只写当前页面模块内存；Tauri 只写 Rust 进程内存，桌面 WebView 通常不需要保存。
  * 参数：token 为 App 签发给当前调用方的明文授权码。
@@ -735,6 +746,17 @@ export async function listInstalledApplications(): Promise<ApplicationOptionMode
 }
 
 /**
+ * 使用系统默认应用打开本机文件。
+ * 流程：桌面端通过受保护的 Tauri 命令交给系统 open；普通浏览器不尝试 file:// 跳转，避免浏览器安全限制和误导。
+ * 参数：filePath 为会话正文中的本机文件绝对路径。
+ * 返回：打开请求完成 Promise。
+ * 异常：普通 Web、文件不存在或系统打开失败时抛出用户可读错误。
+ */
+export async function openLocalFileWithDefaultApp(filePath: string): Promise<void> {
+    await invokeDesktop<void>('open_local_file_with_default_app', { filePath });
+}
+
+/**
  * 主动请求 CodexMan App 麦克风权限。
  * 流程：通过 AVFoundation requestAccess 触发 macOS 系统授权弹窗，让 CodexMan 出现在麦克风隐私列表。
  * 参数：无。
@@ -1037,7 +1059,7 @@ export async function listCodexThreads(request: CodexThreadListRequestModel): Pr
  */
 export async function readCodexThreadMessages(threadId: string): Promise<CodexThreadMessagesResponseModel> {
     return requestPublicApi<CodexThreadMessagesResponseModel>(
-        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages?limit=80`,
+        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages?limit=200`,
         { method: 'GET' }
     );
 }
@@ -1097,7 +1119,7 @@ export async function streamCodexThreadEvents(
     };
     if (publicApiToken) headers.Authorization = `Bearer ${publicApiToken}`;
     const response = await fetch(
-        `${PUBLIC_API_BASE_URL}/v1/codex/threads/${encodeURIComponent(threadId)}/stream?windowSize=80`,
+        `${PUBLIC_API_BASE_URL}/v1/codex/threads/${encodeURIComponent(threadId)}/stream?windowSize=200`,
         {
             method: 'GET',
             headers,
