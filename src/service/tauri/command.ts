@@ -1054,12 +1054,17 @@ export async function listCodexThreads(request: CodexThreadListRequestModel): Pr
  * 读取 CodeX 会话正文窗口。
  * 流程：通过公开 HTTP `/messages` 获取服务端有界窗口；messageOrder 仅用于历史分页和排序，不与 SSE seq 混用。
  * 参数：threadId 为搜索接口返回的真实会话 ID。
+ * 参数：beforeMessageOrder 为向前分页锚点，传入后返回该顺序之前的消息窗口。
  * 返回：当前会话正文窗口。
  * 异常：HTTP 鉴权、私有桥接或 CodeX 会话读取失败时透传稳定错误。
  */
-export async function readCodexThreadMessages(threadId: string): Promise<CodexThreadMessagesResponseModel> {
+export async function readCodexThreadMessages(
+    threadId: string,
+    beforeMessageOrder?: number
+): Promise<CodexThreadMessagesResponseModel> {
+    const query = beforeMessageOrder ? `?limit=200&beforeMessageOrder=${beforeMessageOrder}` : '?limit=200';
     return requestPublicApi<CodexThreadMessagesResponseModel>(
-        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages?limit=200`,
+        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages${query}`,
         { method: 'GET' }
     );
 }

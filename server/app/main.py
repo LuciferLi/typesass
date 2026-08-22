@@ -2600,7 +2600,7 @@ def build_codex_thread_messages_response(
 ) -> CodexThreadMessagesResponse:
     """把 Rust 会话详情快照转换为公开消息窗口。
 
-    流程：为 Rust 返回的有序消息补充稳定 messageOrder，再按 beforeMessageOrder/limit 截取窗口。
+    流程：优先使用 Rust 返回的全局 messageOrder；旧 app-server 兜底来源没有该字段时再按当前窗口补充顺序，并按 beforeMessageOrder/limit 截取窗口。
     参数：``raw_detail`` 为私有 RPC 返回对象；``limit`` 和 ``before_message_order`` 为已校验分页参数。
     返回：公开 HTTP 消息窗口模型。
     异常边界：私有 RPC 结构异常时按协议错误失败，不猜测或补造正文。
@@ -2631,9 +2631,11 @@ def build_codex_thread_messages_response(
         kind = str(message.get("kind") or role)
         if kind not in allowed_kinds:
             kind = role
+        raw_message_order = message.get("messageOrder")
+        message_order = raw_message_order if isinstance(raw_message_order, int) else index + 1
         ordered_messages.append(
             {
-                "messageOrder": index + 1,
+                "messageOrder": message_order,
                 "role": role,
                 "kind": kind,
                 "title": str(message.get("title") or ""),
@@ -2642,7 +2644,17 @@ def build_codex_thread_messages_response(
                 "createdAt": str(message.get("createdAt") or ""),
             }
         )
-    upper_bound = before_message_order or (len(ordered_messages) + 1)
+    has_global_order = any(
+        isinstance(message, dict) and isinstance(message.get("messageOrder"), int)
+        for message in raw_messages
+    )
+    max_message_order = max(
+        (int(message["messageOrder"]) for message in ordered_messages),
+        default=0,
+    )
+    upper_bound = before_message_order or (
+        max_message_order + 1 if has_global_order else len(ordered_messages) + 1
+    )
     window_messages = [
         message
         for message in ordered_messages
@@ -2660,7 +2672,9 @@ def build_codex_thread_messages_response(
                 "startMessageOrder": start_order,
                 "endMessageOrder": end_order,
                 "hasMoreBefore": start_order > 1,
-                "hasMoreAfter": end_order < len(ordered_messages),
+                "hasMoreAfter": bool(before_message_order and window_messages)
+                if has_global_order
+                else end_order < len(ordered_messages),
             },
         }
     )
@@ -2752,7 +2766,9 @@ async def stream_codex_thread_events(
         await asyncio.sleep(2)
         try:
             raw_detail = await _call_private(
-                request, "readCodexThreadMessages", {"threadId": thread_id}
+                request,
+                "readCodexThreadMessages",
+                {"threadId": thread_id, "limit": window_size},
             )
             next_response = build_codex_thread_messages_response(raw_detail, window_size, None)
             next_signature = build_codex_thread_response_signature(next_response)
@@ -2821,7 +2837,9 @@ async def read_codex_thread_messages(
     """
 
     raw_detail = await _call_private(
-        request, "readCodexThreadMessages", {"threadId": thread_id}
+        request,
+        "readCodexThreadMessages",
+        {"threadId": thread_id, "beforeMessageOrder": before_message_order, "limit": limit},
     )
     return build_codex_thread_messages_response(raw_detail, limit, before_message_order)
 
@@ -2865,7 +2883,7 @@ async def stream_codex_thread(
 
     _ = after_seq
     raw_detail = await _call_private(
-        request, "readCodexThreadMessages", {"threadId": thread_id}
+        request, "readCodexThreadMessages", {"threadId": thread_id, "limit": window_size}
     )
     response = build_codex_thread_messages_response(raw_detail, window_size, None)
     return StreamingResponse(

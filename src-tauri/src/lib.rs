@@ -125,6 +125,10 @@ const CODEX_SESSION_TOTAL_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
 const CODEX_SESSION_INDEX_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// 会话列表读取运行态时最多查看 JSONL 尾部字节数，避免高频刷新时读完整大文件。
 const CODEX_SESSION_STATUS_TAIL_BYTES: u64 = 512 * 1024;
+/// 会话详情读取最近消息时最多查看 JSONL 尾部字节数，避免超大历史会话必须整文件读入。
+const CODEX_SESSION_MESSAGE_TAIL_BYTES: u64 = 16 * 1024 * 1024;
+/// 会话详情分页流式扫描的最大字节数；高于旧完整读取上限，但仍防止异常超大文件拖垮进程。
+const CODEX_SESSION_MESSAGE_SCAN_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// 单条本地 session JSONL 事件最大字节数；超限拒绝整个文件且不回显事件正文。
 const CODEX_SESSION_FRAME_MAX_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_SESSION_SUMMARY_MAX_LINES: usize = 120;
@@ -1693,6 +1697,9 @@ pub(crate) struct CodexWorkspaceSummary {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexThreadMessage {
+    /// 消息在完整会话可展示消息序列中的全局顺序；app-server 兜底来源不可用时为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_order: Option<usize>,
     /// 消息角色，对外保持 user/assistant 兼容；工具、状态和思考块都归属 assistant。
     role: String,
     /// 消息类型，用于前端按 Codex 风格区分正文、思考、工具调用、工具结果和状态。
@@ -4416,7 +4423,7 @@ fn ensure_codex_thread_exists(thread_id: &str) -> Result<(), String> {
             .map(|threads| threads.iter().any(|thread| thread.id == thread_id))
             .unwrap_or(false)
             && find_codex_session_file(thread_id)
-                .and_then(|path| read_codex_session_messages(&path).map(|_| ()))
+                .and_then(|path| read_codex_session_tail_messages(&path).map(|_| ()))
                 .is_ok())
     {
         return Ok(());
@@ -4454,12 +4461,14 @@ pub(crate) fn open_session_external_thread_core(thread_id: String) -> Result<Str
 }
 
 /// 读取真实 CodeX 会话的尾部消息窗口。
-/// 流程：先校验 threadId 并确认会话存在，再优先使用 Codex app-server 的 thread/read 权威快照；失败时回退到受限 JSONL 文件解析。
+/// 流程：先校验 threadId 并确认会话存在，再优先读取本地 JSONL 尾部窗口；仅本地文件不可用时回退 Codex app-server。
 /// 参数：thread_id 为前端从搜索接口取得的真实 CodeX thread ID。
 /// 返回：有界会话详情，消息数量与单条正文长度均受现有常量保护。
-/// 异常/边界：非法 ID、未知会话、超大文件或 schema 不兼容时返回稳定错误，不暴露本机路径。
+/// 异常/边界：非法 ID、未知会话、超大事件或 schema 不兼容时返回稳定错误，不暴露本机路径。
 pub(crate) fn read_codex_thread_messages_core(
     thread_id: String,
+    before_message_order: Option<usize>,
+    limit: Option<usize>,
 ) -> Result<CodexThreadDetail, String> {
     let normalized_id = thread_id.trim();
     if normalized_id.is_empty() {
@@ -4467,24 +4476,27 @@ pub(crate) fn read_codex_thread_messages_core(
     }
     validate_codex_thread_id(normalized_id)?;
     ensure_codex_thread_exists(normalized_id)?;
-    match run_codex_app_server_thread_detail(normalized_id) {
-        Ok(detail) => Ok(detail),
-        Err(app_server_error) => {
-            let session_file = find_codex_session_file(normalized_id).map_err(|_| {
-                format!(
-                    "读取 Codex 会话详情失败：{}",
-                    trim_error_message(&app_server_error)
-                )
-            })?;
-            let messages = read_codex_session_messages(&session_file)?;
-            Ok(CodexThreadDetail {
-                id: normalized_id.to_string(),
-                title: "未命名会话".to_string(),
-                updated_at: String::new(),
-                messages,
-            })
-        }
+    let window_limit = normalize_codex_thread_message_limit(limit);
+    if let Ok(session_file) = find_codex_session_file(normalized_id) {
+        let messages =
+            read_codex_session_window_messages(&session_file, before_message_order, window_limit)?;
+        return Ok(CodexThreadDetail {
+            id: normalized_id.to_string(),
+            title: "未命名会话".to_string(),
+            updated_at: String::new(),
+            messages,
+        });
     }
+    run_codex_app_server_thread_detail(normalized_id)
+        .map_err(|error| format!("读取 Codex 会话详情失败：{}", trim_error_message(&error)))
+}
+
+/// 归一化会话详情窗口大小。
+/// 流程：缺省使用公开 HTTP 默认窗口；过小或过大时夹在 20 到 `CODEX_THREAD_MESSAGE_LIMIT` 之间。
+/// 参数：limit 为调用方传入的窗口大小。
+/// 返回：可用于 Rust 读取窗口的安全数量。
+fn normalize_codex_thread_message_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(80).clamp(20, CODEX_THREAD_MESSAGE_LIMIT)
 }
 
 /// 通过 Codex app-server stdio 读取已有任务中的工作空间列表。
@@ -6953,7 +6965,7 @@ fn find_codex_session_file(thread_id: &str) -> Result<PathBuf, String> {
 }
 
 /// 在指定 sessions 根目录执行有预算的精确 thread ID 查找。
-/// 流程：预计算 `thread_id.jsonl` 与 `-thread_id.jsonl` 文件名边界，深度遍历非符号链接目录并累计所有目录条目，精确命中后立即打开并复用 session 句柄校验。
+/// 流程：预计算 `thread_id.jsonl` 与 `-thread_id.jsonl` 文件名边界，深度遍历非符号链接目录并累计所有目录条目，精确命中后校验为普通文件。
 /// 参数：sessions_dir/thread_id 为根目录与目标，directory_limit/entry_limit 为生产预算及测试边界；返回合法目标路径。
 /// 异常/边界：`abc` 不得命中 `abc-extra`；不按无关文件字节累计提前截断；任一预算必须大于零，超过目录或条目限制返回稳定错误码，匹配到符号链接或非普通文件明确拒绝。
 fn find_codex_session_file_in_dir(
@@ -7042,7 +7054,7 @@ fn find_codex_session_file_in_dir(
             if !matches_thread || !file_type.is_file() {
                 continue;
             }
-            drop(open_bounded_codex_session_file(&path, "精确定位")?);
+            validate_codex_session_file_type(&path)?;
             return Ok(path);
         }
     }
@@ -7053,6 +7065,109 @@ fn find_codex_session_file_in_dir(
 fn read_codex_session_messages(path: &Path) -> Result<Vec<CodexThreadMessage>, String> {
     let file = open_bounded_codex_session_file(path, "详情")?;
     read_codex_session_messages_from_file(file)
+}
+
+/// 从 Codex 会话 JSONL 尾部抽取最近用户消息和助手消息。
+/// 流程：只校验目标为普通文件，再从文件尾部最多读取固定窗口；如果从文件中间开始，先丢弃第一条不完整事件，再按有界 JSONL 帧解析最近消息。
+/// 参数：path 为已由 threadId 精确定位出的 session 文件路径。
+/// 返回：最近可展示消息列表。
+/// 异常/边界：整文件可超过完整读取上限；单条事件仍受 `CODEX_SESSION_FRAME_MAX_BYTES` 保护，避免超大行造成内存风险。
+fn read_codex_session_tail_messages(path: &Path) -> Result<Vec<CodexThreadMessage>, String> {
+    validate_codex_session_file_type(path)?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        format!(
+            "读取 Codex 会话详情失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "读取 Codex 会话详情句柄元数据失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err("Codex 会话句柄不是普通文件（错误码：CODEX_SESSION_FILE_INVALID）".to_string());
+    }
+    let file_len = metadata.len();
+    let tail_len = file_len.min(CODEX_SESSION_MESSAGE_TAIL_BYTES);
+    let start_offset = file_len.saturating_sub(tail_len);
+    file.seek(SeekFrom::Start(start_offset)).map_err(|error| {
+        format!(
+            "定位 Codex 会话详情尾部失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let mut reader = BufReader::new(file.take(tail_len));
+    if start_offset > 0 {
+        drop(read_bounded_codex_session_frame(&mut reader)?);
+    }
+    read_codex_session_messages_from_reader(&mut reader)
+}
+
+/// 从 Codex 会话 JSONL 中读取指定消息窗口。
+/// 流程：流式扫描完整文件并给可展示消息分配全局顺序；只保留 `before_message_order` 之前的最后 `limit` 条消息。
+/// 参数：path 为精确定位出的 session 文件，before_message_order 为向前分页锚点，limit 为窗口大小。
+/// 返回：带全局 messageOrder 的消息窗口。
+/// 异常/边界：不把整文件读入内存；单条事件仍受 4MB 上限保护，整次扫描受 256MB 上限保护。
+fn read_codex_session_window_messages(
+    path: &Path,
+    before_message_order: Option<usize>,
+    limit: usize,
+) -> Result<Vec<CodexThreadMessage>, String> {
+    validate_codex_session_file_type(path)?;
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "读取 Codex 会话详情失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "读取 Codex 会话详情句柄元数据失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err("Codex 会话句柄不是普通文件（错误码：CODEX_SESSION_FILE_INVALID）".to_string());
+    }
+    let mut reader = BufReader::new(file.take(CODEX_SESSION_MESSAGE_SCAN_MAX_BYTES + 1));
+    let mut messages = Vec::new();
+    let mut message_order = 0usize;
+    while let Some(frame) = read_bounded_codex_session_frame(&mut reader)? {
+        if frame.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&frame) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(mut message) = extract_codex_event_message(&value, &timestamp) {
+            message_order = message_order.saturating_add(1);
+            if before_message_order
+                .map(|before_order| message_order >= before_order)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            message.message_order = Some(message_order);
+            if messages.len() >= limit {
+                messages.remove(0);
+            }
+            messages.push(message);
+        }
+    }
+    if reader.get_ref().limit() == 0 {
+        return Err(format!(
+            "Codex 会话详情扫描超过 {} 字节，已停止加载（错误码：CODEX_SESSION_DETAIL_SCAN_TOO_LARGE）",
+            CODEX_SESSION_MESSAGE_SCAN_MAX_BYTES
+        ));
+    }
+    Ok(messages)
 }
 
 /// 从 Codex session JSONL 中读取指定 turn 的 task_complete/turn_aborted 状态。
@@ -7122,6 +7237,24 @@ fn read_codex_session_messages_from_file(
     file: fs::File,
 ) -> Result<Vec<CodexThreadMessage>, String> {
     let mut reader = BufReader::new(file.take(CODEX_SESSION_FILE_MAX_BYTES + 1));
+    let messages = read_codex_session_messages_from_reader(&mut reader)?;
+    if reader.get_ref().limit() == 0 {
+        return Err(format!(
+            "Codex 会话文件超过 {} 字节，已拒绝加载（错误码：CODEX_SESSION_FILE_TOO_LARGE）",
+            CODEX_SESSION_FILE_MAX_BYTES
+        ));
+    }
+    Ok(messages)
+}
+
+/// 从任意有界 JSONL reader 中解析最近可展示消息。
+/// 流程：逐帧解析 Codex JSONL 事件，并仅保留最后 `CODEX_THREAD_MESSAGE_LIMIT` 条可展示消息。
+/// 参数：reader 为已经加过读取预算的缓冲 reader。
+/// 返回：最近可展示消息列表。
+/// 异常/边界：单条帧超限时透传固定错误码；非法 JSON 帧跳过，不影响其它合法事件。
+fn read_codex_session_messages_from_reader<R: BufRead>(
+    mut reader: &mut R,
+) -> Result<Vec<CodexThreadMessage>, String> {
     let mut messages = Vec::new();
     while let Some(frame) = read_bounded_codex_session_frame(&mut reader)? {
         if frame.iter().all(u8::is_ascii_whitespace) {
@@ -7142,13 +7275,25 @@ fn read_codex_session_messages_from_file(
             messages.push(message);
         }
     }
-    if reader.get_ref().limit() == 0 {
-        return Err(format!(
-            "Codex 会话文件超过 {} 字节，已拒绝加载（错误码：CODEX_SESSION_FILE_TOO_LARGE）",
-            CODEX_SESSION_FILE_MAX_BYTES
-        ));
-    }
     Ok(messages)
+}
+
+/// 校验 Codex session 路径当前是普通文件。
+/// 流程：读取路径元数据，只接受普通文件，明确拒绝符号链接、目录和其它特殊文件。
+/// 参数：path 为受限 sessions 枚举得到的路径。
+/// 返回：合法时返回空值。
+/// 异常/边界：只校验文件类型，不校验文件大小；读取策略由调用方决定是完整读取还是尾部窗口读取。
+fn validate_codex_session_file_type(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "读取 Codex 会话文件元数据失败：{}",
+            trim_error_message(&error.to_string())
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err("Codex 会话路径不是普通文件（错误码：CODEX_SESSION_FILE_INVALID）".to_string());
+    }
+    Ok(())
 }
 
 /// 打开并复核受限 Codex session 普通文件句柄。
@@ -7365,15 +7510,16 @@ fn extract_codex_event_payload_message(
     }
 }
 
-/// 从 Codex response_item payload 中抽取工具调用和工具结果。
-/// 流程：只展示用户可理解的工具名称、参数、输入或输出，不展示模型加密内容和系统消息。
+/// 从 Codex response_item payload 中抽取思考摘要、工具调用和工具结果。
+/// 流程：只展示用户可理解的思考摘要、工具名称、参数、输入或输出，不展示模型加密内容和系统消息。
 /// 参数：payload 为 JSONL 中的 response_item.payload，timestamp 为外层事件时间。
-/// 返回：工具相关展示消息；普通 response message/reasoning 返回 None，避免重复和泄露系统上下文。
+/// 返回：可公开展示的结构化消息；普通 response message 返回 None，避免重复和泄露系统上下文。
 fn extract_codex_response_item_message(
     payload: &Value,
     timestamp: &str,
 ) -> Option<CodexThreadMessage> {
     match payload.get("type").and_then(Value::as_str)? {
+        "reasoning" => extract_codex_reasoning_summary_message(payload, timestamp),
         "function_call" => Some(build_codex_thread_message(
             "assistant",
             "toolCall",
@@ -7423,6 +7569,48 @@ fn extract_codex_response_item_message(
     }
 }
 
+/// 从 response_item.reasoning 中抽取可公开展示的摘要。
+/// 流程：只读取 summary.summary_text 文案并按换行合并；忽略 encrypted_content 与空摘要，避免展示不可读或不应暴露的内部内容。
+/// 参数：payload 为 response_item.reasoning 事件，timestamp 为外层事件时间。
+/// 返回：存在摘要时返回 reasoning 消息，否则返回 None。
+fn extract_codex_reasoning_summary_message(
+    payload: &Value,
+    timestamp: &str,
+) -> Option<CodexThreadMessage> {
+    let summary_lines = payload
+        .get("summary")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|item| {
+            if item.get("type").and_then(Value::as_str) != Some("summary_text") {
+                return None;
+            }
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        })
+        .collect::<Vec<String>>();
+    let content = summary_lines.join("\n");
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(build_codex_thread_message(
+        "assistant",
+        "reasoning",
+        "思考",
+        &content,
+        "",
+        timestamp,
+    ))
+}
+
 /// 构建统一的 Codex 会话展示消息。
 /// 流程：集中设置角色、类型、标题、状态和正文裁剪，避免多个解析分支重复处理上限。
 /// 参数：role 为兼容角色，kind 为结构化类型，title 为块标题，content 为正文，status 为执行状态，created_at 为时间。
@@ -7436,6 +7624,7 @@ fn build_codex_thread_message(
     created_at: &str,
 ) -> CodexThreadMessage {
     CodexThreadMessage {
+        message_order: None,
         role: role.to_string(),
         kind: kind.to_string(),
         title: limit_chars(title, 120),
@@ -10873,6 +11062,103 @@ mod tests {
                 || growth_error.contains("CODEX_SESSION_FRAME_TOO_LARGE")
         );
         fs::remove_dir_all(&temp_dir).expect("应删除精确测试临时目录");
+    }
+
+    /// 超大历史会话详情必须能从尾部窗口恢复最近消息，避免完整读取 64MB 上限阻塞页面。
+    #[test]
+    fn codex_session_tail_messages_allow_oversized_history_file() {
+        let temp_dir = create_test_temp_dir("codex-session-tail-messages");
+        let session_path = temp_dir.join("rollout-large-history.jsonl");
+        let mut file = fs::File::create(&session_path).expect("应创建超大历史会话文件");
+        let file_len = CODEX_SESSION_FILE_MAX_BYTES + 1024;
+        file.set_len(file_len)
+            .expect("应构造超过完整读取上限的稀疏文件");
+        let tail_start = file_len.saturating_sub(CODEX_SESSION_MESSAGE_TAIL_BYTES);
+        file.seek(SeekFrom::Start(tail_start))
+            .expect("应定位到尾部读取窗口起点");
+        file.write_all(b"partial-frame-to-discard\n")
+            .expect("应写入需要丢弃的半帧占位");
+        file.write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-08-23T00:00:00Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": "尾部窗口消息",
+                        "phase": "final"
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .expect("应写入尾部合法消息");
+        let current_position = file.stream_position().expect("应读取当前测试文件位置");
+        if current_position < file_len {
+            file.write_all(&vec![b'\n'; (file_len - current_position) as usize])
+                .expect("应填充 JSONL 尾部换行，避免稀疏空洞形成单条超大帧");
+        }
+        drop(file);
+
+        validate_codex_session_file(&session_path).expect_err("完整读取仍应拒绝超大文件");
+        let messages =
+            read_codex_session_tail_messages(&session_path).expect("尾部读取应允许超大历史文件");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "尾部窗口消息");
+        assert_eq!(messages[0].kind, "finalAnswer");
+        fs::remove_dir_all(&temp_dir).expect("应删除尾部读取测试临时目录");
+    }
+
+    /// 会话窗口分页必须保留完整会话里的全局消息顺序，支持向前读取更早窗口。
+    #[test]
+    fn codex_session_window_messages_use_global_message_order() {
+        let temp_dir = create_test_temp_dir("codex-session-window-messages");
+        let session_path = temp_dir.join("rollout-window-history.jsonl");
+        let frames = [
+            json!({
+                "timestamp": "2026-08-23T00:00:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "第一条"}
+            }),
+            json!({
+                "timestamp": "2026-08-23T00:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "第二条", "phase": "final"}
+            }),
+            json!({
+                "timestamp": "2026-08-23T00:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_reasoning", "text": "第三条"}
+            }),
+            json!({
+                "timestamp": "2026-08-23T00:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "第四条"}
+            }),
+        ];
+        let content = frames
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&session_path, format!("{}\n", content)).expect("应创建分页测试会话文件");
+
+        let tail_messages =
+            read_codex_session_window_messages(&session_path, None, 2).expect("尾部窗口应读取成功");
+        assert_eq!(tail_messages.len(), 2);
+        assert_eq!(tail_messages[0].message_order, Some(3));
+        assert_eq!(tail_messages[1].message_order, Some(4));
+        assert_eq!(tail_messages[1].content, "第四条");
+
+        let before_messages = read_codex_session_window_messages(&session_path, Some(3), 2)
+            .expect("向前分页窗口应读取成功");
+        assert_eq!(before_messages.len(), 2);
+        assert_eq!(before_messages[0].message_order, Some(1));
+        assert_eq!(before_messages[1].message_order, Some(2));
+        assert_eq!(before_messages[0].content, "第一条");
+
+        fs::remove_dir_all(&temp_dir).expect("应删除分页测试临时目录");
     }
 
     /// Codex 会话详情流式扫描时必须只保留最后 80 条可展示消息，不能因长会话累积无界内存。

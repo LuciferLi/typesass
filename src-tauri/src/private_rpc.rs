@@ -168,12 +168,18 @@ struct TaskIdParams {
     task_id: String,
 }
 
-/// 单字段 threadId 参数，用于通过 Codex deeplink 打开会话。
+/// Codex 会话 ID 参数，用于通过 deeplink 打开会话或读取会话详情。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ThreadIdParams {
     /// 目标 Codex 会话 ID。
     thread_id: String,
+    /// 向前分页锚点；读取详情时返回该顺序之前的消息，打开会话时忽略。
+    #[serde(default)]
+    before_message_order: Option<usize>,
+    /// 读取详情窗口大小；打开会话时忽略。
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// 创建项目的严格 RPC 参数，避免公共 HTTP 未知字段静默进入 Rust 业务层。
@@ -767,7 +773,11 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
         "readCodexThreadMessages" => {
             let request = decode_params::<ThreadIdParams>(params)?;
             serialize_business_result(
-                read_codex_thread_messages_core(request.thread_id),
+                read_codex_thread_messages_core(
+                    request.thread_id,
+                    request.before_message_order,
+                    request.limit,
+                ),
                 "CODEX_UNAVAILABLE",
                 "Codex 会话详情暂不可用。",
             )

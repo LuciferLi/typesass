@@ -25,7 +25,8 @@
 
         <div
             ref="scrollContainerRef"
-            class="relative min-h-0 overflow-y-auto bg-[#111113] px-5 py-4 text-[#f4f4f5]">
+            class="relative min-h-0 overflow-y-auto bg-[#111113] px-5 py-4 text-[#f4f4f5]"
+            @scroll="handleMessageScroll">
             <div
                 v-if="!selectedThread"
                 class="grid h-full min-h-[360px] place-items-center text-center">
@@ -84,6 +85,15 @@
             <div
                 v-else
                 class="mx-auto grid w-full max-w-[860px] gap-5 pb-10">
+                <div
+                    v-if="currentRuntime?.isLoadingMoreBefore"
+                    class="mx-auto inline-flex items-center gap-2 rounded-full border border-white/10 bg-[#1f1f23]/95 px-3 py-1.5 text-[12px] text-white/55 shadow-lg shadow-black/20">
+                    <loading
+                        class="animate-spin"
+                        theme="outline"
+                        size="13" />
+                    <span>加载更早消息中</span>
+                </div>
                 <div
                     v-if="loading"
                     class="sticky top-0 z-10 mx-auto mb-2 inline-flex items-center gap-2 rounded-full border border-white/10 bg-[#1f1f23]/95 px-3 py-1.5 text-[12px] text-white/60 shadow-lg shadow-black/20">
@@ -386,6 +396,102 @@
                                         {{ block.content }}
                                     </blockquote>
 
+                                    <div
+                                        v-else-if="block.type === 'processGroup'"
+                                        class="grid gap-2">
+                                        <button
+                                            type="button"
+                                            class="inline-flex w-fit items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.035] px-2.5 py-1.5 text-[12px] leading-none text-white/62 hover:bg-white/[0.07] hover:text-white/82"
+                                            @click="handleToggleProcessGroup(message.sourceKey, blockIndex)">
+                                            <span>{{ block.title }}</span>
+                                            <down
+                                                class="transition-transform"
+                                                :class="
+                                                    isProcessGroupExpanded(message.sourceKey, blockIndex)
+                                                        ? 'rotate-180'
+                                                        : ''
+                                                "
+                                                theme="outline"
+                                                size="12" />
+                                        </button>
+
+                                        <div
+                                            v-if="isProcessGroupExpanded(message.sourceKey, blockIndex)"
+                                            class="grid gap-2 pl-0.5">
+                                            <div
+                                                v-for="(item, itemIndex) in block.items"
+                                                :key="`${message.sourceKey}-process-${blockIndex}-${itemIndex}`"
+                                                class="grid min-w-0 gap-1">
+                                                <button
+                                                    type="button"
+                                                    class="group flex min-w-0 items-center gap-2 rounded-md px-1 py-1 text-left text-[13px] leading-5 text-white/58 hover:bg-white/[0.04] hover:text-white/78"
+                                                    :class="item.content ? '' : 'cursor-default hover:bg-transparent'"
+                                                    @click="
+                                                        item.content
+                                                            ? handleToggleProcessItem(
+                                                                  message.sourceKey,
+                                                                  blockIndex,
+                                                                  itemIndex
+                                                              )
+                                                            : undefined
+                                                    ">
+                                                    <doc-detail
+                                                        v-if="item.icon === 'file'"
+                                                        class="shrink-0 text-white/48"
+                                                        theme="outline"
+                                                        size="14" />
+                                                    <terminal
+                                                        v-else-if="item.icon === 'command'"
+                                                        class="shrink-0 text-white/48"
+                                                        theme="outline"
+                                                        size="14" />
+                                                    <refresh
+                                                        v-else-if="item.icon === 'browser'"
+                                                        class="shrink-0 text-white/48"
+                                                        theme="outline"
+                                                        size="14" />
+                                                    <check
+                                                        v-else-if="item.icon === 'edit'"
+                                                        class="shrink-0 text-white/48"
+                                                        theme="outline"
+                                                        size="14" />
+                                                    <command
+                                                        v-else
+                                                        class="shrink-0 text-white/48"
+                                                        theme="outline"
+                                                        size="14" />
+                                                    <span class="min-w-0 flex-1 truncate">{{ item.title }}</span>
+                                                    <span
+                                                        v-if="item.statusText"
+                                                        class="shrink-0 rounded border px-1.5 py-0.5 text-[10px] leading-none"
+                                                        :class="item.statusClass">
+                                                        {{ item.statusText }}
+                                                    </span>
+                                                    <down
+                                                        v-if="item.content"
+                                                        class="shrink-0 transition-transform"
+                                                        :class="
+                                                            isProcessItemExpanded(
+                                                                message.sourceKey,
+                                                                blockIndex,
+                                                                itemIndex
+                                                            )
+                                                                ? 'rotate-180'
+                                                                : ''
+                                                        "
+                                                        theme="outline"
+                                                        size="12" />
+                                                </button>
+                                                <pre
+                                                    v-if="
+                                                        item.content &&
+                                                        isProcessItemExpanded(message.sourceKey, blockIndex, itemIndex)
+                                                    "
+                                                    class="ml-6 max-h-[360px] overflow-auto rounded-lg border border-white/10 bg-black/25 p-3 font-mono text-[12px] leading-5 text-white/68"><code>{{ item.content }}</code></pre>
+                                            </div>
+                                        </div>
+                                    </div>
+
                                     <img
                                         v-else-if="block.type === 'image' && block.previewSrc"
                                         class="max-h-[420px] max-w-full rounded-lg border border-white/10 object-contain"
@@ -526,6 +632,20 @@
     }
 
     /** 右侧会话正文渲染块。 */
+    interface ThreadProcessItem {
+        /** 步骤标题；展示为 Codex 工作过程里的单行摘要。 */
+        title: string;
+        /** 步骤详情；为空时只展示摘要，不显示展开箭头。 */
+        content: string;
+        /** 步骤状态文案；普通步骤为空。 */
+        statusText: string;
+        /** 步骤状态样式。 */
+        statusClass: string;
+        /** 步骤图标类型，用于区分读取文件、运行命令、编辑、浏览器和普通工具。 */
+        icon: 'tool' | 'file' | 'command' | 'edit' | 'browser';
+    }
+
+    /** 右侧会话正文渲染块。 */
     type ThreadMessageRenderBlock =
         | {
               /** 段落块，内部继续拆分行内片段。 */
@@ -582,6 +702,14 @@
               statusClass: string;
               /** 工具块完整正文。 */
               content: string;
+          }
+        | {
+              /** 工作过程折叠组，对齐 Codex 原生的耗时/步骤列表展示。 */
+              type: 'processGroup';
+              /** 折叠组标题，通常为耗时文案。 */
+              title: string;
+              /** 组内按原始事件顺序展示的步骤。 */
+              items: ThreadProcessItem[];
           };
 
     /** 可直接被模板渲染的会话回合视图模型。 */
@@ -606,6 +734,8 @@
         threadId: string;
         /** 当前会话首包或手动刷新是否正在读取。 */
         loading: boolean;
+        /** 当前会话是否正在向前加载更早历史消息。 */
+        isLoadingMoreBefore: boolean;
         /** 当前会话最近一次读取失败的安全错误文案。 */
         errorMessage: string;
         /** 当前会话流连接状态。 */
@@ -631,6 +761,8 @@
     const threadRuntimeById = ref<Record<string, ThreadViewerRuntimeState>>({});
     const expandedMessageOrders = ref<Set<number>>(new Set<number>());
     const expandedBlockKeys = ref<Set<string>>(new Set<string>());
+    const expandedProcessGroupKeys = ref<Set<string>>(new Set<string>());
+    const expandedProcessItemKeys = ref<Set<string>>(new Set<string>());
     const copiedBlockKey = ref('');
     const scrollContainerRef = ref<HTMLElement | null>(null);
     let copiedTimer: ReturnType<typeof window.setTimeout> | null = null;
@@ -727,16 +859,45 @@
         const firstMessage = turnMessages[0] as CodexThreadMessageModel;
         const lastMessage = turnMessages[turnMessages.length - 1] as CodexThreadMessageModel;
         const longMessageOrders = turnMessages
-            .filter((message) => isLongMessage(message))
+            .filter((message) => isLongMessage(message) && shouldUseTurnExpand(message))
             .map((message) => message.messageOrder);
         return {
             source: firstMessage,
             sourceKey: `${firstMessage.role}-${firstMessage.messageOrder}-${lastMessage.messageOrder}`,
-            blocks: turnMessages.flatMap((message) => buildMessageBlocks(message)),
+            blocks: buildTurnBlocks(turnMessages),
             isLong: longMessageOrders.length > 0,
             longMessageOrders,
             timeText: formatMessageTime(firstMessage.createdAt || lastMessage.createdAt)
         };
+    }
+
+    /**
+     * 构建回合内展示块。
+     * 流程：将连续工作事件聚合成 Codex 风格的工作过程折叠组，普通正文仍按 Markdown 分块渲染。
+     * 参数：turnMessages 为同一展示回合中的消息列表。
+     * 返回：可直接渲染的块列表。
+     * 边界：用户消息不参与工作过程聚合，避免用户正文被误折叠。
+     */
+    function buildTurnBlocks(turnMessages: CodexThreadMessageModel[]): ThreadMessageRenderBlock[] {
+        const blocks: ThreadMessageRenderBlock[] = [];
+        let processMessages: CodexThreadMessageModel[] = [];
+        const flushProcessMessages = (): void => {
+            if (!processMessages.length) return;
+            blocks.push(buildProcessGroupBlock(processMessages));
+            processMessages = [];
+        };
+
+        turnMessages.forEach((message) => {
+            if (message.role !== 'user' && isProcessMessage(message)) {
+                processMessages.push(message);
+                return;
+            }
+            flushProcessMessages();
+            blocks.push(...buildMessageBlocks(message));
+        });
+        flushProcessMessages();
+
+        return blocks.length ? blocks : [{ type: 'paragraph', segments: [buildTextSegment('')] }];
     }
 
     /**
@@ -755,6 +916,64 @@
     }
 
     /**
+     * 判断当前消息区是否停留在底部附近。
+     * 流程：根据 scrollHeight、scrollTop 和 clientHeight 计算剩余距离，允许少量阈值避免像素误差导致实时消息不跟随。
+     * 参数：无。
+     * 返回：接近底部时返回 true。
+     * 边界：容器尚未挂载时按可跟随处理，保证首次快照仍能滚到底部。
+     */
+    function isMessageScrollNearBottom(): boolean {
+        const container = scrollContainerRef.value;
+        if (!container) return true;
+        return container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+    }
+
+    /**
+     * 处理消息区滚动。
+     * 流程：用户接近顶部且当前窗口存在更早历史时，触发向前分页加载；非当前会话或正在加载时直接忽略。
+     * 参数：无。
+     * 返回：无返回值。
+     * 异常边界：滚动事件高频触发时由运行态 loading 标记去重。
+     */
+    function handleMessageScroll(): void {
+        const container = scrollContainerRef.value;
+        const runtime = currentRuntime.value;
+        if (!container || !runtime || !runtime.messageRange?.hasMoreBefore) return;
+        if (runtime.loading || runtime.isLoadingMoreBefore) return;
+        if (container.scrollTop > 80) return;
+        void loadMoreBefore(runtime);
+    }
+
+    /**
+     * 向前加载更早会话消息。
+     * 流程：以当前窗口第一条 messageOrder 为锚点请求上一页，成功后 prepend 到现有消息前，并用高度差保持用户阅读位置不跳动。
+     * 参数：runtime 为当前会话运行态。
+     * 返回：加载完成 Promise。
+     * 异常边界：加载失败只降级连接态，不清空当前已读消息。
+     */
+    async function loadMoreBefore(runtime: ThreadViewerRuntimeState): Promise<void> {
+        const beforeMessageOrder = runtime.messageRange?.startMessageOrder ?? 0;
+        if (beforeMessageOrder <= 1) return;
+        const container = scrollContainerRef.value;
+        const previousHeight = container?.scrollHeight ?? 0;
+        const previousTop = container?.scrollTop ?? 0;
+        runtime.isLoadingMoreBefore = true;
+        try {
+            const response = await readCodexThreadMessages(runtime.threadId, beforeMessageOrder);
+            mergeBeforeThreadSnapshot(runtime.threadId, response.messages, response.range);
+            runtime.connectionState = 'connected';
+            await nextTick();
+            if (container) {
+                container.scrollTop = container.scrollHeight - previousHeight + previousTop;
+            }
+        } catch {
+            runtime.connectionState = runtime.connectionState === 'connected' ? 'connected' : 'reconnecting';
+        } finally {
+            runtime.isLoadingMoreBefore = false;
+        }
+    }
+
+    /**
      * 创建会话详情运行态。
      * 流程：为首次打开的 thread 初始化消息、连接和轮询容器，后续切回时复用同一份状态。
      * 参数：threadId 为 CodeX 会话 ID。
@@ -764,6 +983,7 @@
         return {
             threadId,
             loading: false,
+            isLoadingMoreBefore: false,
             errorMessage: '',
             connectionState: 'idle',
             messages: [],
@@ -801,6 +1021,8 @@
     async function activateThread(threadId: string): Promise<void> {
         expandedMessageOrders.value = new Set<number>();
         expandedBlockKeys.value = new Set<string>();
+        expandedProcessGroupKeys.value = new Set<string>();
+        expandedProcessItemKeys.value = new Set<string>();
         copiedBlockKey.value = '';
         if (!threadId) {
             return;
@@ -861,10 +1083,11 @@
             return;
         }
         if (event.type === 'snapshot') {
+            const shouldStickToBottom = props.selectedThread?.id === threadId && isMessageScrollNearBottom();
             applyThreadSnapshot(threadId, event.messages, event.range);
             runtime.connectionState = 'connected';
             runtime.loading = false;
-            if (props.selectedThread?.id === threadId) scrollToBottom();
+            if (shouldStickToBottom) scrollToBottom();
             return;
         }
         const index = runtime.messages.findIndex((message) => message.messageOrder === event.message.messageOrder);
@@ -946,9 +1169,10 @@
                 if (latestRuntime.connectionState !== 'connected') latestRuntime.connectionState = 'connected';
                 return;
             }
+            const shouldStickToBottom = props.selectedThread?.id === threadId && isMessageScrollNearBottom();
             applyThreadSnapshot(threadId, response.messages, response.range);
             latestRuntime.connectionState = 'connected';
-            if (props.selectedThread?.id === threadId) scrollToBottom();
+            if (shouldStickToBottom) scrollToBottom();
         } catch {
             const latestRuntime = threadRuntimeById.value[threadId];
             if (latestRuntime && latestRuntime.connectionState !== 'connected') {
@@ -977,9 +1201,66 @@
     ): void {
         const runtime = threadRuntimeById.value[threadId];
         if (!runtime) return;
+        const currentRange = runtime.messageRange;
+        if (currentRange && currentRange.startMessageOrder < nextRange.startMessageOrder) {
+            const nextOrders = new Set(nextMessages.map((message) => message.messageOrder));
+            const retainedMessages = runtime.messages.filter(
+                (message) => message.messageOrder < nextRange.startMessageOrder && !nextOrders.has(message.messageOrder)
+            );
+            runtime.messages = [...retainedMessages, ...nextMessages].sort(
+                (current, next) => current.messageOrder - next.messageOrder
+            );
+            runtime.messageRange = {
+                startMessageOrder: currentRange.startMessageOrder,
+                endMessageOrder: nextRange.endMessageOrder,
+                hasMoreBefore: currentRange.hasMoreBefore,
+                hasMoreAfter: nextRange.hasMoreAfter
+            };
+            runtime.latestSnapshotSignature = buildThreadSnapshotSignature(runtime.messages, runtime.messageRange);
+            return;
+        }
         runtime.messages = nextMessages;
         runtime.messageRange = nextRange;
         runtime.latestSnapshotSignature = buildThreadSnapshotSignature(nextMessages, nextRange);
+    }
+
+    /**
+     * 合并更早的会话消息窗口。
+     * 流程：按 messageOrder 去重后把上一页消息放到当前窗口前方，并同步扩展 range 起点。
+     * 参数：threadId 为当前快照所属会话 ID。
+     * 参数：beforeMessages 为向前分页返回的消息窗口。
+     * 参数：beforeRange 为向前分页返回的窗口范围。
+     * 返回：无返回值。
+     * 异常边界：空窗口不改变当前消息，避免把已有详情清空。
+     */
+    function mergeBeforeThreadSnapshot(
+        threadId: string,
+        beforeMessages: CodexThreadMessageModel[],
+        beforeRange: CodexThreadMessageRangeModel
+    ): void {
+        const runtime = threadRuntimeById.value[threadId];
+        if (!runtime || !beforeMessages.length) return;
+        const existingOrders = new Set(runtime.messages.map((message) => message.messageOrder));
+        const prependMessages = beforeMessages.filter((message) => !existingOrders.has(message.messageOrder));
+        if (!prependMessages.length) {
+            runtime.messageRange = {
+                startMessageOrder: beforeRange.startMessageOrder || runtime.messageRange?.startMessageOrder || 0,
+                endMessageOrder: runtime.messageRange?.endMessageOrder ?? beforeRange.endMessageOrder,
+                hasMoreBefore: beforeRange.hasMoreBefore,
+                hasMoreAfter: runtime.messageRange?.hasMoreAfter ?? beforeRange.hasMoreAfter
+            };
+            return;
+        }
+        runtime.messages = [...prependMessages, ...runtime.messages].sort(
+            (current, next) => current.messageOrder - next.messageOrder
+        );
+        runtime.messageRange = {
+            startMessageOrder: beforeRange.startMessageOrder,
+            endMessageOrder: runtime.messageRange?.endMessageOrder ?? beforeRange.endMessageOrder,
+            hasMoreBefore: beforeRange.hasMoreBefore,
+            hasMoreAfter: runtime.messageRange?.hasMoreAfter ?? beforeRange.hasMoreAfter
+        };
+        runtime.latestSnapshotSignature = buildThreadSnapshotSignature(runtime.messages, runtime.messageRange);
     }
 
     /**
@@ -1070,6 +1351,16 @@
     }
 
     /**
+     * 判断消息是否适合显示回合级展开入口。
+     * 流程：仅普通助手回复和最终回复使用回合级展开；工具、思考和状态事件已有独立折叠块，避免在整组消息底部出现误导性的“展开完整内容”。
+     * 参数：message 为当前消息。
+     * 返回：适合由回合底部按钮展开时返回 true。
+     */
+    function shouldUseTurnExpand(message: CodexThreadMessageModel): boolean {
+        return message.kind === 'assistant' || message.kind === 'commentary' || message.kind === 'finalAnswer';
+    }
+
+    /**
      * 判断回合内长消息是否已经全部展开。
      * 流程：回合可能聚合多条助手事件，需要所有长消息都展开时才展示收起态。
      * 参数：messageOrders 为回合内命中折叠阈值的消息顺序列表。
@@ -1105,9 +1396,160 @@
      * 返回：用于分块渲染的正文。
      */
     function visibleMessageContent(message: CodexThreadMessageModel): string {
-        if (!isLongMessage(message) || expandedMessageOrders.value.has(message.messageOrder)) return message.content;
+        if (
+            !shouldUseTurnExpand(message) ||
+            !isLongMessage(message) ||
+            expandedMessageOrders.value.has(message.messageOrder)
+        ) {
+            return message.content;
+        }
         const lines = message.content.split('\n').slice(0, 120).join('\n');
         return `${lines.slice(0, 12_000)}\n\n内容较长，已折叠。`;
+    }
+
+    /**
+     * 判断消息是否属于 Codex 工作过程。
+     * 流程：工具调用、工具结果、思考和状态事件进入工作过程折叠组；普通助手正文继续直接渲染。
+     * 参数：message 为当前消息。
+     * 返回：应展示在工作过程里时返回 true。
+     */
+    function isProcessMessage(message: CodexThreadMessageModel): boolean {
+        return (
+            message.kind === 'reasoning' ||
+            message.kind === 'toolCall' ||
+            message.kind === 'toolResult' ||
+            message.kind === 'status'
+        );
+    }
+
+    /**
+     * 构建工作过程折叠组。
+     * 流程：按消息创建时间计算耗时标题，再把每条结构化事件转成可展开步骤。
+     * 参数：processMessages 为连续工作过程消息。
+     * 返回：Codex 风格工作过程块。
+     */
+    function buildProcessGroupBlock(processMessages: CodexThreadMessageModel[]): ThreadMessageRenderBlock {
+        return {
+            type: 'processGroup',
+            title: buildProcessGroupTitle(processMessages),
+            items: processMessages.map((message) => buildProcessItem(message))
+        };
+    }
+
+    /**
+     * 构建工作过程标题。
+     * 流程：优先使用首尾时间差生成“耗时”文案；时间不可用时降级为“工作过程”。
+     * 参数：processMessages 为同一工作过程中的消息列表。
+     * 返回：折叠按钮标题。
+     */
+    function buildProcessGroupTitle(processMessages: CodexThreadMessageModel[]): string {
+        const timestamps = processMessages
+            .map((message) => parseMessageTimestamp(message.createdAt))
+            .filter((timestamp) => timestamp > 0);
+        if (timestamps.length < 2) return '工作过程';
+        const elapsedSeconds = Math.max(1, Math.round((Math.max(...timestamps) - Math.min(...timestamps)) / 1000));
+        return `耗时 ${formatElapsedTime(elapsedSeconds)}`;
+    }
+
+    /**
+     * 构建工作过程步骤。
+     * 流程：根据 kind/title/content 识别步骤类型，摘要展示在列表，完整内容折叠到详情。
+     * 参数：message 为结构化工作事件。
+     * 返回：可渲染的工作过程步骤。
+     */
+    function buildProcessItem(message: CodexThreadMessageModel): ThreadProcessItem {
+        const content = visibleMessageContent(message);
+        const title = buildProcessItemTitle(message, content);
+        return {
+            title,
+            content: buildProcessItemContent(message, content),
+            statusText: formatMessageStatus(message.status),
+            statusClass: buildStatusClass(message.status),
+            icon: buildProcessItemIcon(title, message)
+        };
+    }
+
+    /**
+     * 构建工作过程步骤标题。
+     * 流程：结构化工具优先使用工具标题，思考和状态使用专属文案，最终统一压缩长度。
+     * 参数：message 为结构化工作事件。
+     * 参数：content 为当前事件详情正文。
+     * 返回：步骤摘要标题。
+     */
+    function buildProcessItemTitle(message: CodexThreadMessageModel, content: string): string {
+        if (message.kind === 'reasoning') return compactProcessTitle(message.title || content || '思考');
+        if (message.kind === 'status') return compactProcessTitle(message.title || content || '状态更新');
+        if (message.kind === 'toolCall') return compactProcessTitle(buildStructuredToolTitle(message));
+        if (message.kind === 'toolResult') return compactProcessTitle(buildStructuredToolTitle(message));
+        return compactProcessTitle(message.title || '工作过程');
+    }
+
+    /**
+     * 构建工作过程步骤详情。
+     * 流程：工具和思考保留正文，纯状态且正文等于标题时不展示详情。
+     * 参数：message 为结构化工作事件。
+     * 参数：content 为当前事件详情正文。
+     * 返回：展开后显示的详情文本。
+     */
+    function buildProcessItemContent(message: CodexThreadMessageModel, content: string): string {
+        const trimmedContent = content.trim();
+        if (!trimmedContent) return '';
+        if (message.kind === 'status' && trimmedContent === message.title.trim()) return '';
+        return trimmedContent;
+    }
+
+    /**
+     * 构建工作过程步骤图标类型。
+     * 流程：按标题和消息类型归类到文件、命令、编辑、浏览器或普通工具。
+     * 参数：title 为步骤标题，message 为结构化工作事件。
+     * 返回：模板可识别的图标类型。
+     */
+    function buildProcessItemIcon(title: string, message: CodexThreadMessageModel): ThreadProcessItem['icon'] {
+        if (/读取|文件|上下文/.test(title)) return 'file';
+        if (/命令|检查|lint|cargo|npm|python/i.test(title)) return 'command';
+        if (/编辑|已编辑|patch/i.test(title)) return 'edit';
+        if (/浏览器|页面|截图/i.test(title)) return 'browser';
+        if (message.kind === 'toolResult' && /结果/.test(title)) return 'command';
+        return 'tool';
+    }
+
+    /**
+     * 压缩工作过程标题。
+     * 流程：去除换行和多余空白，限制长度避免步骤行撑破右侧详情。
+     * 参数：title 为原始标题。
+     * 返回：短标题。
+     */
+    function compactProcessTitle(title: string): string {
+        const normalizedTitle = title.trim().replace(/\s+/g, ' ');
+        if (!normalizedTitle) return '工作过程';
+        return normalizedTitle.length > 72 ? `${normalizedTitle.slice(0, 72)}...` : normalizedTitle;
+    }
+
+    /**
+     * 解析消息时间戳。
+     * 流程：兼容毫秒时间戳和 ISO 字符串，非法时间返回 0 供调用方过滤。
+     * 参数：value 为消息创建时间。
+     * 返回：毫秒时间戳。
+     */
+    function parseMessageTimestamp(value: string): number {
+        if (!value) return 0;
+        const timestamp = /^\d+$/.test(value) ? Number(value) : Date.parse(value);
+        return Number.isFinite(timestamp) ? timestamp : 0;
+    }
+
+    /**
+     * 格式化耗时。
+     * 流程：按 Codex 风格展示秒、分钟秒或小时分钟秒。
+     * 参数：elapsedSeconds 为总秒数。
+     * 返回：中文耗时文案。
+     */
+    function formatElapsedTime(elapsedSeconds: number): string {
+        const hours = Math.floor(elapsedSeconds / 3600);
+        const minutes = Math.floor((elapsedSeconds % 3600) / 60);
+        const seconds = elapsedSeconds % 60;
+        if (hours > 0) return `${hours}小时 ${minutes}分钟 ${seconds}秒`;
+        if (minutes > 0) return `${minutes}分钟 ${seconds}秒`;
+        return `${seconds}秒`;
     }
 
     /**
@@ -1508,8 +1950,12 @@
     function normalizeToolTitle(title: string, content: string): string {
         if (title === 'exec_command') return buildExecCommandDisplayTitle(content);
         if (title === 'apply_patch') return content.includes('Success.') ? '已编辑' : '编辑文件';
-        if (title === 'tool_search' || title === 'tool_search 结果') return '工具查找结果';
-        if (title === 'mcp__node_repl__js') return buildNodeReplDisplayTitle(content);
+        if (title === 'tool_search' || title === 'tool_search_tool' || title === 'tool_search 结果') {
+            return '工具查找结果';
+        }
+        if (title === 'mcp__node_repl__js' || title === 'node_repl.js' || title === 'js') {
+            return buildNodeReplDisplayTitle(content);
+        }
         if (title === '工具结果') return buildToolResultDisplayTitle(content);
         return title;
     }
@@ -1638,6 +2084,64 @@
         if (next.has(blockKey)) next.delete(blockKey);
         else next.add(blockKey);
         expandedBlockKeys.value = next;
+    }
+
+    /**
+     * 判断工作过程组是否展开。
+     * 流程：工作过程默认收起；用户点击耗时标题后记录到 expanded set，避免思考和工具过程默认铺满正文。
+     * 参数：sourceKey 为回合稳定键，blockIndex 为块下标。
+     * 返回：当前工作过程应展开时返回 true。
+     */
+    function isProcessGroupExpanded(sourceKey: string, blockIndex: number): boolean {
+        return expandedProcessGroupKeys.value.has(buildBlockKey(sourceKey, blockIndex));
+    }
+
+    /**
+     * 切换工作过程组展开状态。
+     * 流程：复制 Set 后增删当前组 key，保证 Vue 响应式更新。
+     * 参数：sourceKey 为回合稳定键，blockIndex 为块下标。
+     * 返回：无返回值。
+     */
+    function handleToggleProcessGroup(sourceKey: string, blockIndex: number): void {
+        const groupKey = buildBlockKey(sourceKey, blockIndex);
+        const next = new Set(expandedProcessGroupKeys.value);
+        if (next.has(groupKey)) next.delete(groupKey);
+        else next.add(groupKey);
+        expandedProcessGroupKeys.value = next;
+    }
+
+    /**
+     * 生成工作过程步骤展开键。
+     * 流程：用回合 key、组下标和步骤下标组合，避免不同工作过程的步骤状态互相影响。
+     * 参数：sourceKey 为回合稳定键，blockIndex 为工作过程块下标，itemIndex 为步骤下标。
+     * 返回：稳定步骤状态键。
+     */
+    function buildProcessItemKey(sourceKey: string, blockIndex: number, itemIndex: number): string {
+        return `${buildBlockKey(sourceKey, blockIndex)}:${itemIndex}`;
+    }
+
+    /**
+     * 判断工作过程步骤是否展开。
+     * 流程：查询步骤展开 Set，步骤默认收起，减少命令输出对阅读的干扰。
+     * 参数：sourceKey 为回合稳定键，blockIndex 为工作过程块下标，itemIndex 为步骤下标。
+     * 返回：步骤已展开时返回 true。
+     */
+    function isProcessItemExpanded(sourceKey: string, blockIndex: number, itemIndex: number): boolean {
+        return expandedProcessItemKeys.value.has(buildProcessItemKey(sourceKey, blockIndex, itemIndex));
+    }
+
+    /**
+     * 切换工作过程步骤展开状态。
+     * 流程：复制 Set 后增删当前步骤 key，让用户可以逐项查看工具详情。
+     * 参数：sourceKey 为回合稳定键，blockIndex 为工作过程块下标，itemIndex 为步骤下标。
+     * 返回：无返回值。
+     */
+    function handleToggleProcessItem(sourceKey: string, blockIndex: number, itemIndex: number): void {
+        const itemKey = buildProcessItemKey(sourceKey, blockIndex, itemIndex);
+        const next = new Set(expandedProcessItemKeys.value);
+        if (next.has(itemKey)) next.delete(itemKey);
+        else next.add(itemKey);
+        expandedProcessItemKeys.value = next;
     }
 
     /**
