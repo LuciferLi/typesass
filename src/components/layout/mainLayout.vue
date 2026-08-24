@@ -180,8 +180,14 @@
                 class="windowDragRegion absolute inset-x-0 bottom-0 h-4"
                 data-tauri-drag-region="deep"></div>
             <div
-                class="windowNoDrag relative min-h-0 flex-1 rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6"
-                :class="route.name === HubRouteName.TaskManage ? 'overflow-hidden' : 'overflow-y-auto'">
+                class="windowNoDrag relative min-h-0 flex-1"
+                :class="
+                    route.name === HubRouteName.SessionManage
+                        ? 'overflow-hidden rounded-lg border border-border/70 bg-card/65 p-0 backdrop-blur'
+                        : route.name === HubRouteName.TaskManage
+                          ? 'overflow-hidden rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6'
+                          : 'overflow-y-auto rounded-lg border border-border/70 bg-card/65 p-3 backdrop-blur md:p-6'
+                ">
                 <router-view v-slot="{ Component, route: viewRoute }">
                     <transition
                         mode="out-in"
@@ -309,6 +315,7 @@
 
 <script setup lang="ts">
     import {
+        ApplicationMenu,
         Keyboard,
         KeyboardOne,
         LinkBreak,
@@ -389,7 +396,8 @@
         { routeName: HubRouteName.SessionManage, label: '会话管理', icon: Terminal },
         { routeName: HubRouteName.TaskManage, label: '任务管理', icon: List },
         { routeName: HubRouteName.Permission, label: '权限管理', icon: Permissions },
-        { routeName: HubRouteName.ModelManage, label: '模型管理', icon: KeyboardOne }
+        { routeName: HubRouteName.ModelManage, label: '模型管理', icon: KeyboardOne },
+        { routeName: HubRouteName.MyApp, label: '我的应用', icon: ApplicationMenu }
     ] as const;
 
     const showClientBridgeOverlay = computed(() => {

@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
+use crate::my_apps::{
+    CreateMyAppParams, MyAppIdParams, OpenMyAppParams, RuntimeMyApps, UpdateMyAppParams,
+};
 use crate::task_store::{
     CreateProjectRequest, CreateTaskRequest, TaskAttachmentRecord, UpdateProjectRequest,
     UpdateTaskRequest,
@@ -28,13 +31,14 @@ use crate::{
     complete_session_task_core, create_session_project_core, create_session_task_core,
     delete_session_project_core, delete_session_task_core, get_codex_connection_core,
     list_codex_threads_core, list_codex_workspaces_core, load_session_workspace_data_core,
-    open_session_external_thread_core, queue_session_task_core, request_access_token_approval_core,
-    restart_codex_core, update_session_project_core, update_session_task_core,
-    CodexThreadListRequest,
+    open_session_external_thread_core, queue_session_task_core, read_codex_thread_messages_core,
+    request_access_token_approval_core, restart_codex_core, send_codex_thread_message_core,
+    update_session_project_core, update_session_task_core, CodexThreadListRequest,
+    CodexThreadSendMessageRequest,
 };
 
-/// 私有 RPC 单次请求 JSON 的最大长度，防止本机异常客户端造成无界内存分配。
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// 私有 RPC 单次请求 JSON 的最大长度；与公开 HTTP body 上限对齐，覆盖我的应用 zip data URL 上传。
+const MAX_REQUEST_BYTES: usize = 12 * 1024 * 1024;
 /// 私有 RPC 单次响应 JSON 的最大长度，覆盖有限工作区聚合且阻止响应放大。
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// 编译期容量契约：TaskStore 聚合必须给 RPC envelope 至少保留 1 MiB，不允许两层上限独立漂移。
@@ -49,7 +53,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 /// worker 全忙时允许短暂排队的连接数；超过后立即返回 RPC_BUSY，不形成无界线程或内存队列。
 const MAX_PENDING_CONNECTIONS: usize = 8;
 /// FastAPI 可调用的私有 RPC 方法全集；未登记方法在进入业务分发器前默认拒绝。
-const ALLOWED_METHODS: [&str; 15] = [
+const ALLOWED_METHODS: [&str; 24] = [
     "requestAccessTokenApproval",
     "loadWorkspaceData",
     "createProject",
@@ -63,8 +67,17 @@ const ALLOWED_METHODS: [&str; 15] = [
     "listCodexWorkspaces",
     "listCodexThreads",
     "openCodexThread",
+    "readCodexThreadMessages",
+    "sendCodexThreadMessage",
     "getCodexConnection",
     "restartCodex",
+    "listMyApps",
+    "allocateMyAppPort",
+    "createMyApp",
+    "updateMyApp",
+    "deleteMyApp",
+    "restartMyApp",
+    "openMyApp",
 ];
 
 /// 传给 FastAPI sidecar 的私有 RPC 启动配置。
@@ -157,12 +170,31 @@ struct TaskIdParams {
     task_id: String,
 }
 
-/// 单字段 threadId 参数，用于通过 Codex deeplink 打开会话。
+/// Codex 会话 ID 参数，用于通过 deeplink 打开会话或读取会话详情。
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ThreadIdParams {
     /// 目标 Codex 会话 ID。
     thread_id: String,
+    /// 向前分页锚点；读取详情时返回该顺序之前的消息，打开会话时忽略。
+    #[serde(default)]
+    before_message_order: Option<usize>,
+    /// 读取详情窗口大小；打开会话时忽略。
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Codex 已有会话继续发送参数，用于把公开 HTTP 请求严格映射到 Rust 发送入口。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SendCodexThreadMessageParams {
+    /// 目标 Codex 会话 ID。
+    thread_id: String,
+    /// 要发送给 Codex Desktop 的继续对话正文。
+    content: String,
+    /// 随消息发送给 Codex Desktop 的图片附件。
+    #[serde(default)]
+    attachments: Vec<TaskAttachmentRecord>,
 }
 
 /// 创建项目的严格 RPC 参数，避免公共 HTTP 未知字段静默进入 Rust 业务层。
@@ -753,6 +785,32 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                 "Codex 会话服务暂不可用。",
             )
         }
+        "readCodexThreadMessages" => {
+            let request = decode_params::<ThreadIdParams>(params)?;
+            serialize_business_result(
+                read_codex_thread_messages_core(
+                    request.thread_id,
+                    request.before_message_order,
+                    request.limit,
+                ),
+                "CODEX_UNAVAILABLE",
+                "Codex 会话详情暂不可用。",
+            )
+        }
+        "sendCodexThreadMessage" => {
+            let request = decode_params::<SendCodexThreadMessageParams>(params)?;
+            serialize_business_result(
+                send_codex_thread_message_core(
+                    request.thread_id,
+                    CodexThreadSendMessageRequest {
+                        content: request.content,
+                        attachments: request.attachments,
+                    },
+                ),
+                "CODEX_THREAD_SEND_FAILED",
+                "Codex 会话消息发送失败。",
+            )
+        }
         "getCodexConnection" => {
             ensure_empty_params(params)?;
             serialize_business_result(
@@ -767,6 +825,62 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                 restart_codex_core(app),
                 "CODEX_RESTART_FAILED",
                 "Codex Desktop 重启请求失败。",
+            )
+        }
+        "listMyApps" => {
+            ensure_empty_params(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().list(app),
+                "MY_APP_LIST_FAILED",
+                "读取我的应用列表失败。",
+            )
+        }
+        "allocateMyAppPort" => {
+            ensure_empty_params(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().allocate_port(app),
+                "MY_APP_PORT_ALLOCATE_FAILED",
+                "自动分配应用端口失败。",
+            )
+        }
+        "createMyApp" => {
+            let request = decode_params::<CreateMyAppParams>(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().create(app, request),
+                "MY_APP_CREATE_FAILED",
+                "创建我的应用失败。",
+            )
+        }
+        "updateMyApp" => {
+            let request = decode_params::<UpdateMyAppParams>(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().update(app, request),
+                "MY_APP_UPDATE_FAILED",
+                "更新我的应用失败。",
+            )
+        }
+        "deleteMyApp" => {
+            let request = decode_params::<MyAppIdParams>(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().delete(app, &request.app_id),
+                "MY_APP_DELETE_FAILED",
+                "删除我的应用失败。",
+            )
+        }
+        "restartMyApp" => {
+            let request = decode_params::<MyAppIdParams>(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().restart(app, &request.app_id),
+                "MY_APP_RESTART_FAILED",
+                "启动或重启我的应用失败。",
+            )
+        }
+        "openMyApp" => {
+            let request = decode_params::<OpenMyAppParams>(params)?;
+            serialize_business_result(
+                app.state::<RuntimeMyApps>().open(app, request),
+                "MY_APP_OPEN_FAILED",
+                "打开我的应用失败。",
             )
         }
         _ => Err(RpcErrorBody {
@@ -804,9 +918,9 @@ fn ensure_empty_params(params: Value) -> Result<(), RpcErrorBody> {
 }
 
 /// 序列化 Rust 业务结果并统一映射业务失败。
-/// 流程：优先提取既有安全文案中的稳定错误码，否则使用调用 operation 的固定兜底码和文案，成功值再转为 JSON。
+/// 流程：优先提取既有安全文案中的稳定错误码；我的应用错误保留用户可修复原因；其它错误使用固定兜底码和文案，成功值再转为 JSON。
 /// 参数：result 为任意可序列化业务响应，fallback_code/message 为当前方法的稳定失败分类；返回 JSON。
-/// 异常/边界：仅带合法错误码的既有安全文案可透传；无错误码的数据库、路径或进程正文由固定文案替代。
+/// 异常/边界：仅带合法错误码的既有安全文案可透传；我的应用错误裁剪长度后透传；其它无错误码的数据库、路径或进程正文由固定文案替代。
 fn serialize_business_result<T>(
     result: Result<T, String>,
     fallback_code: &str,
@@ -827,6 +941,12 @@ where
                 message: "会话 ID 无效。".to_string(),
             };
         }
+        if fallback_code.starts_with("MY_APP_") {
+            return RpcErrorBody {
+                code: fallback_code.to_string(),
+                message: build_safe_user_message(&message, fallback_message),
+            };
+        }
         RpcErrorBody {
             code: fallback_code.to_string(),
             message: fallback_message.to_string(),
@@ -836,6 +956,19 @@ where
         code: "RPC_SERIALIZATION_FAILED".to_string(),
         message: "私有 RPC 响应序列化失败".to_string(),
     })
+}
+
+/// 构建可以展示给用户的业务错误文案。
+/// 流程：去除首尾空白，空值使用兜底文案，非空文案按字符数裁剪避免响应过长。
+/// 参数：message 为业务层返回的可读失败原因，fallback_message 为固定兜底文案。
+/// 返回：适合 HTTP API 和前端 toast 展示的短文案。
+/// 异常/边界：裁剪按 char 边界执行，避免破坏中文 UTF-8。
+fn build_safe_user_message(message: &str, fallback_message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return fallback_message.to_string();
+    }
+    trimmed.chars().take(500).collect()
 }
 
 /// 从既有安全业务文案中提取稳定 UPPER_SNAKE 错误码。
@@ -1183,10 +1316,25 @@ mod tests {
     /// 连接状态和显式重启必须属于固定 allowlist，且不能出现通用命令入口。
     #[test]
     fn codex_connection_methods_are_explicitly_allowlisted() {
-        assert_eq!(ALLOWED_METHODS.len(), 15);
+        assert_eq!(ALLOWED_METHODS.len(), 22);
         assert!(ALLOWED_METHODS.contains(&"getCodexConnection"));
         assert!(ALLOWED_METHODS.contains(&"restartCodex"));
         assert!(!ALLOWED_METHODS.contains(&"command"));
+    }
+
+    #[test]
+    fn my_app_error_mapping_preserves_user_fixable_detail() {
+        let error = serialize_business_result::<Value>(
+            Err("zip 包根目录或第一层目录必须包含 index.html。".to_string()),
+            "MY_APP_CREATE_FAILED",
+            "创建我的应用失败。",
+        )
+        .expect_err("我的应用失败必须返回结构化错误");
+        assert_eq!(error.code, "MY_APP_CREATE_FAILED");
+        assert_eq!(
+            error.message,
+            "zip 包根目录或第一层目录必须包含 index.html。"
+        );
     }
 
     #[test]

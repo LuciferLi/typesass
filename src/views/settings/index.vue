@@ -16,6 +16,20 @@
                     :model-value="store.settings.themeMode === 'dark'"
                     @update:model-value="store.toggleThemeMode" />
             </ui-field>
+            <ui-field class="rounded-md border border-border bg-muted/30 p-4">
+                <ui-field-content>
+                    <ui-field-label>用户英文名</ui-field-label>
+                    <ui-field-description>
+                        英文名会作为 HTTP API 外网访问域名前缀；每个“我的应用”仍可在创建或编辑时自定义自己的二级域名。
+                    </ui-field-description>
+                </ui-field-content>
+                <ui-input
+                    class="mt-3 h-9 max-w-[360px]"
+                    maxlength="32"
+                    placeholder="例如 lucifer"
+                    :model-value="store.settings.userEnglishName"
+                    @change="handleUserEnglishNameChanged" />
+            </ui-field>
             <ui-field
                 orientation="horizontal"
                 class="rounded-md border border-border bg-muted/30 p-4">
@@ -257,6 +271,28 @@
             })
             .catch((error: unknown) => {
                 showSettingsOperationError('保存系统设置失败', error, '开机自动启动设置保存失败。');
+            });
+    }
+
+    /**
+     * 保存用户英文名。
+     * 流程：读取输入框值，交给 Store 统一规范化并持久化；若公网访问已开启，则同步重启为新域名。
+     * 参数：event 为输入框 change 事件。
+     * 返回：无返回值。
+     * 边界：英文名会影响 HTTP API 固定域名，不会修改已有应用自定义域名。
+     */
+    function handleUserEnglishNameChanged(event: Event): void {
+        const { target } = event;
+        if (!(target instanceof HTMLInputElement)) return;
+        void store
+            .updateUserEnglishName(target.value)
+            .then((publicUrl) => {
+                toast.success('已更新用户英文名', {
+                    description: publicUrl ? `HTTP API 外网地址已更新为 ${publicUrl}` : undefined
+                });
+            })
+            .catch((error: unknown) => {
+                showSettingsOperationError('更新用户英文名失败', error, '用户英文名保存失败。');
             });
     }
 

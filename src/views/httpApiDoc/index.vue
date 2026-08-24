@@ -13,14 +13,24 @@
                     </p>
                 </div>
             </div>
-            <button
-                type="button"
-                class="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-border bg-background px-3 text-[13px] text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-                :disabled="loading"
-                @click="loadDocument">
-                <refresh :class="['h-3.5 w-3.5', loading ? 'animate-spin' : '']" />
-                刷新
-            </button>
+            <div class="flex shrink-0 flex-wrap items-center justify-end gap-3">
+                <label
+                    class="flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[13px] text-foreground">
+                    <span>允许外网访问</span>
+                    <ui-switch
+                        :model-value="settingsStore.settings.publicApiExternalAccessEnabled"
+                        :disabled="settingsStore.saving || publicApiTunnelSwitching"
+                        @update:model-value="handleTogglePublicApiExternalAccess" />
+                </label>
+                <button
+                    type="button"
+                    class="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-border bg-background px-3 text-[13px] text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+                    :disabled="loading"
+                    @click="loadDocument">
+                    <refresh :class="['h-3.5 w-3.5', loading ? 'animate-spin' : '']" />
+                    刷新
+                </button>
+            </div>
         </header>
 
         <div
@@ -56,6 +66,30 @@
                         {{ server.url }}
                     </span>
                 </div>
+
+                <section class="grid gap-2 rounded-md border border-border bg-muted/30 p-3">
+                    <div class="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                        <div class="grid min-w-0 gap-1">
+                            <h2 class="text-[14px] font-semibold text-foreground">远程访问地址</h2>
+                            <p class="text-[12px] leading-5 text-muted-foreground">
+                                外网访问开启后，第三方系统可通过“用户英文名.tolern.com”访问本机 HTTP
+                                API；未设置英文名时使用随机兜底域名。公网来源业务接口必须携带 App 授权码。
+                            </p>
+                        </div>
+                        <button
+                            v-if="remoteApiBaseUrl"
+                            type="button"
+                            class="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-border bg-background px-3 text-[13px] text-foreground hover:bg-muted"
+                            @click="handleCopyRemoteApiBaseUrl">
+                            <copy class="h-3.5 w-3.5" />
+                            复制
+                        </button>
+                    </div>
+                    <code
+                        class="block min-w-0 break-all rounded-md bg-background px-3 py-2 text-[12px] leading-5 text-foreground">
+                        {{ remoteApiBaseUrl || '未开启外网访问，当前仅展示本机地址。' }}
+                    </code>
+                </section>
 
                 <section
                     class="grid gap-3 border-y border-border py-4 text-[12px] leading-5 text-muted-foreground lg:grid-cols-2">
@@ -444,7 +478,8 @@
 </template>
 
 <script setup lang="ts">
-    import { List, Refresh, Terminal } from '@icon-park/vue-next';
+    import { Copy, List, Refresh, Terminal } from '@icon-park/vue-next';
+    import { toast } from 'vue-sonner';
 
     import HttpApiDocSchemaFieldPanel from '@/components/httpApiDoc/schemaFieldPanel.vue';
     import {
@@ -453,6 +488,7 @@
         AccordionItem as UiAccordionItem,
         AccordionTrigger as UiAccordionTrigger
     } from '@/components/ui/accordion';
+    import { Switch as UiSwitch } from '@/components/ui/switch';
     import type {
         HttpApiEndpointModel,
         HttpApiOpenApiDocumentModel,
@@ -461,6 +497,7 @@
         HttpApiSchemaModel
     } from '@/model/httpApiDoc';
     import { getPublicApiToken, readPublicApiOpenApi, requestPublicApiAccessToken } from '@/service/tauri/command';
+    import { useSettingsStore } from '@/stores/settings';
 
     defineOptions({
         name: 'HttpApiDocView'
@@ -514,6 +551,8 @@
     const errorMessage = ref('');
     const exchangingToken = ref(false);
     const integrationTokenMessage = ref('正在检查当前运行会话授权码。');
+    const publicApiTunnelSwitching = ref(false);
+    const settingsStore = useSettingsStore();
 
     const documentDescription = computed(() => {
         return apiDocument.value?.info.description || '读取独立 HTTP 服务当前真实开放的接口。';
@@ -528,7 +567,13 @@
         const endpoints = collectEndpoints(apiDocument.value);
         return groupEndpoints(apiDocument.value, endpoints);
     });
-    const documentServerUrl = computed(() => apiDocument.value?.servers?.[0]?.url || 'http://127.0.0.1:18080');
+    const localDocumentServerUrl = computed(() => apiDocument.value?.servers?.[0]?.url || 'http://127.0.0.1:18080');
+    const remoteApiBaseUrl = computed(() => {
+        const subdomain = settingsStore.settings.publicApiSubdomain;
+        if (!settingsStore.settings.publicApiExternalAccessEnabled || !subdomain) return '';
+        return `https://${subdomain}.tolern.com`;
+    });
+    const documentServerUrl = computed(() => remoteApiBaseUrl.value || localDocumentServerUrl.value);
     const requestAccessTokenCurlExample = computed(
         () => `curl -X POST '${documentServerUrl.value}/v1/access-tokens/request' \\
   -H 'Content-Type: application/json' \\
@@ -615,6 +660,7 @@ curl -X POST "$BASE_URL/v1/tasks/$TASK_ID/complete" \\
 
     onMounted(async () => {
         try {
+            await settingsStore.refreshPublicApiTunnelStatus();
             integrationTokenMessage.value = (await getPublicApiToken())
                 ? '当前运行会话已配置 App 授权码；公网来源业务请求会自动携带。'
                 : '尚未配置 App 授权码；内网来源可访问业务接口，公网来源会返回 401。';
@@ -623,6 +669,51 @@ curl -X POST "$BASE_URL/v1/tasks/$TASK_ID/complete" \\
         }
         await loadDocument();
     });
+
+    /**
+     * 切换 HTTP API 外网访问。
+     * 流程：调用设置 Store 启停 Rust 侧 frpc；成功后页面自动展示固定远程地址。
+     * 参数：enabled 为目标开关状态。
+     * 返回：无返回值。
+     * 边界：失败时刷新运行态并恢复开关显示，避免 UI 和真实隧道不一致。
+     */
+    async function handleTogglePublicApiExternalAccess(enabled: boolean): Promise<void> {
+        if (publicApiTunnelSwitching.value) return;
+        publicApiTunnelSwitching.value = true;
+        try {
+            const publicUrl = await settingsStore.togglePublicApiExternalAccess(enabled);
+            toast.success(enabled ? '已开启 HTTP API 外网访问' : '已关闭 HTTP API 外网访问', {
+                description: enabled && publicUrl ? publicUrl : undefined
+            });
+        } catch (error) {
+            await settingsStore.refreshPublicApiTunnelStatus().catch(() => undefined);
+            toast.error('HTTP API 外网访问设置失败', {
+                description: error instanceof Error ? error.message : '请稍后重试。'
+            });
+        } finally {
+            publicApiTunnelSwitching.value = false;
+        }
+    }
+
+    /**
+     * 复制 HTTP API 远程基础地址。
+     * 流程：把当前固定域名复制到系统剪贴板，并给出短提示。
+     * 参数：无。
+     * 返回：复制完成 Promise。
+     * 边界：未开启或剪贴板不可用时展示失败，不构造临时输入框。
+     */
+    async function handleCopyRemoteApiBaseUrl(): Promise<void> {
+        if (!remoteApiBaseUrl.value) return;
+        try {
+            if (!navigator.clipboard?.writeText) throw new Error('当前环境不支持剪贴板写入。');
+            await navigator.clipboard.writeText(remoteApiBaseUrl.value);
+            toast.success('已复制远程访问地址');
+        } catch (error) {
+            toast.error('复制远程访问地址失败', {
+                description: error instanceof Error ? error.message : '请手动复制页面中的地址。'
+            });
+        }
+    }
 
     /**
      * 为当前 Web 会话申请 App 授权码。

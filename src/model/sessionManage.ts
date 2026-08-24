@@ -185,6 +185,9 @@ export type CodexWorkspaceModel = {
     updatedAt: string;
 };
 
+// CodeX 会话运行状态，用于左侧列表展示实时执行态。
+export type CodexThreadStatusType = 'running' | 'completed' | 'failed' | 'unknown';
+
 // CodeX 会话摘要模型，用于展示外部已有会话。
 export type CodexThreadSummaryModel = {
     // CodeX thread ID。
@@ -199,6 +202,8 @@ export type CodexThreadSummaryModel = {
     agentNickname: string;
     // 子 Agent 角色；普通用户会话为空字符串。
     agentRole: string;
+    // 会话运行状态；running 时左侧列表展示加载图标。
+    status: CodexThreadStatusType;
     // 最近更新时间。
     updatedAt: string;
 };
@@ -214,3 +219,126 @@ export type CodexThreadListRequestModel = {
     // 搜索关键词，可匹配会话标题或 thread ID。
     keyword: string;
 };
+
+/** CodeX 会话消息角色类型。 */
+export type CodexThreadMessageRoleType = 'user' | 'assistant';
+
+/** CodeX 会话消息结构化展示类型。 */
+export type CodexThreadMessageKindType =
+    | 'user'
+    | 'assistant'
+    | 'commentary'
+    | 'finalAnswer'
+    | 'reasoning'
+    | 'toolCall'
+    | 'toolResult'
+    | 'status';
+
+/** CodeX 会话正文中的单条可展示消息。 */
+export interface CodexThreadMessageModel {
+    /** 历史分页和排序使用的消息顺序，不与 SSE seq 混用。 */
+    messageOrder: number;
+    /** 消息角色。 */
+    role: CodexThreadMessageRoleType;
+    /** 结构化消息类型，用于区分助手正文、思考、工具调用、工具结果和状态。 */
+    kind: CodexThreadMessageKindType;
+    /** 消息块标题；普通正文为空，工具和状态块展示折叠标题。 */
+    title: string;
+    /** 已由服务端做长度保护的消息正文。 */
+    content: string;
+    /** 执行状态；普通正文为空，工具和状态块可能为 running/completed/failed。 */
+    status: string;
+    /** 消息创建时间；来源不可用时为空字符串。 */
+    createdAt: string;
+}
+
+/** CodeX 会话消息窗口范围。 */
+export interface CodexThreadMessageRangeModel {
+    /** 当前窗口第一条消息顺序。 */
+    startMessageOrder: number;
+    /** 当前窗口最后一条消息顺序。 */
+    endMessageOrder: number;
+    /** 窗口前方是否还有更早历史。 */
+    hasMoreBefore: boolean;
+    /** 窗口后方是否还有更新消息。 */
+    hasMoreAfter: boolean;
+}
+
+/** CodeX 会话正文窗口响应。 */
+export interface CodexThreadMessagesResponseModel {
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 会话标题。 */
+    title: string;
+    /** 会话更新时间；来源不可用时为空字符串。 */
+    updatedAt: string;
+    /** 当前窗口内可展示消息。 */
+    messages: CodexThreadMessageModel[];
+    /** 当前消息窗口范围。 */
+    range: CodexThreadMessageRangeModel;
+}
+
+/** CodeX 已有会话继续发送状态。 */
+export type CodexThreadSendMessageStatusType = 'sent' | 'queued';
+
+/** CodeX 已有会话继续发送请求。 */
+export interface CodexThreadSendMessageRequestModel {
+    /** 要发送到目标会话的正文；存在图片附件时允许为空。 */
+    content: string;
+    /** 随消息发送给 CodeX 的图片附件，最多 4 张。 */
+    attachments?: SessionTaskAttachmentModel[];
+}
+
+/** CodeX 已有会话继续发送响应。 */
+export interface CodexThreadSendMessageResponseModel {
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 发送状态；首版服务端只返回 sent，queued 预留给后续持久队列。 */
+    status: CodexThreadSendMessageStatusType;
+    /** 服务端持久队列消息 ID；首版为空。 */
+    queuedMessageId: string | null;
+    /** 面向用户的安全说明。 */
+    message: string;
+}
+
+/** CodeX 会话 SSE snapshot 事件。 */
+export interface CodexThreadSnapshotEventModel {
+    /** SSE 增量事件序号。 */
+    seq: number;
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 固定为 snapshot。 */
+    type: 'snapshot';
+    /** 首包窗口消息。 */
+    messages: CodexThreadMessageModel[];
+    /** 首包消息范围。 */
+    range: CodexThreadMessageRangeModel;
+}
+
+/** CodeX 会话 SSE 心跳事件。 */
+export interface CodexThreadHeartbeatEventModel {
+    /** SSE 增量事件序号。 */
+    seq: number;
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 固定为 heartbeat。 */
+    type: 'heartbeat';
+}
+
+/** CodeX 会话 SSE 消息增量事件。 */
+export interface CodexThreadMessageDeltaEventModel {
+    /** SSE 增量事件序号。 */
+    seq: number;
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 固定为 messageDelta。 */
+    type: 'messageDelta';
+    /** 发生变化的消息。 */
+    message: CodexThreadMessageModel;
+}
+
+/** CodeX 会话流事件联合类型。 */
+export type CodexThreadStreamEventModel =
+    | CodexThreadSnapshotEventModel
+    | CodexThreadHeartbeatEventModel
+    | CodexThreadMessageDeltaEventModel;

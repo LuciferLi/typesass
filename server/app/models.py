@@ -322,12 +322,177 @@ class CodexThreadResponse(BaseModel):
         description="子 Agent 角色；普通用户会话为空字符串。",
         examples=["worker"],
     )
+    status: Literal["running", "completed", "failed", "unknown"] = Field(
+        default="unknown",
+        description="会话运行状态；running 表示当前会话仍在执行，用于左侧列表展示加载态。",
+        examples=["running"],
+    )
     updated_at: str = Field(
         alias="updatedAt",
         pattern=r"^$|^[0-9]+$",
         description="最近更新时间：十进制 Unix epoch 毫秒字符串；来源无法提供时间时为空字符串。",
         examples=["1786406400000"],
     )
+
+
+class CodexThreadMessageResponse(BaseModel):
+    """CodeX 会话正文中的可展示消息。
+
+    流程：Rust 从 app-server 快照或受限 JSONL 中抽取用户、助手、工具和状态消息；HTTP 仅补充分页展示所需的 messageOrder。
+    边界：保留 role/content 兼容旧前端，新增 kind/title/status 供 Codex 风格详情渲染。
+    """
+
+    message_order: int = Field(
+        alias="messageOrder",
+        ge=1,
+        description="会话消息展示顺序，用于前端排序和后续历史分页锚点。",
+        examples=[1],
+    )
+    role: Literal["user", "assistant"] = Field(
+        description="消息角色；工具、思考和状态块统一归属 assistant。", examples=["assistant"]
+    )
+    kind: Literal[
+        "user",
+        "assistant",
+        "commentary",
+        "finalAnswer",
+        "reasoning",
+        "toolCall",
+        "toolResult",
+        "status",
+    ] = Field(
+        default="assistant",
+        description="消息结构化类型；用于前端按 Codex 风格渲染正文、思考、工具调用、工具结果和状态。",
+        examples=["toolResult"],
+    )
+    title: str = Field(
+        default="",
+        description="消息块标题；普通正文为空，工具和状态块用于折叠标题。",
+        examples=["exec_command"],
+    )
+    content: str = Field(
+        description="已由 Rust 做单条长度保护的消息正文。", examples=["接口已经补齐。"]
+    )
+    status: str = Field(
+        default="",
+        description="执行状态；普通正文为空，工具和状态块可返回 running/completed/failed 等。",
+        examples=["completed"],
+    )
+    created_at: str = Field(
+        alias="createdAt",
+        description="消息创建时间；来源不可用时允许为空字符串。",
+        examples=["1786406400000"],
+    )
+
+
+class CodexThreadMessageRangeResponse(BaseModel):
+    """CodeX 会话消息窗口范围。
+
+    用途：让前端区分历史分页游标和 SSE eventSeq，避免把两类游标混用。
+    """
+
+    start_message_order: int = Field(
+        alias="startMessageOrder", ge=0, description="当前窗口第一条消息顺序。", examples=[1]
+    )
+    end_message_order: int = Field(
+        alias="endMessageOrder", ge=0, description="当前窗口最后一条消息顺序。", examples=[80]
+    )
+    has_more_before: bool = Field(
+        alias="hasMoreBefore", description="窗口前方是否还有更早历史。", examples=[False]
+    )
+    has_more_after: bool = Field(
+        alias="hasMoreAfter", description="窗口后方是否还有更新消息。", examples=[False]
+    )
+
+
+class CodexThreadMessagesResponse(BaseModel):
+    """CodeX 会话正文窗口响应。
+
+    流程：对外只返回当前有界窗口；后续 JSONL actor 完成后可保持本模型不变并补齐向前分页。
+    边界：messages 为空代表会话存在但暂无可展示正文，不代表接口失败。
+    """
+
+    thread_id: str = Field(
+        alias="threadId",
+        description="CodeX thread 稳定 ID。",
+        examples=["0198f25a-1111-7000-8000-000000000001"],
+    )
+    title: str = Field(description="会话标题。", examples=["完善 HTTP 接口文档"])
+    updated_at: str = Field(
+        alias="updatedAt",
+        description="会话更新时间；来源不可用时允许为空字符串。",
+        examples=["1786406400000"],
+    )
+    messages: List[CodexThreadMessageResponse] = Field(
+        default_factory=list, description="当前窗口内可展示消息。"
+    )
+    range: CodexThreadMessageRangeResponse = Field(description="当前消息窗口范围。")
+
+
+class CodexThreadSendMessageRequest(StrictRequestModel):
+    """CodeX 已有会话继续发送请求。
+
+    流程：公网或本机调用方提交正文和图片附件后由 Python 严格校验，再委托 Rust 通过 CodeX Desktop 原生 composer 发送。
+    边界：正文和附件不能同时为空；mode 仅兼容早期调用方的排队语义，首版实际排队仍由前端运行态完成。
+    """
+
+    content: str = Field(
+        default="",
+        max_length=50_000,
+        description="要发送到目标 CodeX 会话的继续对话正文；有图片附件时允许为空。",
+        examples=["继续帮我优化右侧会话详情输入框。"],
+    )
+    attachments: List[TaskAttachmentRequest] = Field(
+        default_factory=list,
+        max_length=4,
+        description="随消息发送给 CodeX 的图片附件，最多 4 张；附件不会拼入正文。",
+        examples=[[]],
+    )
+    mode: Literal["queueWhenRunning"] = Field(
+        default="queueWhenRunning",
+        description="运行中会话的排队策略；当前用于兼容早期请求体，服务端首版不做跨重启持久队列。",
+        examples=["queueWhenRunning"],
+    )
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def normalize_optional_attachments(cls, value: object) -> object:
+        """兼容旧调用方传入的空附件。
+
+        流程：早期前端或外部调用方可能把无附件序列化为 ``null``，这里统一收敛为空数组后继续执行严格列表校验。
+        参数：``value`` 为原始 attachments 字段。
+        返回：空数组或原值。
+        边界：非 ``null`` 的非法结构仍交给 Pydantic 拒绝，避免吞掉真实字段错误。
+        """
+
+        if value is None:
+            return []
+        return value
+
+
+class CodexThreadSendMessageResponse(BaseModel):
+    """CodeX 已有会话继续发送响应。
+
+    流程：sent 表示 Rust 已经通过 CodeX Desktop 执行一次 Enter；queued 保留给后续持久队列扩展。
+    边界：发送不确定时接口抛出错误 envelope，不返回 sent，调用方不得自动重放正文。
+    """
+
+    thread_id: str = Field(
+        alias="threadId",
+        description="CodeX thread 稳定 ID。",
+        examples=["0198f25a-1111-7000-8000-000000000001"],
+    )
+    status: Literal["sent", "queued"] = Field(
+        description="消息提交状态；首版服务端只返回 sent。",
+        examples=["sent"],
+    )
+    queued_message_id: Optional[str] = Field(
+        default=None,
+        alias="queuedMessageId",
+        description="持久队列消息 ID；首版没有服务端持久队列，发送成功时为空。",
+        examples=[None],
+    )
+    message: str = Field(description="面向调用方的安全说明。", examples=["已发送"])
 
 
 class CodexConnectionResponse(BaseModel):
@@ -609,6 +774,126 @@ class OperationResponse(BaseModel):
         description="固定为 true；打开会话时表示 Rust 已验证 thread 存在并已提交 OS 打开请求，不代表 CodeX 界面已经打开完成。",
         examples=[True],
     )
+
+
+class MyAppCreateRequest(StrictRequestModel):
+    """创建我的应用请求。
+
+    流程：HTTP 严格校验展示字段和访问方式后原样转交 Rust；本地托管 zip 由 Rust 解码、解压和启动服务。
+    边界：本地托管必须传端口和 zipDataUrl；远程 URL 只允许 http/https，不接收本地文件路径。
+    """
+
+    name: StrictText = Field(
+        max_length=80,
+        description="应用名称，去除首尾空白后不可为空，最多 80 个 Unicode 字符。",
+        examples=["数据看板"],
+    )
+    logo_data_url: str = Field(
+        default="",
+        alias="logoDataUrl",
+        max_length=400_000,
+        description="可选 logo data URL；支持 png、jpeg、webp、svg，前端为空时展示默认图标。",
+        examples=["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."],
+    )
+    access_type: Literal["local", "remote"] = Field(
+        alias="accessType",
+        description="访问方式：local 为本地静态资源托管，remote 为远程 URL。",
+        examples=["local"],
+    )
+    port: Optional[int] = Field(
+        default=None,
+        ge=1024,
+        le=65535,
+        description="本地托管服务端口；remote 类型不需要传。",
+        examples=[18123],
+    )
+    remote_url: Optional[str] = Field(
+        default=None,
+        alias="remoteUrl",
+        max_length=4096,
+        description="远程 URL；仅 remote 类型使用，必须是 http 或 https。",
+        examples=["https://example.com/dashboard"],
+    )
+    public_subdomain: Optional[str] = Field(
+        default=None,
+        alias="publicSubdomain",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        description="本地托管应用的公网二级域名前缀；例如 demo 会生成 https://demo.tolern.com。",
+        examples=["demo"],
+    )
+    zip_data_url: Optional[str] = Field(
+        default=None,
+        alias="zipDataUrl",
+        max_length=12_000_000,
+        description="本地托管静态页面 zip 的 data URL；受公开 HTTP 12 MiB body 上限约束。",
+        examples=["data:application/zip;base64,UEsDBBQAAAA..."],
+    )
+
+
+class MyAppUpdateRequest(MyAppCreateRequest):
+    """更新我的应用请求。
+
+    流程：路径 appId 指定被修改应用；正文覆盖名称、logo、类型、端口或 URL；zipDataUrl 为空时复用既有本地站点目录。
+    边界：从远程 URL 改为本地托管且没有历史站点目录时必须重新上传 zipDataUrl。
+    """
+
+
+class MyAppOpenRequest(StrictRequestModel):
+    """打开我的应用请求。
+
+    流程：HTTP 校验打开目标后交给 Rust；本地应用会先确保静态服务已启动。
+    边界：codexman 表示新建或复用 App 内普通窗口，browser 表示系统默认浏览器。
+    """
+
+    target: Literal["codexman", "browser"] = Field(
+        description="打开目标：codexman 使用 CodexMan 新窗口，browser 使用系统默认浏览器。",
+        examples=["codexman"],
+    )
+
+
+class MyAppPortResponse(BaseModel):
+    """我的应用自动端口响应。
+
+    流程：Rust 避开已配置应用端口并尝试绑定本机端口后返回当前可用值。
+    边界：该端口不会被 HTTP 层预占用，保存时仍可能因外部进程抢占而启动失败。
+    """
+
+    port: int = Field(ge=1024, le=65535, description="当前检测可用的端口。", examples=[18123])
+
+
+class MyAppResponse(BaseModel):
+    """我的应用列表项响应。
+
+    流程：Rust 合并持久化配置、运行时服务状态、本地访问地址和局域网访问地址后返回。
+    边界：远程 URL 应用没有本地服务，serviceStatus 固定表达为 unavailable。
+    """
+
+    id: str = Field(description="应用稳定 ID。", examples=["app_01J00000000000000000000000"])
+    name: str = Field(description="应用名称。", examples=["数据看板"])
+    logo_data_url: str = Field(alias="logoDataUrl", description="logo data URL；可能为空。")
+    access_type: Literal["local", "remote"] = Field(alias="accessType", description="访问方式。")
+    port: Optional[int] = Field(default=None, description="本地托管端口。", examples=[18123])
+    remote_url: Optional[str] = Field(default=None, alias="remoteUrl", description="远程 URL。")
+    local_url: str = Field(alias="localUrl", description="本机访问地址；远程 URL 应用为空。")
+    lan_url: str = Field(alias="lanUrl", description="局域网访问地址；远程 URL 应用为空。")
+    public_url: str = Field(alias="publicUrl", description="公网访问地址；未配置二级域名或远程 URL 应用为空。")
+    public_subdomain: Optional[str] = Field(
+        default=None,
+        alias="publicSubdomain",
+        description="公网访问二级域名前缀；未配置时为空。",
+        examples=["demo"],
+    )
+    open_url: str = Field(alias="openUrl", description="默认打开地址。")
+    service_status: Literal["starting", "running", "paused", "failed", "unavailable"] = Field(
+        alias="serviceStatus",
+        description="本地服务状态；远程 URL 应用为 unavailable。",
+        examples=["running"],
+    )
+    service_message: str = Field(alias="serviceMessage", description="服务状态说明或最近错误。")
+    created_at: str = Field(alias="createdAt", description="创建时间。")
+    updated_at: str = Field(alias="updatedAt", description="更新时间。")
 
 
 class AudioTranscriptionRequest(StrictRequestModel):

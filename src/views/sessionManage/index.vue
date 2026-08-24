@@ -1,24 +1,24 @@
 <template>
     <section class="h-full min-h-0">
-        <div class="grid h-full min-h-0 gap-3 lg:grid-cols-[280px_minmax(0,1fr)]">
-            <session-manage-workspace-list
+        <div class="grid h-full min-h-0 gap-0 lg:grid-cols-[420px_minmax(0,1fr)]">
+            <session-manage-session-list
                 :workspaces="store.codexWorkspaces"
                 :selected-workspace-cwd="store.selectedWorkspaceCwd"
+                :search-keyword="store.codexThreadKeyword"
                 :loading="store.loading"
-                @refresh="handleRefreshWorkspaces"
-                @select="handleSelectWorkspace" />
-            <session-manage-session-list
                 :codex-threads="store.codexThreads"
+                :selected-thread-id="selectedThreadId"
                 :sessions="store.sessions"
                 :has-workspace="Boolean(store.selectedWorkspaceCwd)"
                 :has-more="store.hasMoreCodexThreads"
-                :loading="store.loading"
                 :loading-more="store.loadingMoreThreads"
-                :search-keyword="store.codexThreadKeyword"
                 @refresh="handleRefreshSessions"
+                @select-workspace="handleSelectWorkspace"
                 @search="handleSearchThreads"
                 @load-more="handleLoadMoreThreads"
+                @select="handleSelectThread"
                 @open="handleOpenThread" />
+            <session-manage-session-thread-viewer :selected-thread="selectedThread" />
         </div>
     </section>
 </template>
@@ -27,7 +27,7 @@
     import { toast } from 'vue-sonner';
 
     import SessionManageSessionList from '@/components/sessionManage/sessionList.vue';
-    import SessionManageWorkspaceList from '@/components/sessionManage/workspaceList.vue';
+    import SessionManageSessionThreadViewer from '@/components/sessionManage/sessionThreadViewer.vue';
     import { useSessionManageStore } from '@/stores/sessionManage';
 
     defineOptions({
@@ -35,7 +35,14 @@
     });
 
     const store = useSessionManageStore();
+    const selectedThreadId = ref('');
     let disposeTaskUpdates: (() => void) | null = null;
+    let codexThreadStatusRefreshTimer: ReturnType<typeof window.setInterval> | null = null;
+    let refreshingCodexThreadStatus = false;
+
+    const selectedThread = computed(() => {
+        return store.codexThreads.find((thread) => thread.id === selectedThreadId.value) ?? null;
+    });
 
     /**
      * 弹出会话管理操作失败提示。
@@ -58,21 +65,9 @@
      * 边界：切换失败时由 store 写入提示文案，页面保留原选中态。
      */
     function handleSelectWorkspace(workspaceCwd: string): void {
+        selectedThreadId.value = '';
         void store.selectCodexWorkspace(workspaceCwd).catch((error: unknown) => {
             showSessionOperationError('切换工作空间失败', error, '读取工作空间会话失败。');
-        });
-    }
-
-    /**
-     * 刷新工作空间数据。
-     * 流程：刷新 CodeX 工作空间，再按当前工作空间刷新右侧会话。
-     * 参数：无。
-     * 返回：无返回值。
-     * 边界：CodeX 不可用时显示空工作空间列表。
-     */
-    function handleRefreshWorkspaces(): void {
-        void store.initSessionManage().catch((error: unknown) => {
-            showSessionOperationError('刷新工作空间失败', error, '读取工作空间失败。');
         });
     }
 
@@ -84,9 +79,16 @@
      * 边界：没有选中工作空间时由 store 返回空会话列表。
      */
     function handleRefreshSessions(): void {
-        void store.refreshCodexThreads(undefined, true).catch((error: unknown) => {
-            showSessionOperationError('刷新会话失败', error, '读取 CodeX 会话失败。');
-        });
+        void store
+            .refreshCodexThreads(undefined, true)
+            .then(() => {
+                if (!store.codexThreads.some((thread) => thread.id === selectedThreadId.value)) {
+                    selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+                }
+            })
+            .catch((error: unknown) => {
+                showSessionOperationError('刷新会话失败', error, '读取 CodeX 会话失败。');
+            });
     }
 
     /**
@@ -97,9 +99,14 @@
      * 边界：空关键词恢复默认会话列表。
      */
     function handleSearchThreads(keyword: string): void {
-        void store.searchCodexThreads(keyword).catch((error: unknown) => {
-            showSessionOperationError('搜索会话失败', error, '读取搜索结果失败。');
-        });
+        void store
+            .searchCodexThreads(keyword)
+            .then(() => {
+                selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+            })
+            .catch((error: unknown) => {
+                showSessionOperationError('搜索会话失败', error, '读取搜索结果失败。');
+            });
     }
 
     /**
@@ -116,6 +123,16 @@
     }
 
     /**
+     * 切换右侧会话内容。
+     * 流程：左侧列表单击只更新当前 thread ID，右侧组件负责取消旧流并加载新内容。
+     * 参数：threadId 为 CodeX 会话 ID。
+     * 返回：无返回值。
+     */
+    function handleSelectThread(threadId: string): void {
+        selectedThreadId.value = threadId;
+    }
+
+    /**
      * 打开 CodeX 会话定位。
      * 流程：委托 store 调用 HTTP，再由 Rust 打开受校验的外部 thread。
      * 参数：threadId 为 CodeX 会话 ID。
@@ -128,10 +145,41 @@
         });
     }
 
+    /**
+     * 静默刷新左侧 CodeX 会话摘要状态。
+     * 流程：页面保持打开时定时刷新第一页摘要，让 running/completed 状态驱动列表 loading 图标。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：没有工作空间、正在追加加载或上一轮未结束时跳过，避免打断用户当前选择和分页操作。
+     */
+    function refreshCodexThreadStatusSilently(): void {
+        if (!store.selectedWorkspaceCwd || store.loadingMoreThreads || refreshingCodexThreadStatus) return;
+        refreshingCodexThreadStatus = true;
+        void store.refreshCodexThreads(undefined, true).finally(() => {
+            refreshingCodexThreadStatus = false;
+        });
+    }
+
+    /**
+     * 启动左侧会话状态静默刷新。
+     * 流程：初始化完成后创建固定间隔轮询，组件卸载时统一清理。
+     * 参数：无。
+     * 返回：无返回值。
+     * 边界：重复调用会先清理旧 timer，避免页面重进后多重轮询。
+     */
+    function startCodexThreadStatusRefresh(): void {
+        if (codexThreadStatusRefreshTimer) window.clearInterval(codexThreadStatusRefreshTimer);
+        codexThreadStatusRefreshTimer = window.setInterval(refreshCodexThreadStatusSilently, 5_000);
+    }
+
     onMounted(() => {
         void store
             .initTaskManage()
             .then(() => store.refreshCodexThreads(undefined, true))
+            .then(() => {
+                selectedThreadId.value = store.codexThreads[0]?.id ?? '';
+                startCodexThreadStatusRefresh();
+            })
             .then(() => store.listenTaskUpdates())
             .then((dispose) => {
                 disposeTaskUpdates = dispose;
@@ -144,5 +192,7 @@
     onUnmounted(() => {
         disposeTaskUpdates?.();
         disposeTaskUpdates = null;
+        if (codexThreadStatusRefreshTimer) window.clearInterval(codexThreadStatusRefreshTimer);
+        codexThreadStatusRefreshTimer = null;
     });
 </script>

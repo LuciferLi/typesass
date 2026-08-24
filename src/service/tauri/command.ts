@@ -11,9 +11,20 @@ import type {
     SavePrivateModelRequestModel,
     TestPrivateModelRequestModel
 } from '@/model/modelManage';
+import type {
+    CreateMyAppRequestModel,
+    MyAppModel,
+    MyAppOpenTargetType,
+    MyAppPortResponseModel,
+    UpdateMyAppRequestModel
+} from '@/model/myApp';
 import type { RuntimeDiagnosticsModel, ShortcutProfileModel } from '@/model/permission';
 import type {
     CodexThreadListRequestModel,
+    CodexThreadMessagesResponseModel,
+    CodexThreadSendMessageRequestModel,
+    CodexThreadSendMessageResponseModel,
+    CodexThreadStreamEventModel,
     CodexThreadSummaryModel,
     CodexWorkspaceModel,
     CreateSessionProjectRequestModel,
@@ -23,6 +34,7 @@ import type {
     UpdateSessionProjectRequestModel,
     UpdateSessionTaskRequestModel
 } from '@/model/sessionManage';
+import type { PublicApiTunnelStatusModel } from '@/model/settings';
 import type { ApplicationOptionModel } from '@/model/shortcutBinding';
 import type { PasteResponseModel, SelectedTextResponseModel } from '@/model/textPolish';
 import type {
@@ -100,6 +112,9 @@ export function isPublicApiRequestErrorCode(error: unknown, code: string): error
 
 /** 公共 API 请求支持的 HTTP 方法，避免通过是否存在请求体隐式推断方法。 */
 type PublicApiRequestMethod = 'GET' | 'POST';
+
+/** CodeX 会话 SSE 事件处理函数。 */
+export type CodexThreadStreamEventHandler = (event: CodexThreadStreamEventModel) => void;
 
 /** 公共 API 单次业务调用配置。 */
 interface PublicApiRequestOptions {
@@ -207,6 +222,17 @@ const PUBLIC_API_RETRYABLE_ERROR_CODES = new Set([
 ]);
 /** 普通浏览器当前页面持有的 App 授权码；外部授权页后续可改为持久保存。 */
 let browserPublicApiToken = '';
+
+/**
+ * 构建本机 Markdown 图片预览地址。
+ * 流程：把 Markdown 中的本机图片绝对路径编码成同源预览接口地址；开发态由 Vite 代理到 sidecar。
+ * 参数：filePath 为会话正文中的本机图片路径。
+ * 返回：可放入 img src 的本机 HTTP 预览地址。
+ * 边界：真正的路径范围、文件类型和来源权限由 sidecar 再次校验。
+ */
+export function buildLocalMarkdownImagePreviewUrl(filePath: string): string {
+    return `/v1/local-images/preview?path=${encodeURIComponent(filePath)}`;
+}
 
 /**
  * 保存当前浏览器会话使用的公共 API 授权码。
@@ -644,6 +670,28 @@ export async function readPublicApiOpenApi(): Promise<HttpApiOpenApiDocumentMode
 }
 
 /**
+ * 读取公共 HTTP API 外网访问状态。
+ * 流程：桌面端通过 Tauri IPC 读取固定域名和 frpc 运行态；普通 Web 无此管理权限。
+ * 参数：无。
+ * 返回：外网访问开关、固定域名、远程地址和运行态。
+ * 异常：非桌面环境或 IPC 失败时抛出明确错误。
+ */
+export async function getPublicApiTunnelStatus(): Promise<PublicApiTunnelStatusModel> {
+    return invokeDesktop<PublicApiTunnelStatusModel>('get_public_api_tunnel_status');
+}
+
+/**
+ * 切换公共 HTTP API 外网访问。
+ * 流程：开启时由 Rust 优先使用用户英文名作为二级域名，未设置时生成 6 位随机兜底域名并启动 frpc；关闭时保留域名并停止 frpc。
+ * 参数：enabled 为目标开关状态。
+ * 返回：切换后的外网访问状态。
+ * 异常：域名生成、配置写入或 frpc 启停失败时透传错误。
+ */
+export async function setPublicApiTunnelEnabled(enabled: boolean): Promise<PublicApiTunnelStatusModel> {
+    return invokeDesktop<PublicApiTunnelStatusModel>('set_public_api_tunnel_enabled', { enabled });
+}
+
+/**
  * 读取公共服务模型目录。
  * 流程：桌面端通过受保护 IPC 读取本机安全目录，普通 Web 通过 GET `/v1/models` 读取 HTTP 授权后的安全目录。
  * 参数：无。
@@ -697,6 +745,17 @@ export async function suspendShortcutsForRecording(): Promise<void> {
  */
 export async function listInstalledApplications(): Promise<ApplicationOptionModel[]> {
     return invokeDesktop<ApplicationOptionModel[]>('list_installed_applications');
+}
+
+/**
+ * 使用系统默认应用打开本机文件。
+ * 流程：桌面端通过受保护的 Tauri 命令交给系统 open；普通浏览器不尝试 file:// 跳转，避免浏览器安全限制和误导。
+ * 参数：filePath 为会话正文中的本机文件绝对路径。
+ * 返回：打开请求完成 Promise。
+ * 异常：普通 Web、文件不存在或系统打开失败时抛出用户可读错误。
+ */
+export async function openLocalFileWithDefaultApp(filePath: string): Promise<void> {
+    await invokeDesktop<void>('open_local_file_with_default_app', { filePath });
 }
 
 /**
@@ -994,6 +1053,141 @@ export async function listCodexThreads(request: CodexThreadListRequestModel): Pr
 }
 
 /**
+ * 读取 CodeX 会话正文窗口。
+ * 流程：通过公开 HTTP `/messages` 获取服务端有界窗口；messageOrder 仅用于历史分页和排序，不与 SSE seq 混用。
+ * 参数：threadId 为搜索接口返回的真实会话 ID。
+ * 参数：beforeMessageOrder 为向前分页锚点，传入后返回该顺序之前的消息窗口。
+ * 返回：当前会话正文窗口。
+ * 异常：HTTP 鉴权、私有桥接或 CodeX 会话读取失败时透传稳定错误。
+ */
+export async function readCodexThreadMessages(
+    threadId: string,
+    beforeMessageOrder?: number
+): Promise<CodexThreadMessagesResponseModel> {
+    const query = beforeMessageOrder ? `?limit=200&beforeMessageOrder=${beforeMessageOrder}` : '?limit=200';
+    return requestPublicApi<CodexThreadMessagesResponseModel>(
+        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages${query}`,
+        { method: 'GET' }
+    );
+}
+
+/**
+ * 向 CodeX 已有会话发送继续对话消息。
+ * 流程：通过公开 HTTP POST 调用本机 sidecar，sidecar 再委托 Rust 通过 CodeX Desktop 原生 composer 提交。
+ * 参数：threadId 为当前选中的真实会话 ID，request 为正文和图片附件。
+ * 返回：服务端发送状态。
+ * 异常：鉴权、会话不存在、输入框不可用或发送不确定时透传稳定错误；调用方不得对不确定错误自动重发。
+ */
+export async function sendCodexThreadMessage(
+    threadId: string,
+    request: CodexThreadSendMessageRequestModel
+): Promise<CodexThreadSendMessageResponseModel> {
+    const payload: CodexThreadSendMessageRequestModel = {
+        content: request.content.trim(),
+        attachments: request.attachments ?? []
+    };
+    return requestPublicApi<CodexThreadSendMessageResponseModel>(
+        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages`,
+        {
+            method: 'POST',
+            payload,
+            timeoutMs: 30_000
+        }
+    );
+}
+
+/**
+ * 判断未知对象是否为 CodeX 会话 SSE 事件。
+ * 流程：只校验前端合并所需的公共字段，避免把协议异常对象写入消息区。
+ * 参数：value 为从 SSE data 中解析出的 JSON 值。
+ * 返回：满足当前事件联合类型时返回 true。
+ * 边界：额外字段允许存在，以兼容后续服务端扩展。
+ */
+function isCodexThreadStreamEvent(value: unknown): value is CodexThreadStreamEventModel {
+    if (!value || typeof value !== 'object') return false;
+    const record = value as Record<string, unknown>;
+    return typeof record.seq === 'number' && typeof record.threadId === 'string' && typeof record.type === 'string';
+}
+
+/**
+ * 解析一段 SSE 原始事件块。
+ * 流程：拼接所有 data 行并按 JSON 解析，再用类型守卫限制为 CodeX 会话事件。
+ * 参数：chunk 为以空行分隔出的单个 SSE 事件块。
+ * 返回：合法事件返回模型，否则返回 null。
+ * 边界：heartbeat、snapshot 和后续 messageDelta 共用同一解析入口。
+ */
+function parseCodexThreadSseChunk(chunk: string): CodexThreadStreamEventModel | null {
+    const dataText = chunk
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n');
+    if (!dataText) return null;
+    try {
+        const event = JSON.parse(dataText) as unknown;
+        return isCodexThreadStreamEvent(event) ? event : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 订阅 CodeX 会话 SSE。
+ * 流程：使用 fetch readable stream 携带 Bearer Token 和 X-Request-Id，逐块解析 SSE 并回调类型化事件。
+ * 参数：threadId 为真实会话 ID，signal 用于页面切换或卸载时取消连接，onEvent 接收 snapshot/heartbeat/delta。
+ * 返回：流正常结束 Promise。
+ * 异常：HTTP 非 2xx、服务不可达或读取失败时抛出用户可读错误；AbortError 由调用方按取消处理。
+ */
+export async function streamCodexThreadEvents(
+    threadId: string,
+    signal: AbortSignal,
+    onEvent: CodexThreadStreamEventHandler
+): Promise<void> {
+    const requestId = createPublicApiRequestId();
+    const publicApiToken = await getPublicApiToken();
+    const headers: Record<string, string> = {
+        Accept: 'text/event-stream',
+        'X-Request-Id': requestId
+    };
+    if (publicApiToken) headers.Authorization = `Bearer ${publicApiToken}`;
+    const response = await fetch(
+        `${PUBLIC_API_BASE_URL}/v1/codex/threads/${encodeURIComponent(threadId)}/stream?windowSize=200`,
+        {
+            method: 'GET',
+            headers,
+            cache: 'no-store',
+            signal
+        }
+    );
+    if (!response.ok) {
+        throw new Error(`会话流连接失败（HTTP ${response.status}，请求 ID：${requestId}）`);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error(`会话流响应不可读取（请求 ID：${requestId}）`);
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let shouldRead = true;
+    while (shouldRead) {
+        const { done, value } = await reader.read();
+        if (done) {
+            shouldRead = false;
+            break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split(/\r?\n\r?\n/);
+        buffer = chunks.pop() ?? '';
+        for (const chunk of chunks) {
+            const event = parseCodexThreadSseChunk(chunk);
+            if (event) onEvent(event);
+        }
+    }
+    const tail = decoder.decode();
+    if (tail) buffer += tail;
+    const finalEvent = parseCodexThreadSseChunk(buffer);
+    if (finalEvent) onEvent(finalEvent);
+}
+
+/**
  * 读取任务管理真实工作区数据。
  * 流程：通过 HTTP 从 Rust 权威任务库读取项目、任务和会话，前端不推断状态。
  * 参数：projectId 为可选项目 ID。
@@ -1112,6 +1306,112 @@ export async function queueSessionTask(taskId: string): Promise<SessionWorkspace
 export async function completeSessionTask(taskId: string): Promise<SessionWorkspaceDataModel> {
     return requestPublicApi<SessionWorkspaceDataModel>(`/v1/tasks/${encodeURIComponent(taskId)}/complete`, {
         method: 'POST'
+    });
+}
+
+/**
+ * 读取我的应用列表。
+ * 流程：通过公共 HTTP 服务请求 `/v1/my-apps`，由 Rust 返回配置、访问地址和服务状态。
+ * 参数：无。
+ * 返回：我的应用列表。
+ * 异常：HTTP、鉴权、私有桥接或配置读取失败时透传稳定错误码和 requestId。
+ */
+export async function listMyApps(): Promise<MyAppModel[]> {
+    return requestPublicApi<MyAppModel[]>('/v1/my-apps', { method: 'GET', timeoutMs: 5_000 });
+}
+
+/**
+ * 自动分配我的应用端口。
+ * 流程：通过 HTTP 请求 Rust 在固定端口段查找当前可绑定端口。
+ * 参数：无。
+ * 返回：当前检测可用端口。
+ * 异常：没有可用端口或 HTTP 服务不可用时透传错误。
+ */
+export async function allocateMyAppPort(): Promise<MyAppPortResponseModel> {
+    return requestPublicApi<MyAppPortResponseModel>('/v1/my-apps/allocate-port', {
+        method: 'POST',
+        timeoutMs: 5_000
+    });
+}
+
+/**
+ * 创建我的应用。
+ * 流程：只通过公共 HTTP 提交表单和可选 zip data URL，Rust 负责落盘、解压和服务启动。
+ * 参数：request 为新增应用配置。
+ * 返回：创建后的应用列表项。
+ * 异常：字段、zip、端口、URL 或本地服务启动失败时透传错误。
+ */
+export async function createMyApp(request: CreateMyAppRequestModel): Promise<MyAppModel> {
+    return requestPublicApi<MyAppModel>('/v1/my-apps', {
+        method: 'POST',
+        payload: request,
+        timeoutMs: 70_000
+    });
+}
+
+/**
+ * 修改我的应用。
+ * 流程：通过 HTTP 路径传应用 ID，正文传新配置；端口或 zip 变化由 Rust 原子处理。
+ * 参数：request 为编辑后的完整配置。
+ * 返回：更新后的应用列表项。
+ * 异常：应用不存在、端口冲突、zip 无效或服务启动失败时透传错误。
+ */
+export async function updateMyApp(request: UpdateMyAppRequestModel): Promise<MyAppModel> {
+    return requestPublicApi<MyAppModel>(`/v1/my-apps/${encodeURIComponent(request.id)}/update`, {
+        method: 'POST',
+        payload: {
+            name: request.name,
+            logoDataUrl: request.logoDataUrl,
+            accessType: request.accessType,
+            port: request.port,
+            remoteUrl: request.remoteUrl,
+            publicSubdomain: request.publicSubdomain,
+            zipDataUrl: request.zipDataUrl
+        },
+        timeoutMs: 70_000
+    });
+}
+
+/**
+ * 删除我的应用。
+ * 流程：通过 HTTP 请求 Rust 停止受管服务、删除记录和本地站点目录。
+ * 参数：appId 为待删除应用 ID。
+ * 返回：删除完成 Promise。
+ * 异常：应用不存在、服务停止或文件删除失败时透传错误。
+ */
+export async function deleteMyApp(appId: string): Promise<void> {
+    await requestPublicApi<{ ok: true }>(`/v1/my-apps/${encodeURIComponent(appId)}/delete`, {
+        method: 'POST',
+        timeoutMs: 20_000
+    });
+}
+
+/**
+ * 启动或重启我的应用本地服务。
+ * 流程：通过 HTTP 请求 Rust 停止当前受管线程并按固定端口重新启动。
+ * 参数：appId 为本地托管应用 ID。
+ * 返回：最新应用列表项。
+ * 异常：远程 URL、站点目录缺失或端口被占用时透传错误。
+ */
+export async function restartMyApp(appId: string): Promise<MyAppModel> {
+    return requestPublicApi<MyAppModel>(`/v1/my-apps/${encodeURIComponent(appId)}/start`, {
+        method: 'POST',
+        timeoutMs: 20_000
+    });
+}
+
+/**
+ * 打开我的应用。
+ * 流程：通过 HTTP 请求 Rust 使用 CodexMan 新窗口或默认浏览器打开；本地应用先确保服务已启动。
+ * 参数：appId 为应用 ID，target 为打开目标。
+ * 返回：打开完成 Promise。
+ * 异常：服务启动失败或 URL 无效时透传错误。
+ */
+export async function openMyApp(appId: string, target: MyAppOpenTargetType): Promise<void> {
+    await requestPublicApi<{ ok: true }>(`/v1/my-apps/${encodeURIComponent(appId)}/open`, {
+        method: 'POST',
+        payload: { target },
+        timeoutMs: 20_000
     });
 }
 
