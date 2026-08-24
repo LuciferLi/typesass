@@ -278,6 +278,29 @@ export interface CodexThreadMessagesResponseModel {
     range: CodexThreadMessageRangeModel;
 }
 
+/** CodeX 已有会话继续发送状态。 */
+export type CodexThreadSendMessageStatusType = 'sent' | 'queued';
+
+/** CodeX 已有会话继续发送请求。 */
+export interface CodexThreadSendMessageRequestModel {
+    /** 要发送到目标会话的正文；存在图片附件时允许为空。 */
+    content: string;
+    /** 随消息发送给 CodeX 的图片附件，最多 4 张。 */
+    attachments?: SessionTaskAttachmentModel[];
+}
+
+/** CodeX 已有会话继续发送响应。 */
+export interface CodexThreadSendMessageResponseModel {
+    /** CodeX thread 稳定 ID。 */
+    threadId: string;
+    /** 发送状态；首版服务端只返回 sent，queued 预留给后续持久队列。 */
+    status: CodexThreadSendMessageStatusType;
+    /** 服务端持久队列消息 ID；首版为空。 */
+    queuedMessageId: string | null;
+    /** 面向用户的安全说明。 */
+    message: string;
+}
+
 /** CodeX 会话 SSE snapshot 事件。 */
 export interface CodexThreadSnapshotEventModel {
     /** SSE 增量事件序号。 */

@@ -45,6 +45,8 @@ from .models import (
     CodexThreadMessagesResponse,
     CodexThreadResponse,
     CodexThreadSearchRequest,
+    CodexThreadSendMessageRequest,
+    CodexThreadSendMessageResponse,
     CodexWorkspaceResponse,
     MyAppCreateRequest,
     MyAppOpenRequest,
@@ -1597,6 +1599,12 @@ CODEX_THREAD_MESSAGES_EXAMPLE = {
         "hasMoreAfter": False,
     },
 }
+CODEX_THREAD_SEND_MESSAGE_EXAMPLE = {
+    "threadId": "0198f25a-1111-7000-8000-000000000001",
+    "status": "sent",
+    "queuedMessageId": None,
+    "message": "已发送",
+}
 WORKSPACE_DATA_EXAMPLE = {
     "projects": [
         {
@@ -1744,6 +1752,37 @@ CODEX_THREAD_MESSAGES_ERROR_CODES = {
             "code": "VALIDATION_ERROR",
             "retryable": False,
             "action": "修正 threadId、beforeMessageOrder 或 limit 参数。",
+        }
+    ],
+    **CODEX_LIST_ERROR_CODES,
+}
+CODEX_THREAD_SEND_MESSAGE_ERROR_CODES = {
+    "400": [
+        *CODEX_OPEN_ERROR_CODES["400"],
+        {
+            "code": "CODEX_COMPOSER_NOT_READY",
+            "retryable": True,
+            "action": "确认 CodeX Desktop 已打开目标会话且输入框可用后重试；不要在不确定错误后自动重放。",
+        },
+        {
+            "code": "CODEX_THREAD_MISMATCH",
+            "retryable": False,
+            "action": "刷新会话列表和详情后重新选择目标 thread，禁止继续向旧目标发送。",
+        },
+    ],
+    "404": CODEX_OPEN_ERROR_CODES["404"],
+    "409": [
+        {
+            "code": "CODEX_THREAD_SEND_UNCERTAIN",
+            "retryable": False,
+            "action": "发送可能已经越过 Enter 边界；先读取会话详情确认是否已出现该消息，禁止自动重放。",
+        }
+    ],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "修正 threadId、正文长度或额外字段。",
         }
     ],
     **CODEX_LIST_ERROR_CODES,
@@ -2842,6 +2881,55 @@ async def read_codex_thread_messages(
         {"threadId": thread_id, "beforeMessageOrder": before_message_order, "limit": limit},
     )
     return build_codex_thread_messages_response(raw_detail, limit, before_message_order)
+
+
+@app.post(
+    "/v1/codex/threads/{threadId}/messages",
+    response_model=CodexThreadSendMessageResponse,
+    responses=private_route_responses(
+        CODEX_THREAD_SEND_MESSAGE_EXAMPLE, CODEX_THREAD_SEND_MESSAGE_ERROR_CODES
+    ),
+    dependencies=[Depends(require_api_access)],
+    tags=["会话管理"],
+    summary="向 CodeX 已有会话发送消息",
+    description=(
+        "通过本机 Rust 桥接控制 CodeX Desktop 原生 composer，向指定已有 thread 继续发送一条文本消息。"
+        "首版服务端不提供跨重启持久排队；调用方收到不确定错误后必须先读取会话详情确认，禁止自动重放。"
+    ),
+    openapi_extra=private_route_openapi(CODEX_THREAD_SEND_MESSAGE_ERROR_CODES),
+)
+async def send_codex_thread_message(
+    request: Request,
+    thread_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="threadId",
+            description="从会话搜索结果取得的 CodeX thread 稳定 ID。",
+            examples=["0198f25a-1111-7000-8000-000000000001"],
+        ),
+    ],
+    payload: CodexThreadSendMessageRequest,
+) -> CodexThreadSendMessageResponse:
+    """向 CodeX 已有会话发送消息。
+
+    流程：Bearer 鉴权和请求体校验完成后，仅把 threadId 与正文交给 Rust 私有 RPC；Python 不读取本机 JSONL 或操作 DOM。
+    参数：``thread_id`` 为真实 thread ID；``payload`` 为继续对话正文。
+    返回：发送状态响应。
+    异常边界：正文、授权码、WebSocket 和本机路径均不写日志；Rust 返回不确定状态时按统一错误 envelope 暴露。
+    """
+
+    raw_result = await _call_private(
+        request,
+        "sendCodexThreadMessage",
+        {
+            "threadId": thread_id,
+            "content": payload.content,
+            "attachments": [
+                attachment.model_dump(by_alias=True) for attachment in payload.attachments
+            ],
+        },
+    )
+    return CodexThreadSendMessageResponse.model_validate(raw_result)
 
 
 @app.get(

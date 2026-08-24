@@ -429,6 +429,72 @@ class CodexThreadMessagesResponse(BaseModel):
     range: CodexThreadMessageRangeResponse = Field(description="当前消息窗口范围。")
 
 
+class CodexThreadSendMessageRequest(StrictRequestModel):
+    """CodeX 已有会话继续发送请求。
+
+    流程：公网或本机调用方提交正文和图片附件后由 Python 严格校验，再委托 Rust 通过 CodeX Desktop 原生 composer 发送。
+    边界：正文和附件不能同时为空；mode 仅兼容早期调用方的排队语义，首版实际排队仍由前端运行态完成。
+    """
+
+    content: str = Field(
+        default="",
+        max_length=50_000,
+        description="要发送到目标 CodeX 会话的继续对话正文；有图片附件时允许为空。",
+        examples=["继续帮我优化右侧会话详情输入框。"],
+    )
+    attachments: List[TaskAttachmentRequest] = Field(
+        default_factory=list,
+        max_length=4,
+        description="随消息发送给 CodeX 的图片附件，最多 4 张；附件不会拼入正文。",
+        examples=[[]],
+    )
+    mode: Literal["queueWhenRunning"] = Field(
+        default="queueWhenRunning",
+        description="运行中会话的排队策略；当前用于兼容早期请求体，服务端首版不做跨重启持久队列。",
+        examples=["queueWhenRunning"],
+    )
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def normalize_optional_attachments(cls, value: object) -> object:
+        """兼容旧调用方传入的空附件。
+
+        流程：早期前端或外部调用方可能把无附件序列化为 ``null``，这里统一收敛为空数组后继续执行严格列表校验。
+        参数：``value`` 为原始 attachments 字段。
+        返回：空数组或原值。
+        边界：非 ``null`` 的非法结构仍交给 Pydantic 拒绝，避免吞掉真实字段错误。
+        """
+
+        if value is None:
+            return []
+        return value
+
+
+class CodexThreadSendMessageResponse(BaseModel):
+    """CodeX 已有会话继续发送响应。
+
+    流程：sent 表示 Rust 已经通过 CodeX Desktop 执行一次 Enter；queued 保留给后续持久队列扩展。
+    边界：发送不确定时接口抛出错误 envelope，不返回 sent，调用方不得自动重放正文。
+    """
+
+    thread_id: str = Field(
+        alias="threadId",
+        description="CodeX thread 稳定 ID。",
+        examples=["0198f25a-1111-7000-8000-000000000001"],
+    )
+    status: Literal["sent", "queued"] = Field(
+        description="消息提交状态；首版服务端只返回 sent。",
+        examples=["sent"],
+    )
+    queued_message_id: Optional[str] = Field(
+        default=None,
+        alias="queuedMessageId",
+        description="持久队列消息 ID；首版没有服务端持久队列，发送成功时为空。",
+        examples=[None],
+    )
+    message: str = Field(description="面向调用方的安全说明。", examples=["已发送"])
+
+
 class CodexConnectionResponse(BaseModel):
     """CodeX Desktop 本机连接状态响应。
 

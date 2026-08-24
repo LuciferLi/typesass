@@ -46,7 +46,7 @@ use public_api_tunnel::{
 use sidecar::RuntimeSidecar;
 use task_store::{
     CreateProjectRequest, CreateTaskRequest, CreateTaskResponse, RunningTaskRecord,
-    UpdateProjectRequest, WorkspaceDataResponse,
+    TaskAttachmentRecord, UpdateProjectRequest, WorkspaceDataResponse,
 };
 use web_server::RuntimeWebServer;
 
@@ -105,6 +105,8 @@ const LOCAL_CONFIG_WATCH_INTERVAL_MS: u64 = 500;
 const CODEX_THREAD_LIST_LIMIT: usize = 60;
 /// 会话详情内部保留的结构化消息上限；工具调用拆块后数量会明显增加，需要高于前端默认窗口。
 const CODEX_THREAD_MESSAGE_LIMIT: usize = 200;
+/// 已有会话单次继续对话文本字符上限；公开 API 与 CDP 提交前共同按该值拒绝异常大输入。
+const CODEX_THREAD_SEND_CONTENT_MAX_CHARS: usize = 50_000;
 const CODEX_MESSAGE_CONTENT_MAX_CHARS: usize = 6000;
 /// 任务结果中最终助手文本字符上限；按最坏 JSON 转义后仍低于 task_store 的 32 KiB 结果上限。
 const CODEX_TASK_RESULT_TEXT_MAX_CHARS: usize = 4000;
@@ -145,6 +147,8 @@ const CODEX_APP_SERVER_STDERR_RECORD_MAX_BYTES: usize = 64 * 1024;
 const CODEX_APP_SERVER_DIAGNOSTIC_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Codex app-server 诊断日志写锁；串行化 stderr 与 stdout 协议错误的轮转和追加。
 static CODEX_APP_SERVER_DIAGNOSTIC_LOG_LOCK: Mutex<()> = Mutex::new(());
+/// 已有会话发送写锁；Codex Desktop 只有一个可见 composer，同进程必须串行化所有继续对话提交。
+static CODEX_THREAD_SEND_LOCK: Mutex<()> = Mutex::new(());
 /// 当前进程只执行一次的诊断日志初始化，确保旧版可能写入的原始 stderr 不会继续留在磁盘。
 static CODEX_APP_SERVER_DIAGNOSTIC_LOG_INITIALIZE: Once = Once::new();
 /// 活跃 turn 的只读对账间隔；短任务完成后最多约一秒刷新到待验收。
@@ -1726,6 +1730,31 @@ pub(crate) struct CodexThreadDetail {
     updated_at: String,
     /// 从 JSONL 中抽取出的最近用户和助手消息。
     messages: Vec<CodexThreadMessage>,
+}
+
+/// 已有 CodeX 会话继续发送请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexThreadSendMessageRequest {
+    /// 要发送到目标会话的正文；正文和附件不能同时为空。
+    pub(crate) content: String,
+    /// 随消息发送给 CodeX 的图片附件；复用任务附件结构和校验边界。
+    #[serde(default)]
+    pub(crate) attachments: Vec<TaskAttachmentRecord>,
+}
+
+/// 已有 CodeX 会话继续发送响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexThreadSendMessageResponse {
+    /// CodeX thread 稳定 ID，必须与请求路径中的 threadId 一致。
+    thread_id: String,
+    /// 发送状态；首版 Rust 入口只返回 sent，运行中 queued 由前端运行态处理。
+    status: String,
+    /// 当前没有持久化队列，发送成功时为空。
+    queued_message_id: Option<String>,
+    /// 面向用户的安全说明。
+    message: String,
 }
 
 /// 前端读取 CodeX 会话列表时提交的分页筛选参数。
@@ -4489,6 +4518,66 @@ pub(crate) fn read_codex_thread_messages_core(
     }
     run_codex_app_server_thread_detail(normalized_id)
         .map_err(|error| format!("读取 Codex 会话详情失败：{}", trim_error_message(&error)))
+}
+
+/// 向真实 CodeX 已有会话发送一条继续对话消息。
+/// 流程：校验 threadId 和正文边界，确认本地会话存在，在进程内串行持有 composer 写锁后调用 CDP 精确提交。
+/// 参数：thread_id 为搜索接口返回的真实 CodeX thread ID；request 为继续对话正文。
+/// 返回：发送状态响应，sent 表示已越过 Codex Desktop Enter 提交动作。
+/// 异常/边界：正文不会写入日志；Enter 后协议失败返回不确定错误，调用方禁止自动重放。
+pub(crate) fn send_codex_thread_message_core(
+    thread_id: String,
+    request: CodexThreadSendMessageRequest,
+) -> Result<CodexThreadSendMessageResponse, String> {
+    let normalized_id = thread_id.trim();
+    if normalized_id.is_empty() {
+        return Err("会话 ID 不能为空（错误码：INVALID_THREAD_ID）".to_string());
+    }
+    validate_codex_thread_id(normalized_id)?;
+    ensure_codex_thread_exists(normalized_id)?;
+    let content = request.content.trim();
+    let attachments = task_store::validate_task_attachments(request.attachments)?;
+    if content.is_empty() && attachments.is_empty() {
+        return Err("消息内容或图片附件不能为空（错误码：VALIDATION_ERROR）".to_string());
+    }
+    if content.chars().count() > CODEX_THREAD_SEND_CONTENT_MAX_CHARS {
+        return Err("消息内容超过发送上限（错误码：VALIDATION_ERROR）".to_string());
+    }
+    let _guard = CODEX_THREAD_SEND_LOCK.lock().map_err(|_| {
+        "CodeX 会话发送锁不可用（错误码：CODEX_THREAD_SEND_LOCK_FAILED）".to_string()
+    })?;
+    let receipt = codex_cdp::submit_existing_thread_message(
+        normalized_id,
+        content,
+        &attachments,
+        |_watermark| Ok(()),
+    );
+    match receipt {
+        Ok(receipt) => {
+            let returned_thread_id = receipt
+                .thread_id
+                .as_deref()
+                .unwrap_or(normalized_id)
+                .trim()
+                .trim_start_matches("local:");
+            if returned_thread_id != normalized_id {
+                return Err(
+                    "Codex Desktop 目标会话不一致（错误码：CODEX_THREAD_MISMATCH）".to_string(),
+                );
+            }
+            Ok(CodexThreadSendMessageResponse {
+                thread_id: normalized_id.to_string(),
+                status: "sent".to_string(),
+                queued_message_id: None,
+                message: "已发送".to_string(),
+            })
+        }
+        Err(failure) if failure.submission_uncertain => Err(format!(
+            "{}（错误码：CODEX_THREAD_SEND_UNCERTAIN）",
+            failure.message
+        )),
+        Err(failure) => Err(format!("{}（错误码：{}）", failure.message, failure.code)),
+    }
 }
 
 /// 归一化会话详情窗口大小。
