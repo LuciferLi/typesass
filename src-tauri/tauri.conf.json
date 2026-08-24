@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CodexMan",
-  "version": "0.1.22",
+  "version": "0.1.27",
   "identifier": "asia.aijob.aitool",
   "build": {
     "beforeDevCommand": "npm run dev:frontend",
@@ -117,7 +117,8 @@
       "binaries/codexman-ai-sidecar"
     ],
     "resources": [
-      "../dist"
+      "../dist",
+      "resources/frpc"
     ],
     "macOS": {
       "signingIdentity": "Developer ID Application: Tamba Trading Co., Ltd. (9VKQ2P8P6N)",

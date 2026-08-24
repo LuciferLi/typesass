@@ -474,9 +474,12 @@ export const useSessionManageStore = defineStore('sessionManage', {
             }
             try {
                 const offset = reset ? 0 : this.codexThreadOffset;
+                const limit = reset
+                    ? Math.max(CODEX_THREAD_PAGE_SIZE, this.codexThreadOffset || CODEX_THREAD_PAGE_SIZE)
+                    : CODEX_THREAD_PAGE_SIZE;
                 const threads = await listCodexThreads({
                     workspaceCwd: workspacePath,
-                    limit: CODEX_THREAD_PAGE_SIZE,
+                    limit,
                     offset,
                     keyword: this.codexThreadKeyword
                 });

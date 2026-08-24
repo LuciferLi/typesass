@@ -93,6 +93,443 @@ pub(crate) struct CodexCdpFailure {
     pub(crate) submission_uncertain: bool,
 }
 
+/// 通过 Codex Desktop 主 renderer 向已存在会话提交一条文本或图片消息。
+/// 流程：打开目标 `/local/{threadId}` 路由，精确确认活动会话和唯一 composer，上传图片附件，写入并校验正文后只按一次 Enter。
+/// 参数：thread_id 为已由上层校验存在的 CodeX 会话 ID，prompt 为待发送正文，attachments 为图片附件，before_enter 用于在越过发送边界前持久化调用方状态。
+/// 返回：Enter 前时间水位；已有会话不需要恢复新 thread ID，因此回执中的 threadId 固定为目标会话。
+/// 异常/边界：路由、输入框、正文校验失败均发生在 Enter 前；Enter 后任何协议失败都标记为不确定，调用方禁止自动重放。
+pub(crate) fn submit_existing_thread_message<F>(
+    thread_id: &str,
+    prompt: &str,
+    attachments: &[TaskAttachmentRecord],
+    before_enter: F,
+) -> Result<CodexSubmissionReceipt, CodexCdpFailure>
+where
+    F: FnOnce(i64) -> Result<(), String>,
+{
+    if thread_id.trim().is_empty() || (prompt.trim().is_empty() && attachments.is_empty()) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_INPUT_INVALID",
+            "Codex Desktop 提交参数无效。",
+        ));
+    }
+    if prompt.len() > CDP_PROMPT_MAX_BYTES {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_PROMPT_TOO_LARGE",
+            "消息内容超过 Codex Desktop 提交上限。",
+        ));
+    }
+    let mut session = CdpSession::connect()?;
+    session.request(1, "Runtime.enable", json!({}), false)?;
+    session.request(9_000, "Page.bringToFront", json!({}), false)?;
+    let thread_id_json = serde_json::to_string(thread_id).map_err(|_| {
+        pre_submission_failure("CODEX_CDP_INPUT_INVALID", "无法准备 Codex Desktop 会话。")
+    })?;
+    let navigation_result = session.evaluate(
+        2,
+        &format!(
+            r#"(() => {{
+                const targetThreadId = {thread_id_json};
+                const bridge = window.electronBridge;
+                if (!bridge || typeof bridge.sendMessageFromView !== 'function') return false;
+                window.postMessage({{
+                    type: 'navigate-to-route',
+                    path: `/local/${{targetThreadId}}`,
+                    state: {{ focusComposerNonce: Date.now() }}
+                }}, window.location.origin);
+                return true;
+            }})()"#
+        ),
+        false,
+    )?;
+    if navigation_result.as_bool() != Some(true) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_THREAD_NAVIGATION_FAILED",
+            "Codex Desktop 未确认会话切换。",
+        ));
+    }
+    let mut composer_ready = false;
+    for attempt in 0..COMPOSER_READY_ATTEMPTS {
+        let result = session.evaluate(
+            10 + attempt as u64,
+            &format!(
+                r#"(() => {{
+                    const targetThreadId = {thread_id_json};
+                    const normalizeThreadId = (value) => String(value || '').replace(/^local:/, '');
+                    const routeMatch = window.location.pathname.match(/^\/local\/([^/?#]+)/);
+                    const active = document.querySelector('[data-app-action-sidebar-thread-active="true"]');
+                    const activeThreadId = normalizeThreadId(active?.getAttribute('data-app-action-sidebar-thread-id') || routeMatch?.[1] || '');
+                    if (activeThreadId !== targetThreadId) return {{ ok: false, reason: 'thread-mismatch', activeThreadId }};
+                    const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                      .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                    if (composers.length !== 1) return {{ ok: false, reason: 'composer-count', count: composers.length }};
+                    const composer = composers[0];
+                    const disabled = composer.getAttribute('aria-disabled') === 'true'
+                      || composer.closest('[aria-disabled="true"]')
+                      || composer.matches('[disabled]');
+                    if (disabled) return {{ ok: false, reason: 'composer-disabled' }};
+                    if ((composer.textContent || '').trim() !== '') return {{ ok: false, reason: 'composer-not-empty' }};
+                    composer.focus();
+                    return {{ ok: document.activeElement === composer, reason: 'ready' }};
+                }})()"#
+            ),
+            false,
+        )?;
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            composer_ready = true;
+            break;
+        }
+        std::thread::sleep(COMPOSER_READY_INTERVAL);
+    }
+    if !composer_ready {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_COMPOSER_NOT_READY",
+            "Codex Desktop 目标会话输入框未在限定时间内就绪。",
+        ));
+    }
+    prepare_composer_attachments(&mut session, attachments)?;
+    if !prompt.trim().is_empty() {
+        if let Err(failure) =
+            session.request(60, "Input.insertText", json!({"text": prompt}), false)
+        {
+            return Err(if session.clear_composer().is_ok() {
+                failure
+            } else {
+                protocol_failure_at(true, "existing composer cleanup failed after insert error")
+            });
+        }
+    }
+    let prompt_json = serde_json::to_string(prompt).map_err(|_| {
+        pre_submission_failure(
+            "CODEX_CDP_INPUT_INVALID",
+            "无法校验 Codex Desktop 消息内容。",
+        )
+    })?;
+    let expected_attachment_count = attachments.len();
+    let composer_check = session.evaluate(
+        61,
+        &format!(
+            r#"(() => {{
+                const targetThreadId = {thread_id_json};
+                const expectedAttachmentCount = {expected_attachment_count};
+                const normalizeThreadId = (value) => String(value || '').replace(/^local:/, '');
+                const routeMatch = window.location.pathname.match(/^\/local\/([^/?#]+)/);
+                const active = document.querySelector('[data-app-action-sidebar-thread-active="true"]');
+                const activeThreadId = normalizeThreadId(active?.getAttribute('data-app-action-sidebar-thread-id') || routeMatch?.[1] || '');
+                const readComposerText = (composer) => {{
+                    const blocks = Array.from(composer.childNodes)
+                      .filter((node) => node instanceof HTMLElement && (node.matches('p,div') || node.getClientRects().length > 0));
+                    if (blocks.length === 0) return composer.textContent || '';
+                    return blocks.map((block) => block.textContent || '').join('\n');
+                }};
+                const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                  .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                const attachmentImages = document.querySelectorAll(
+                  'img[src^="blob:"], img[src^="app://fs/"], '
+                  + '.composer-attachment-surface img[alt="User attachment"], '
+                  + '.composer-attachment-surface img[alt="用户附件"]'
+                ).length;
+                return activeThreadId === targetThreadId
+                  && composers.length === 1
+                  && readComposerText(composers[0]) === {prompt_json}
+                  && attachmentImages >= expectedAttachmentCount;
+            }})()"#
+        ),
+        false,
+    );
+    if !matches!(composer_check, Ok(Value::Bool(true))) {
+        if session.clear_composer().is_err() {
+            return Err(protocol_failure_at(
+                true,
+                "existing composer cleanup failed after write check",
+            ));
+        }
+        return Err(pre_submission_failure(
+            "CODEX_CDP_COMPOSER_WRITE_FAILED",
+            "Codex Desktop 输入框未确认完整消息内容。",
+        ));
+    }
+    let submitted_at_ms = current_unix_millis();
+    if before_enter(submitted_at_ms).is_err() {
+        return Err(if session.clear_composer().is_ok() {
+            pre_submission_failure(
+                "CODEX_CDP_SUBMISSION_PERSIST_FAILED",
+                "无法在发送前持久化 Codex Desktop 提交阶段。",
+            )
+        } else {
+            protocol_failure_at(true, "existing composer cleanup failed after persist error")
+        });
+    }
+    session.evaluate(
+        62,
+        &format!(
+            r#"(() => {{
+                const targetThreadId = {thread_id_json};
+                const normalizeThreadId = (value) => String(value || '').replace(/^local:/, '');
+                const routeMatch = window.location.pathname.match(/^\/local\/([^/?#]+)/);
+                const active = document.querySelector('[data-app-action-sidebar-thread-active="true"]');
+                const activeThreadId = normalizeThreadId(active?.getAttribute('data-app-action-sidebar-thread-id') || routeMatch?.[1] || '');
+                const composers = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                  .filter((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                const composer = activeThreadId === targetThreadId && composers.length === 1 ? composers[0] : null;
+                if (!composer) return false;
+                composer.focus();
+                const range = document.createRange();
+                range.selectNodeContents(composer);
+                range.collapse(false);
+                const selection = window.getSelection();
+                selection?.removeAllRanges();
+                selection?.addRange(range);
+                return document.activeElement === composer;
+            }})()"#
+        ),
+        true,
+    )?;
+    session.request(
+        63,
+        "Input.dispatchKeyEvent",
+        json!({
+            "type": "rawKeyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 36,
+            "macCharCode": 13,
+            "unmodifiedText": "\r",
+            "text": "\r"
+        }),
+        true,
+    )?;
+    session.request(
+        64,
+        "Input.dispatchKeyEvent",
+        json!({
+            "type": "keyUp",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 36
+        }),
+        true,
+    )?;
+    Ok(CodexSubmissionReceipt {
+        submitted_at_ms,
+        thread_id: Some(thread_id.to_string()),
+    })
+}
+
+/// 准备当前 Codex composer 的图片附件。
+/// 流程：先清理已有图片预览，再为每个结构化附件写入临时文件，通过隐藏 file input 和拖拽事件交给原生 composer。
+/// 参数：session 为已连接并聚焦目标 renderer 的 CDP 会话；attachments 为已由业务层校验过的图片附件。
+/// 返回：无返回值，成功表示 composer 已出现不少于本次附件数量的图片预览。
+/// 异常/边界：不记录 data URL、临时路径或文件内容；上传失败发生在 Enter 前，可由调用方安全重试。
+fn prepare_composer_attachments(
+    session: &mut CdpSession,
+    attachments: &[TaskAttachmentRecord],
+) -> Result<(), CodexCdpFailure> {
+    let cleared_existing_attachments = session.evaluate(
+        51,
+        r#"(() => new Promise((resolve) => {
+            const composer = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+              .find((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+            if (!composer) {
+              resolve(false);
+              return;
+            }
+            const images = document.querySelectorAll(
+              '.composer-attachment-surface img[alt="User attachment"], '
+              + '.composer-attachment-surface img[alt="用户附件"], '
+              + 'img[src^="blob:"], img[src^="app://fs/"]'
+            );
+            for (const image of images) {
+              const surface = image.closest('.composer-attachment-surface[role="button"]');
+              const remove = surface?.querySelector('button[aria-label^="Remove"], button[aria-label^="移除"]');
+              remove?.click();
+            }
+            let attempts = 0;
+            const timer = setInterval(() => {
+              attempts += 1;
+              const remaining = document.querySelectorAll(
+                '.composer-attachment-surface img[alt="User attachment"], '
+                + '.composer-attachment-surface img[alt="用户附件"], '
+                + 'img[src^="blob:"], img[src^="app://fs/"]'
+              ).length;
+              if (remaining === 0 || attempts >= 20) {
+                clearInterval(timer);
+                resolve(remaining === 0);
+              }
+            }, 100);
+        }))()"#,
+        false,
+    )?;
+    if cleared_existing_attachments.as_bool() != Some(true) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex Desktop 当前输入框残留图片附件未清理完成。",
+        ));
+    }
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    let attachment_paths = attachments
+        .iter()
+        .map(write_attachment_temp_file)
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_id = format!("codexman-task-attachment-{}", uuid::Uuid::new_v4().simple());
+    let input_id_json = serde_json::to_string(&input_id)
+        .map_err(|_| protocol_failure_at(false, "attachment input id serialization failed"))?;
+    let prepared = session.evaluate(
+        59,
+        &format!(
+            r#"(() => new Promise((resolve) => {{
+                const inputId = {input_id_json};
+                const existing = document.getElementById(inputId);
+                if (existing) existing.remove();
+                const composer = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                  .find((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                if (!composer) {{
+                  resolve({{ ok: false, attachmentImagesBefore: 0 }});
+                  return;
+                }}
+                const attachmentImagesBefore = document.querySelectorAll(
+                  'img[src^="blob:"], img[src^="app://fs/"], '
+                  + '.composer-attachment-surface img[alt="User attachment"], '
+                  + '.composer-attachment-surface img[alt="用户附件"]'
+                ).length;
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.multiple = true;
+                input.id = inputId;
+                input.style.display = 'none';
+                document.body.append(input);
+                resolve({{ ok: true, attachmentImagesBefore }});
+            }}))()"#
+        ),
+        false,
+    )?;
+    if prepared.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex Desktop 当前输入框未找到可接收图片的区域。",
+        ));
+    }
+    let attachment_images_before = prepared
+        .get("attachmentImagesBefore")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| protocol_failure_at(false, "attachment count missing"))?;
+    session.request(58, "DOM.enable", json!({}), false)?;
+    let document_node_id = session
+        .request(56, "DOM.getDocument", json!({"depth": 0}), false)?
+        .pointer("/result/root/nodeId")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| protocol_failure_at(false, "attachment document node missing"))?;
+    let input_node_id = session
+        .request(
+            57,
+            "DOM.querySelector",
+            json!({
+                "nodeId": document_node_id,
+                "selector": format!("#{input_id}")
+            }),
+            false,
+        )?
+        .pointer("/result/nodeId")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| protocol_failure_at(false, "attachment input node missing"))?;
+    if input_node_id == 0 {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex Desktop 图片附件临时输入控件创建失败。",
+        ));
+    }
+    session.request(
+        55,
+        "DOM.setFileInputFiles",
+        json!({
+            "nodeId": input_node_id,
+            "files": attachment_paths
+        }),
+        false,
+    )?;
+    let dispatched = session.evaluate(
+        54,
+        &format!(
+            r#"(() => {{
+                const input = document.getElementById({input_id_json});
+                const composer = Array.from(document.querySelectorAll('[data-codex-composer="true"][contenteditable="true"]'))
+                  .find((element) => element instanceof HTMLElement && element.getClientRects().length > 0);
+                if (!input || !composer) return false;
+                const transfer = new DataTransfer();
+                for (const file of input.files) transfer.items.add(file);
+                if (transfer.files.length !== input.files.length || transfer.files.length === 0) return false;
+                const rect = composer.getBoundingClientRect();
+                const eventOptions = {{
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                  dataTransfer: transfer,
+                  shiftKey: true,
+                  clientX: Math.round(rect.left + rect.width / 2),
+                  clientY: Math.round(rect.top + rect.height / 2),
+                }};
+                composer.focus();
+                for (const type of ['dragenter', 'dragover', 'drop']) {{
+                  composer.dispatchEvent(new DragEvent(type, eventOptions));
+                }}
+                return true;
+            }})()"#
+        ),
+        false,
+    )?;
+    if dispatched.as_bool() != Some(true) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex Desktop 未接收图片附件拖拽事件。",
+        ));
+    }
+    let expected_attachment_count = attachment_images_before + attachments.len() as u64;
+    let confirmed = session.evaluate(
+        53,
+        &format!(
+            r#"(() => new Promise((resolve) => {{
+                const expected = {expected_attachment_count};
+                let attempts = 0;
+                const timer = setInterval(() => {{
+                  attempts += 1;
+                  const attachmentImages = document.querySelectorAll(
+                    'img[src^="blob:"], img[src^="app://fs/"], '
+                    + '.composer-attachment-surface img[alt="User attachment"], '
+                    + '.composer-attachment-surface img[alt="用户附件"]'
+                  ).length;
+                  const pending = document.body.innerText.includes('正在上传') || document.body.innerText.includes('Uploading');
+                  if ((attachmentImages >= expected && !pending) || attempts >= 50) {{
+                    clearInterval(timer);
+                    resolve(attachmentImages >= expected && !pending);
+                  }}
+                }}, 100);
+            }}))()"#
+        ),
+        false,
+    )?;
+    let _ = session.evaluate(
+        52,
+        &format!(
+            r#"(() => {{
+                document.getElementById({input_id_json})?.remove();
+                return true;
+            }})()"#
+        ),
+        false,
+    );
+    if confirmed.as_bool() != Some(true) {
+        return Err(pre_submission_failure(
+            "CODEX_CDP_ATTACHMENT_INPUT_MISSING",
+            "Codex Desktop 当前输入框未确认图片附件预览。",
+        ));
+    }
+    Ok(())
+}
+
 /// 通过 Codex Desktop 主 renderer 在精确工作空间创建原生新会话并按一次 Enter。
 /// 流程：通过受支持的 set-active bridge 让主进程选中项目；只读轮询全局状态精确确认 canonical root，点击项目行新聊天按钮创建空会话，写入前复核选择未变化，最后仅发送一次 Enter。
 /// 参数：workspace_path 为 canonical 工作目录，prompt 为任务正文；返回 Enter 前时间水位，真实 thread ID 必须由调用方以 UI/JSONL 双通道唯一恢复。

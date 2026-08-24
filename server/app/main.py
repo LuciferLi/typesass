@@ -4,14 +4,18 @@ import asyncio
 from contextlib import asynccontextmanager
 import hmac
 import ipaddress
+import json
 import logging
+import mimetypes
+import time
+from pathlib import Path as LocalPath
 from typing import Annotated, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, Path, Request
+from fastapi import Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import httpx
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -38,9 +42,17 @@ from .models import (
     ModelCatalogResponse,
     CodexConnectionResponse,
     CodexRestartAcceptedResponse,
+    CodexThreadMessagesResponse,
     CodexThreadResponse,
     CodexThreadSearchRequest,
+    CodexThreadSendMessageRequest,
+    CodexThreadSendMessageResponse,
     CodexWorkspaceResponse,
+    MyAppCreateRequest,
+    MyAppOpenRequest,
+    MyAppPortResponse,
+    MyAppResponse,
+    MyAppUpdateRequest,
     OperationResponse,
     ProjectWriteRequest,
     SafeBusinessId,
@@ -63,6 +75,7 @@ bearer_scheme = HTTPBearer(
     scheme_name="AppAccessToken",
     description="公网来源携带 App 系统设置页维护的授权码；开发环境可使用固定开发授权码。",
 )
+LOCAL_IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
 
 
 @asynccontextmanager
@@ -455,6 +468,76 @@ def _is_internal_origin(origin: str) -> bool:
     return address.is_private or address.is_loopback
 
 
+def _is_loopback_origin(origin: str) -> bool:
+    """判断来源是否为本机页面。
+
+    流程：解析 Origin 或 Referer，只有 localhost、127.0.0.1、::1 和 tauri.localhost 放行。
+    参数：``origin`` 为请求头中的来源地址。
+    返回：来源明确为本机时返回 True。
+    异常边界：非法、空字符串、私网 IP 或普通域名均不放行，避免本机图片预览接口被局域网网页复用。
+    """
+
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    return parsed.hostname in ("localhost", "127.0.0.1", "::1", "tauri.localhost")
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """判断请求 TCP 客户端是否来自本机。
+
+    流程：读取 ASGI client host 并按 IP 解析，只有 loopback 地址放行。
+    参数：``request`` 为当前 FastAPI 请求。
+    返回：客户端地址为 loopback 时返回 True。
+    异常边界：缺少 client、非法 IP 或局域网地址均不放行。
+    """
+
+    if request.client is None:
+        return False
+    try:
+        return ipaddress.ip_address(request.client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_local_image_preview_access(request: Request) -> None:
+    """校验本机图片预览接口访问权限。
+
+    流程：要求 TCP 客户端和 Origin/Referer 同时为本机来源，避免无鉴权图片标签暴露任意本地图片。
+    参数：``request`` 为当前 FastAPI 请求。
+    返回：校验通过无返回。
+    异常边界：浏览器图片请求通常不带 Authorization，因此本接口不复用 Bearer，但严格限制来源。
+    """
+
+    source = request.headers.get("origin", "").strip() or request.headers.get("referer", "").strip()
+    if not _is_loopback_client(request) or not _is_loopback_origin(source):
+        raise ApiError(401, "LOCAL_IMAGE_PREVIEW_FORBIDDEN", "本机图片预览只允许本机页面访问。")
+
+
+def resolve_local_image_preview_path(raw_path: str) -> LocalPath:
+    """解析并校验本机图片预览路径。
+
+    流程：解析绝对路径，限制在当前用户 home 目录内，并只允许常见图片后缀的真实文件。
+    参数：``raw_path`` 为前端从 Markdown 图片语法中提取的本机路径。
+    返回：通过校验的本机图片路径。
+    异常边界：非 home 目录、非图片、目录、缺失文件或符号链接逃逸均返回稳定错误。
+    """
+
+    try:
+        image_path = LocalPath(raw_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ApiError(404, "LOCAL_IMAGE_NOT_FOUND", "本机图片不存在。") from error
+    home_path = LocalPath.home().resolve()
+    try:
+        image_path.relative_to(home_path)
+    except ValueError as error:
+        raise ApiError(403, "LOCAL_IMAGE_PATH_FORBIDDEN", "本机图片路径不在允许范围内。") from error
+    if not image_path.is_file() or image_path.suffix.lower() not in LOCAL_IMAGE_PREVIEW_EXTENSIONS:
+        raise ApiError(415, "LOCAL_IMAGE_TYPE_UNSUPPORTED", "只支持预览常见图片文件。")
+    return image_path
+
+
 def _api_access_origin(request: Request) -> str:
     """读取业务接口来源标识。
 
@@ -601,6 +684,88 @@ async def health() -> HealthResponse:
     """
 
     return HealthResponse(ok=True, name="codexman-ai-api")
+
+
+@app.get(
+    "/v1/local-images/preview",
+    responses=build_error_responses(
+        {
+            401: ("本机图片预览只允许本机页面访问。", "LOCAL_IMAGE_PREVIEW_FORBIDDEN"),
+            403: ("本机图片路径不在允许范围内。", "LOCAL_IMAGE_PATH_FORBIDDEN"),
+            404: ("本机图片不存在。", "LOCAL_IMAGE_NOT_FOUND"),
+            415: ("只支持预览常见图片文件。", "LOCAL_IMAGE_TYPE_UNSUPPORTED"),
+        }
+    ),
+    tags=["基础"],
+    summary="预览本机 Markdown 图片",
+    description=(
+        "供 CodexMan 本机页面把会话 Markdown 中的本机图片路径渲染为图片。"
+        "接口不使用 Bearer Header，必须同时满足 TCP 客户端和来源页面均为本机，并且只返回当前用户 home 目录内的图片文件。"
+    ),
+    openapi_extra={
+        "parameters": [request_id_openapi_parameter()],
+        "x-error-codes": build_error_code_documentation(
+            {
+                "401": [
+                    {
+                        "code": "LOCAL_IMAGE_PREVIEW_FORBIDDEN",
+                        "retryable": False,
+                        "action": "只能从本机 localhost 或 Tauri 页面加载该图片预览地址。",
+                    }
+                ],
+                "403": [
+                    {
+                        "code": "LOCAL_IMAGE_PATH_FORBIDDEN",
+                        "retryable": False,
+                        "action": "只传入当前用户 home 目录内的图片绝对路径。",
+                    }
+                ],
+                "404": [
+                    {
+                        "code": "LOCAL_IMAGE_NOT_FOUND",
+                        "retryable": False,
+                        "action": "确认 Markdown 图片路径仍存在且当前用户可读取。",
+                    }
+                ],
+                "415": [
+                    {
+                        "code": "LOCAL_IMAGE_TYPE_UNSUPPORTED",
+                        "retryable": False,
+                        "action": "仅支持 png、jpg、jpeg、webp、gif、bmp、svg 图片。",
+                    }
+                ],
+            }
+        ),
+    },
+)
+async def preview_local_markdown_image(
+    request: Request,
+    image_path: Annotated[
+        str,
+        Query(
+            alias="path",
+            min_length=1,
+            max_length=4096,
+            description="Markdown 图片语法中的本机图片绝对路径。",
+        ),
+    ],
+) -> FileResponse:
+    """预览本机 Markdown 图片。
+
+    流程：先校验请求来自本机页面，再解析图片路径并以 no-store 方式返回文件。
+    参数：``request`` 为当前请求，``image_path`` 为 Markdown 中提取的本机图片路径。
+    返回：图片文件响应。
+    异常边界：不返回非图片文件、不允许 home 目录外路径、不记录或回显完整文件内容。
+    """
+
+    require_local_image_preview_access(request)
+    local_image_path = resolve_local_image_preview_path(image_path)
+    media_type = mimetypes.guess_type(str(local_image_path))[0] or "application/octet-stream"
+    return FileResponse(
+        local_image_path,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 ACCESS_TOKEN_RECORD_EXAMPLE = {
@@ -1409,6 +1574,37 @@ CODEX_THREAD_EXAMPLE = [
         "updatedAt": "1786406400000",
     }
 ]
+CODEX_THREAD_MESSAGES_EXAMPLE = {
+    "threadId": "0198f25a-1111-7000-8000-000000000001",
+    "title": "完善 HTTP 接口文档",
+    "updatedAt": "1786406400000",
+    "messages": [
+        {
+            "messageOrder": 1,
+            "role": "user",
+            "content": "请补齐接口文档。",
+            "createdAt": "1786406400000",
+        },
+        {
+            "messageOrder": 2,
+            "role": "assistant",
+            "content": "已补齐 HTTP 接口说明。",
+            "createdAt": "1786406400000",
+        },
+    ],
+    "range": {
+        "startMessageOrder": 1,
+        "endMessageOrder": 2,
+        "hasMoreBefore": False,
+        "hasMoreAfter": False,
+    },
+}
+CODEX_THREAD_SEND_MESSAGE_EXAMPLE = {
+    "threadId": "0198f25a-1111-7000-8000-000000000001",
+    "status": "sent",
+    "queuedMessageId": None,
+    "message": "已发送",
+}
 WORKSPACE_DATA_EXAMPLE = {
     "projects": [
         {
@@ -1544,6 +1740,49 @@ CODEX_OPEN_ERROR_CODES = {
             "code": "CODEX_THREAD_NOT_FOUND",
             "retryable": False,
             "action": "会话不存在或已归档；刷新 thread 搜索结果，禁止为未知 ID 构造打开请求。",
+        }
+    ],
+    **CODEX_LIST_ERROR_CODES,
+}
+CODEX_THREAD_MESSAGES_ERROR_CODES = {
+    "400": CODEX_OPEN_ERROR_CODES["400"],
+    "404": CODEX_OPEN_ERROR_CODES["404"],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "修正 threadId、beforeMessageOrder 或 limit 参数。",
+        }
+    ],
+    **CODEX_LIST_ERROR_CODES,
+}
+CODEX_THREAD_SEND_MESSAGE_ERROR_CODES = {
+    "400": [
+        *CODEX_OPEN_ERROR_CODES["400"],
+        {
+            "code": "CODEX_COMPOSER_NOT_READY",
+            "retryable": True,
+            "action": "确认 CodeX Desktop 已打开目标会话且输入框可用后重试；不要在不确定错误后自动重放。",
+        },
+        {
+            "code": "CODEX_THREAD_MISMATCH",
+            "retryable": False,
+            "action": "刷新会话列表和详情后重新选择目标 thread，禁止继续向旧目标发送。",
+        },
+    ],
+    "404": CODEX_OPEN_ERROR_CODES["404"],
+    "409": [
+        {
+            "code": "CODEX_THREAD_SEND_UNCERTAIN",
+            "retryable": False,
+            "action": "发送可能已经越过 Enter 边界；先读取会话详情确认是否已出现该消息，禁止自动重放。",
+        }
+    ],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "修正 threadId、正文长度或额外字段。",
         }
     ],
     **CODEX_LIST_ERROR_CODES,
@@ -1840,6 +2079,129 @@ TASK_COMPLETE_ERROR_CODES = {
     ],
     **TASK_AGGREGATE_INVARIANT_ERROR_CODES,
 }
+MY_APP_COMMON_ERROR_CODES = {
+    "409": [
+        {
+            "code": "MY_APP_OPERATION_FAILED",
+            "retryable": False,
+            "action": "刷新我的应用列表并检查端口、zip 包或 URL；禁止结束非 CodexMan 持有的系统进程。",
+        }
+    ],
+    "422": [
+        {
+            "code": "VALIDATION_ERROR",
+            "retryable": False,
+            "action": "按请求 schema 修正名称、端口、URL、publicSubdomain、zipDataUrl、打开目标或额外字段。",
+        }
+    ],
+}
+MY_APP_LIST_ERROR_CODES = {
+    "500": [
+        {
+            "code": "MY_APP_LIST_FAILED",
+            "retryable": False,
+            "action": "携带 requestId 检查桌面日志和我的应用配置文件，禁止把读取失败当作空列表。",
+        }
+    ]
+}
+MY_APP_PORT_ERROR_CODES = {
+    "409": [
+        {
+            "code": "MY_APP_PORT_ALLOCATE_FAILED",
+            "retryable": False,
+            "action": "当前端口段没有可用端口；让用户手动填写并在保存时再次校验。",
+        }
+    ]
+}
+MY_APP_CREATE_ERROR_CODES = {
+    "400": [
+        {
+            "code": "MY_APP_CREATE_FAILED",
+            "retryable": False,
+            "action": "检查名称、端口、公网二级域名、远程 URL 或静态站点 zip；本地托管必须包含 index.html。",
+        }
+    ],
+    **MY_APP_COMMON_ERROR_CODES,
+}
+MY_APP_UPDATE_ERROR_CODES = {
+    "400": [
+        {
+            "code": "MY_APP_UPDATE_FAILED",
+            "retryable": False,
+            "action": "检查名称、端口、公网二级域名、远程 URL 或 zip；端口变化只会重启 CodexMan 当前持有的服务。",
+        }
+    ],
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    **MY_APP_COMMON_ERROR_CODES,
+}
+MY_APP_DELETE_ERROR_CODES = {
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    **MY_APP_COMMON_ERROR_CODES,
+}
+MY_APP_RESTART_ERROR_CODES = {
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    "409": [
+        {
+            "code": "MY_APP_RESTART_FAILED",
+            "retryable": False,
+            "action": "端口被占用、站点目录缺失、公网访问客户端不可用或 zip 内容无效；不要结束未知进程，修改端口或重新上传后再启动。",
+        }
+    ],
+    "422": MY_APP_COMMON_ERROR_CODES["422"],
+}
+MY_APP_OPEN_ERROR_CODES = {
+    "404": [
+        {
+            "code": "MY_APP_NOT_FOUND",
+            "retryable": False,
+            "action": "应用不存在或已删除；刷新列表后重新选择。",
+        }
+    ],
+    "409": [
+        {
+            "code": "MY_APP_OPEN_FAILED",
+            "retryable": False,
+            "action": "本地服务启动失败或目标 URL 无效；修复后由用户重新打开。",
+        }
+    ],
+    "422": MY_APP_COMMON_ERROR_CODES["422"],
+}
+
+MY_APP_EXAMPLE = {
+    "id": "app_01J00000000000000000000000",
+    "name": "数据看板",
+    "logoDataUrl": "",
+    "accessType": "local",
+    "port": 18123,
+    "remoteUrl": "",
+    "localUrl": "http://127.0.0.1:18123",
+    "lanUrl": "http://192.168.1.23:18123",
+    "publicUrl": "https://demo.tolern.com",
+    "publicSubdomain": "demo",
+    "openUrl": "http://127.0.0.1:18123",
+    "serviceStatus": "running",
+    "serviceMessage": "服务已启动。",
+    "createdAt": "2026-08-20T00:00:00Z",
+    "updatedAt": "2026-08-20T00:00:00Z",
+}
 
 
 def _private_route_error_codes(
@@ -1928,6 +2290,223 @@ async def _call_private(
 
     client: PrivateRpcClient = request.app.state.private_rpc
     return await client.call(method, _request_id(request), params)
+
+
+@app.get(
+    "/v1/my-apps",
+    response_model=List[MyAppResponse],
+    responses=private_route_responses([MY_APP_EXAMPLE], MY_APP_LIST_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="读取我的应用列表",
+    description=(
+        "读取本机保存的本地托管和远程 URL 应用，并返回静态服务状态、本机地址和局域网地址。"
+        "HTTP 层不读取站点目录、不启动端口服务，所有运行时状态均来自桌面业务核心。"
+    ),
+    openapi_extra=private_route_openapi(MY_APP_LIST_ERROR_CODES),
+)
+async def list_my_apps(request: Request) -> object:
+    """读取我的应用列表。
+
+    流程：Bearer 依赖先完成鉴权，再以空参数调用 Rust ``listMyApps``。
+    参数：``request`` 提供 requestId 和私有 RPC 客户端。
+    返回：我的应用列表；无应用时为空数组。
+    异常边界：读取配置失败返回统一错误，不伪装为空列表。
+    """
+
+    return await _call_private(request, "listMyApps", {})
+
+
+@app.post(
+    "/v1/my-apps/allocate-port",
+    response_model=MyAppPortResponse,
+    responses=private_route_responses({"port": 18123}, MY_APP_PORT_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="自动分配我的应用本地端口",
+    description="请求桌面业务核心在固定端口段内寻找当前可绑定端口；返回值不预占端口，保存时仍会再次校验。",
+    openapi_extra=private_route_openapi(MY_APP_PORT_ERROR_CODES),
+)
+async def allocate_my_app_port(request: Request) -> object:
+    """自动分配可用端口。
+
+    流程：调用 Rust ``allocateMyAppPort``，由 Rust 避开已配置端口并尝试绑定检测。
+    参数：``request`` 提供 requestId 和私有 RPC 客户端。
+    返回：当前检测可用端口。
+    异常边界：HTTP 不自行扫描端口，也不保留端口占用。
+    """
+
+    return await _call_private(request, "allocateMyAppPort", {})
+
+
+@app.post(
+    "/v1/my-apps",
+    response_model=MyAppResponse,
+    responses=private_route_responses(MY_APP_EXAMPLE, MY_APP_CREATE_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="创建我的应用",
+    description=(
+        "创建本地托管或远程 URL 应用。本地托管需要 zipDataUrl 和端口，Rust 会安全解压到 App 数据目录，"
+        "随后绑定 0.0.0.0:<port> 以允许局域网访问；填写 publicSubdomain 时会通过 frpc 注册公网二级域名。"
+    ),
+    openapi_extra=private_route_openapi(
+        MY_APP_CREATE_ERROR_CODES,
+        {
+            "name": "数据看板",
+            "logoDataUrl": "",
+            "accessType": "local",
+            "port": 18123,
+            "remoteUrl": "",
+            "publicSubdomain": "demo",
+            "zipDataUrl": "data:application/zip;base64,UEsDBBQAAAA...",
+        },
+    ),
+)
+async def create_my_app(request: Request, payload: MyAppCreateRequest) -> object:
+    """创建我的应用。
+
+    流程：Pydantic 严格校验请求体后调用 Rust ``createMyApp``；Rust 负责 zip 解压、持久化和本地服务启动。
+    参数：``request`` 提供 RPC 上下文；``payload`` 为应用配置和可选 zip。
+    返回：创建后的应用列表项。
+    异常边界：HTTP 不保存 zip、不触碰文件系统，也不启动端口服务。
+    """
+
+    return await _call_private(request, "createMyApp", payload.model_dump(by_alias=True))
+
+
+@app.post(
+    "/v1/my-apps/{appId}/update",
+    response_model=MyAppResponse,
+    responses=private_route_responses(MY_APP_EXAMPLE, MY_APP_UPDATE_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="修改我的应用",
+    description=(
+        "修改名称、logo、访问方式、端口或远程 URL。端口变化时 Rust 只停止 CodexMan 当前持有的旧服务并重启新端口；"
+        "zipDataUrl 为空时复用现有站点目录。"
+    ),
+    openapi_extra=private_route_openapi(
+        MY_APP_UPDATE_ERROR_CODES,
+        {
+            "name": "数据看板 v2",
+            "logoDataUrl": "",
+            "accessType": "local",
+            "port": 18124,
+            "remoteUrl": "",
+            "publicSubdomain": "demo-v2",
+            "zipDataUrl": "",
+        },
+    ),
+)
+async def update_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待修改应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+    payload: MyAppUpdateRequest,
+) -> object:
+    """修改我的应用。
+
+    流程：把路径 appId 与严格正文合并后调用 Rust ``updateMyApp``。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID；``payload`` 为新配置。
+    返回：更新后的应用列表项。
+    异常边界：HTTP 不杀端口进程；Rust 只管理当前 App 持有的静态服务线程。
+    """
+
+    params = payload.model_dump(by_alias=True, exclude_none=True)
+    params["id"] = app_id
+    return await _call_private(request, "updateMyApp", params)
+
+
+@app.post(
+    "/v1/my-apps/{appId}/delete",
+    response_model=OperationResponse,
+    responses=private_route_responses({"ok": True}, MY_APP_DELETE_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="删除我的应用",
+    description="删除应用记录；本地托管应用会停止 CodexMan 受管静态服务并删除解压目录，不会结束未知系统进程。",
+    openapi_extra=private_route_openapi(MY_APP_DELETE_ERROR_CODES),
+)
+async def delete_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待删除应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+) -> OperationResponse:
+    """删除我的应用。
+
+    流程：校验 appId 后调用 Rust ``deleteMyApp``，由 Rust 停止受管服务、删除配置和站点目录。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID。
+    返回：固定成功对象。
+    异常边界：HTTP 不直接删除文件，也不结束任何端口进程。
+    """
+
+    await _call_private(request, "deleteMyApp", {"appId": app_id})
+    return OperationResponse()
+
+
+@app.post(
+    "/v1/my-apps/{appId}/start",
+    response_model=MyAppResponse,
+    responses=private_route_responses(MY_APP_EXAMPLE, MY_APP_RESTART_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="启动或重启我的应用本地服务",
+    description="仅本地托管应用可调用；Rust 停止当前 App 持有的旧服务后重新绑定记录中的固定端口。",
+    openapi_extra=private_route_openapi(MY_APP_RESTART_ERROR_CODES),
+)
+async def restart_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待启动或重启应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+) -> object:
+    """启动或重启我的应用本地服务。
+
+    流程：校验 appId 后调用 Rust ``restartMyApp``，由 Rust 停止受管线程并重新启动静态 HTTP 服务。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID。
+    返回：最新应用列表项和服务状态。
+    异常边界：远程 URL 应用没有本地服务，端口被其它进程占用时返回失败而不杀未知进程。
+    """
+
+    return await _call_private(request, "restartMyApp", {"appId": app_id})
+
+
+@app.post(
+    "/v1/my-apps/{appId}/open",
+    response_model=OperationResponse,
+    responses=private_route_responses({"ok": True}, MY_APP_OPEN_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["我的应用"],
+    summary="打开我的应用",
+    description="按 target 使用 CodexMan 新窗口或默认浏览器打开；本地托管应用会先确保静态服务启动成功。",
+    openapi_extra=private_route_openapi(MY_APP_OPEN_ERROR_CODES, {"target": "codexman"}),
+)
+async def open_my_app(
+    request: Request,
+    app_id: Annotated[
+        SafeBusinessId,
+        Path(alias="appId", description="待打开应用稳定 ID。", examples=["app_01J00000000000000000000000"]),
+    ],
+    payload: MyAppOpenRequest,
+) -> OperationResponse:
+    """打开我的应用。
+
+    流程：校验 appId 和打开目标后调用 Rust ``openMyApp``，本地应用由 Rust 先启动静态服务。
+    参数：``request`` 提供 RPC 上下文；``app_id`` 为应用 ID；``payload`` 为打开目标。
+    返回：固定成功对象。
+    异常边界：服务启动失败或 URL 无效时不打开空窗口。
+    """
+
+    params = payload.model_dump(by_alias=True)
+    params["appId"] = app_id
+    await _call_private(request, "openMyApp", params)
+    return OperationResponse()
 
 
 @app.get(
@@ -2052,6 +2631,353 @@ async def search_codex_threads(
 
     return await _call_private(
         request, "listCodexThreads", payload.model_dump(by_alias=True)
+    )
+
+
+def build_codex_thread_messages_response(
+    raw_detail: object, limit: int, before_message_order: Optional[int]
+) -> CodexThreadMessagesResponse:
+    """把 Rust 会话详情快照转换为公开消息窗口。
+
+    流程：优先使用 Rust 返回的全局 messageOrder；旧 app-server 兜底来源没有该字段时再按当前窗口补充顺序，并按 beforeMessageOrder/limit 截取窗口。
+    参数：``raw_detail`` 为私有 RPC 返回对象；``limit`` 和 ``before_message_order`` 为已校验分页参数。
+    返回：公开 HTTP 消息窗口模型。
+    异常边界：私有 RPC 结构异常时按协议错误失败，不猜测或补造正文。
+    """
+
+    if not isinstance(raw_detail, dict):
+        raise ApiError(502, "PRIVATE_SERVICE_PROTOCOL_ERROR", "会话详情响应格式无效。")
+    raw_messages = raw_detail.get("messages")
+    if not isinstance(raw_messages, list):
+        raise ApiError(502, "PRIVATE_SERVICE_PROTOCOL_ERROR", "会话消息响应格式无效。")
+    allowed_kinds = {
+        "user",
+        "assistant",
+        "commentary",
+        "finalAnswer",
+        "reasoning",
+        "toolCall",
+        "toolResult",
+        "status",
+    }
+    ordered_messages = []
+    for index, message in enumerate(raw_messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        kind = str(message.get("kind") or role)
+        if kind not in allowed_kinds:
+            kind = role
+        raw_message_order = message.get("messageOrder")
+        message_order = raw_message_order if isinstance(raw_message_order, int) else index + 1
+        ordered_messages.append(
+            {
+                "messageOrder": message_order,
+                "role": role,
+                "kind": kind,
+                "title": str(message.get("title") or ""),
+                "content": str(message.get("content") or ""),
+                "status": str(message.get("status") or ""),
+                "createdAt": str(message.get("createdAt") or ""),
+            }
+        )
+    has_global_order = any(
+        isinstance(message, dict) and isinstance(message.get("messageOrder"), int)
+        for message in raw_messages
+    )
+    max_message_order = max(
+        (int(message["messageOrder"]) for message in ordered_messages),
+        default=0,
+    )
+    upper_bound = before_message_order or (
+        max_message_order + 1 if has_global_order else len(ordered_messages) + 1
+    )
+    window_messages = [
+        message
+        for message in ordered_messages
+        if int(message["messageOrder"]) < upper_bound
+    ][-limit:]
+    start_order = int(window_messages[0]["messageOrder"]) if window_messages else 0
+    end_order = int(window_messages[-1]["messageOrder"]) if window_messages else 0
+    return CodexThreadMessagesResponse.model_validate(
+        {
+            "threadId": str(raw_detail.get("id") or ""),
+            "title": str(raw_detail.get("title") or "未命名会话"),
+            "updatedAt": str(raw_detail.get("updatedAt") or ""),
+            "messages": window_messages,
+            "range": {
+                "startMessageOrder": start_order,
+                "endMessageOrder": end_order,
+                "hasMoreBefore": start_order > 1,
+                "hasMoreAfter": bool(before_message_order and window_messages)
+                if has_global_order
+                else end_order < len(ordered_messages),
+            },
+        }
+    )
+
+
+def encode_sse_event(event_name: str, event_id: int, payload: object) -> str:
+    """编码单条 SSE 事件。
+
+    流程：按标准 event/id/data 三段输出，每条事件以空行结束，data 使用紧凑 JSON 且不包含私有路径。
+    参数：``event_name`` 为事件类型，``event_id`` 为单连接内事件序号，``payload`` 为可 JSON 序列化对象。
+    返回：可直接写入 ``text/event-stream`` 的字符串。
+    异常边界：调用方只传入公开模型或固定心跳对象，不写入 token、路径或请求头。
+    """
+
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_name}\nid: {event_id}\ndata: {data}\n\n"
+
+
+def build_codex_thread_response_signature(response: CodexThreadMessagesResponse) -> str:
+    """构建会话窗口变化签名。
+
+    流程：只取公开消息窗口中的顺序、类型、标题、状态和正文生成紧凑 JSON，供 SSE 轮询判断是否需要推送新快照。
+    参数：``response`` 为已转换好的公开消息窗口。
+    返回：稳定字符串签名；同一窗口内容不变时签名一致。
+    异常边界：不包含本机路径以外的私有 RPC 元数据、请求头或 token。
+    """
+
+    return json.dumps(
+        {
+            "range": response.range.model_dump(by_alias=True),
+            "messages": [
+                {
+                    "messageOrder": message.message_order,
+                    "role": message.role,
+                    "kind": message.kind,
+                    "title": message.title,
+                    "status": message.status,
+                    "content": message.content,
+                    "createdAt": message.created_at,
+                }
+                for message in response.messages
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def build_codex_thread_snapshot_payload(
+    response: CodexThreadMessagesResponse, event_seq: int
+) -> dict[str, object]:
+    """构建会话 SSE snapshot 载荷。
+
+    流程：把公开响应模型转换为前端 SSE 协议使用的 camelCase 字典，避免首包和增量刷新重复拼装。
+    参数：``response`` 为公开消息窗口，``event_seq`` 为当前 SSE 事件序号。
+    返回：可序列化的 snapshot payload。
+    异常边界：只输出公开响应字段，不暴露本机 JSONL 路径或私有 RPC 细节。
+    """
+
+    return {
+        "seq": event_seq,
+        "threadId": response.thread_id,
+        "type": "snapshot",
+        "messages": [message.model_dump(by_alias=True) for message in response.messages],
+        "range": response.range.model_dump(by_alias=True),
+    }
+
+
+async def stream_codex_thread_events(
+    request: Request, thread_id: str, window_size: int, response: CodexThreadMessagesResponse
+) -> AsyncIterator[str]:
+    """生成 CodeX 会话 SSE 事件流。
+
+    流程：先发送有界 snapshot，再短轮询读取同一会话窗口；内容变化时推送新的 snapshot，未变化时定期 heartbeat。
+    参数：``request`` 用于检测客户端断开，``thread_id`` 为会话 ID，``window_size`` 为窗口大小，``response`` 为首包窗口。
+    返回：SSE 字符串异步迭代器。
+    异常边界：客户端断开后自然结束；轮询失败时推送 heartbeat 保持连接，不把内部错误正文写进事件流。
+    """
+
+    event_seq = max(1, response.range.end_message_order)
+    response_signature = build_codex_thread_response_signature(response)
+    heartbeat_deadline = time.monotonic() + 15
+    yield encode_sse_event(
+        "snapshot",
+        event_seq,
+        build_codex_thread_snapshot_payload(response, event_seq),
+    )
+    while not await request.is_disconnected():
+        await asyncio.sleep(2)
+        try:
+            raw_detail = await _call_private(
+                request,
+                "readCodexThreadMessages",
+                {"threadId": thread_id, "limit": window_size},
+            )
+            next_response = build_codex_thread_messages_response(raw_detail, window_size, None)
+            next_signature = build_codex_thread_response_signature(next_response)
+            if next_signature != response_signature:
+                event_seq += 1
+                response = next_response
+                response_signature = next_signature
+                heartbeat_deadline = time.monotonic() + 15
+                yield encode_sse_event(
+                    "snapshot",
+                    event_seq,
+                    build_codex_thread_snapshot_payload(response, event_seq),
+                )
+                continue
+        except Exception:
+            pass
+        if time.monotonic() >= heartbeat_deadline:
+            event_seq += 1
+            heartbeat_deadline = time.monotonic() + 15
+            yield encode_sse_event(
+                "heartbeat",
+                event_seq,
+                {"seq": event_seq, "threadId": response.thread_id, "type": "heartbeat"},
+            )
+
+
+@app.get(
+    "/v1/codex/threads/{threadId}/messages",
+    response_model=CodexThreadMessagesResponse,
+    responses=private_route_responses(CODEX_THREAD_MESSAGES_EXAMPLE, CODEX_THREAD_MESSAGES_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["会话管理"],
+    summary="读取 CodeX 会话正文窗口",
+    description=(
+        "读取指定 thread 的最近会话正文窗口。第一版返回有界窗口，不返回本机 JSONL 路径、socket、token 或内部事件；"
+        "beforeMessageOrder 用于向前分页，不能与 SSE seq 混用。"
+    ),
+    openapi_extra=private_route_openapi(CODEX_THREAD_MESSAGES_ERROR_CODES),
+)
+async def read_codex_thread_messages(
+    request: Request,
+    thread_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="threadId",
+            description="从会话搜索结果取得的 CodeX thread 稳定 ID。",
+            examples=["0198f25a-1111-7000-8000-000000000001"],
+        ),
+    ],
+    before_message_order: Annotated[
+        Optional[int],
+        Query(
+            alias="beforeMessageOrder",
+            ge=1,
+            description="向前加载该 messageOrder 之前的消息；省略时返回尾部窗口。",
+        ),
+    ] = None,
+    limit: Annotated[int, Query(ge=20, le=200, description="本次窗口消息数量。")] = 80,
+) -> CodexThreadMessagesResponse:
+    """读取 CodeX 会话正文窗口。
+
+    流程：Bearer 依赖完成鉴权后调用 Rust 只读详情入口，再在 HTTP 层补充 messageOrder 与窗口范围。
+    参数：``thread_id`` 为真实 thread ID；``before_message_order`` 和 ``limit`` 为历史分页参数。
+    返回：有界消息窗口。
+    异常边界：Python 不扫描本机文件、不读取任意 path，也不把内部错误正文写入响应。
+    """
+
+    raw_detail = await _call_private(
+        request,
+        "readCodexThreadMessages",
+        {"threadId": thread_id, "beforeMessageOrder": before_message_order, "limit": limit},
+    )
+    return build_codex_thread_messages_response(raw_detail, limit, before_message_order)
+
+
+@app.post(
+    "/v1/codex/threads/{threadId}/messages",
+    response_model=CodexThreadSendMessageResponse,
+    responses=private_route_responses(
+        CODEX_THREAD_SEND_MESSAGE_EXAMPLE, CODEX_THREAD_SEND_MESSAGE_ERROR_CODES
+    ),
+    dependencies=[Depends(require_api_access)],
+    tags=["会话管理"],
+    summary="向 CodeX 已有会话发送消息",
+    description=(
+        "通过本机 Rust 桥接控制 CodeX Desktop 原生 composer，向指定已有 thread 继续发送一条文本消息。"
+        "首版服务端不提供跨重启持久排队；调用方收到不确定错误后必须先读取会话详情确认，禁止自动重放。"
+    ),
+    openapi_extra=private_route_openapi(CODEX_THREAD_SEND_MESSAGE_ERROR_CODES),
+)
+async def send_codex_thread_message(
+    request: Request,
+    thread_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="threadId",
+            description="从会话搜索结果取得的 CodeX thread 稳定 ID。",
+            examples=["0198f25a-1111-7000-8000-000000000001"],
+        ),
+    ],
+    payload: CodexThreadSendMessageRequest,
+) -> CodexThreadSendMessageResponse:
+    """向 CodeX 已有会话发送消息。
+
+    流程：Bearer 鉴权和请求体校验完成后，仅把 threadId 与正文交给 Rust 私有 RPC；Python 不读取本机 JSONL 或操作 DOM。
+    参数：``thread_id`` 为真实 thread ID；``payload`` 为继续对话正文。
+    返回：发送状态响应。
+    异常边界：正文、授权码、WebSocket 和本机路径均不写日志；Rust 返回不确定状态时按统一错误 envelope 暴露。
+    """
+
+    raw_result = await _call_private(
+        request,
+        "sendCodexThreadMessage",
+        {
+            "threadId": thread_id,
+            "content": payload.content,
+            "attachments": [
+                attachment.model_dump(by_alias=True) for attachment in payload.attachments
+            ],
+        },
+    )
+    return CodexThreadSendMessageResponse.model_validate(raw_result)
+
+
+@app.get(
+    "/v1/codex/threads/{threadId}/stream",
+    responses=private_route_responses(CODEX_THREAD_MESSAGES_EXAMPLE, CODEX_THREAD_MESSAGES_ERROR_CODES),
+    dependencies=[Depends(require_api_access)],
+    tags=["会话管理"],
+    summary="订阅 CodeX 会话 SSE",
+    description=(
+        "使用 text/event-stream 返回会话 snapshot、变化快照和 heartbeat。浏览器端应使用 fetch readable stream 携带 Bearer，"
+        "不要使用原生 EventSource 携带 Authorization Header。"
+    ),
+    openapi_extra=private_route_openapi(CODEX_THREAD_MESSAGES_ERROR_CODES),
+)
+async def stream_codex_thread(
+    request: Request,
+    thread_id: Annotated[
+        SafeBusinessId,
+        Path(
+            alias="threadId",
+            description="从会话搜索结果取得的 CodeX thread 稳定 ID。",
+            examples=["0198f25a-1111-7000-8000-000000000001"],
+        ),
+    ],
+    window_size: Annotated[
+        int, Query(alias="windowSize", ge=20, le=200, description="首包 snapshot 消息数量。")
+    ] = 80,
+    after_seq: Annotated[
+        Optional[int], Query(alias="afterSeq", ge=0, description="断线续传事件序号；第一版 miss 时返回 snapshot。")
+    ] = None,
+) -> StreamingResponse:
+    """订阅 CodeX 会话事件流。
+
+    流程：先按当前窗口读取一次 snapshot，再短轮询同一会话窗口，检测到变化时推送新 snapshot；afterSeq 暂作为兼容参数保留。
+    参数：``thread_id`` 为真实 thread ID，``window_size`` 为首包窗口大小，``after_seq`` 为后续增量续传游标。
+    返回：``text/event-stream`` 响应。
+    异常边界：鉴权失败或 snapshot 读取失败时不会建立流；事件不包含本机路径、token 或私有 RPC 细节。
+    """
+
+    _ = after_seq
+    raw_detail = await _call_private(
+        request, "readCodexThreadMessages", {"threadId": thread_id, "limit": window_size}
+    )
+    response = build_codex_thread_messages_response(raw_detail, window_size, None)
+    return StreamingResponse(
+        stream_codex_thread_events(request, thread_id, window_size, response),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
 
 

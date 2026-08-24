@@ -8,7 +8,13 @@ import {
     SETTINGS_TASK_CONCURRENCY_MIN
 } from '@/model/settings';
 import { readClientJson, writeClientJson } from '@/service/storage/clientJsonStorage';
-import { getLoginLaunch, isTauriRuntime, setLoginLaunch } from '@/service/tauri/command';
+import {
+    getLoginLaunch,
+    getPublicApiTunnelStatus,
+    isTauriRuntime,
+    setLoginLaunch,
+    setPublicApiTunnelEnabled
+} from '@/service/tauri/command';
 
 /**
  * 设置页状态，用于聚合持久化偏好、原生设置读取状态和操作反馈。
@@ -28,10 +34,13 @@ export const useSettingsStore = defineStore('settings', {
     state: (): SettingsState => {
         return {
             settings: {
+                userEnglishName: '',
                 launchAtLogin: false,
                 themeMode: 'dark',
                 smartVoiceEnhancement: true,
-                taskConcurrencyLimit: SETTINGS_TASK_CONCURRENCY_DEFAULT
+                taskConcurrencyLimit: SETTINGS_TASK_CONCURRENCY_DEFAULT,
+                publicApiExternalAccessEnabled: false,
+                publicApiSubdomain: ''
             },
             initializing: false,
             saving: false,
@@ -62,6 +71,7 @@ export const useSettingsStore = defineStore('settings', {
             if (!settings || typeof settings !== 'object') return;
             const nextSettings = settings as Partial<SettingsModel>;
             this.settings = {
+                userEnglishName: normalizeUserEnglishName(nextSettings.userEnglishName, this.settings.userEnglishName),
                 launchAtLogin: nextSettings.launchAtLogin ?? this.settings.launchAtLogin,
                 themeMode:
                     nextSettings.themeMode === 'dark' || nextSettings.themeMode === 'light'
@@ -71,6 +81,12 @@ export const useSettingsStore = defineStore('settings', {
                 taskConcurrencyLimit: normalizeTaskConcurrencyLimit(
                     nextSettings.taskConcurrencyLimit,
                     this.settings.taskConcurrencyLimit
+                ),
+                publicApiExternalAccessEnabled:
+                    nextSettings.publicApiExternalAccessEnabled ?? this.settings.publicApiExternalAccessEnabled,
+                publicApiSubdomain: normalizePublicApiSubdomain(
+                    nextSettings.publicApiSubdomain,
+                    this.settings.publicApiSubdomain
                 )
             };
             if (typeof document !== 'undefined') {
@@ -122,6 +138,67 @@ export const useSettingsStore = defineStore('settings', {
         },
 
         /**
+         * 保存用户英文名。
+         * 流程：按 DNS 前缀友好的字符规则规范化输入，再写入客户端配置文件；若 HTTP API 外网访问已开启，则立即按新英文名重启隧道。
+         * 参数：name 为用户输入英文名。
+         * 返回：最新 HTTP API 外网访问地址；未开启外网访问时返回空字符串。
+         * 边界：英文名会影响 HTTP API 固定域名，不会覆盖“我的应用”的自定义二级域名。
+         */
+        async updateUserEnglishName(name: string): Promise<string> {
+            this.settings.userEnglishName = normalizeUserEnglishName(name, '');
+            if (isTauriRuntime()) {
+                await writeClientJson(StorageKey.settings, this.settings);
+                if (this.settings.publicApiExternalAccessEnabled) {
+                    const status = await setPublicApiTunnelEnabled(true);
+                    this.settings.publicApiExternalAccessEnabled = status.enabled;
+                    this.settings.publicApiSubdomain = status.subdomain ?? '';
+                    await writeClientJson(StorageKey.settings, this.settings);
+                    this.message = '';
+                    return status.publicUrl ?? '';
+                }
+            }
+            this.message = '';
+            return '';
+        },
+
+        /**
+         * 刷新公共 HTTP API 外网访问状态。
+         * 流程：桌面端读取 Rust 运行时状态并同步到设置分区字段；普通 Web 保留本地配置值。
+         * 参数：无。
+         * 返回：刷新完成 Promise。
+         * 边界：IPC 失败时不清空已有域名，避免误导用户认为配置已丢失。
+         */
+        async refreshPublicApiTunnelStatus(): Promise<void> {
+            if (!isTauriRuntime()) return;
+            const status = await getPublicApiTunnelStatus();
+            this.settings.publicApiExternalAccessEnabled = status.enabled;
+            this.settings.publicApiSubdomain = status.subdomain ?? '';
+        },
+
+        /**
+         * 切换公共 HTTP API 外网访问。
+         * 流程：调用 Rust 写配置并启停 frpc，成功后同步固定域名到页面状态。
+         * 参数：enabled 为目标开关状态。
+         * 返回：远程公网访问地址；关闭或尚未生成时返回空字符串。
+         * 边界：失败时不乐观修改开关，调用方负责展示错误。
+         */
+        async togglePublicApiExternalAccess(enabled: boolean): Promise<string> {
+            this.saving = true;
+            try {
+                const status = await setPublicApiTunnelEnabled(enabled);
+                this.settings.publicApiExternalAccessEnabled = status.enabled;
+                this.settings.publicApiSubdomain = status.subdomain ?? '';
+                this.message = '';
+                return status.publicUrl ?? '';
+            } catch (error) {
+                this.message = error instanceof Error ? error.message : '保存 HTTP API 外网访问设置失败。';
+                throw error;
+            } finally {
+                this.saving = false;
+            }
+        },
+
+        /**
          * 保存任务执行并发上限。
          * 流程：把输入值收敛到 1-10 的整数，再写入客户端配置文件；后端调度器下一轮读取配置时即时生效。
          * 参数：limit 为用户输入的并发上限。
@@ -149,6 +226,7 @@ export const useSettingsStore = defineStore('settings', {
             this.initializing = true;
             try {
                 this.settings.launchAtLogin = await getLoginLaunch();
+                await this.refreshPublicApiTunnelStatus();
                 void writeClientJson(StorageKey.settings, this.settings);
             } catch (error) {
                 this.message = error instanceof Error ? error.message : '读取系统设置失败。';
@@ -190,4 +268,36 @@ export const useSettingsStore = defineStore('settings', {
 function normalizeTaskConcurrencyLimit(value: unknown, fallback: number): number {
     if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
     return Math.min(SETTINGS_TASK_CONCURRENCY_MAX, Math.max(SETTINGS_TASK_CONCURRENCY_MIN, Math.floor(value)));
+}
+
+/**
+ * 规范化用户英文名。
+ * 流程：转换为小写，保留字母、数字和短横线，并压缩连续短横线。
+ * 参数：value 为外部输入值，fallback 为非法输入兜底值。
+ * 返回：适合作为域名前缀参考的英文名。
+ * 边界：空值允许保存；超过 32 位会截断，避免提示域名过长。
+ */
+function normalizeUserEnglishName(value: unknown, fallback: string): string {
+    if (typeof value !== 'string') return fallback;
+    return value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 32);
+}
+
+/**
+ * 规范化公共 HTTP API 固定二级域名前缀。
+ * 流程：接受用户英文名或随机兜底域名的 DNS label；非法值使用兜底值。
+ * 参数：value 为外部输入值，fallback 为当前已有值。
+ * 返回：可展示的固定前缀。
+ * 边界：该字段不允许用户编辑，前端只做展示级校验。
+ */
+function normalizePublicApiSubdomain(value: unknown, fallback: string): string {
+    if (typeof value !== 'string') return fallback;
+    const normalized = value.trim().toLowerCase();
+    if (!/^[a-z0-9-]{1,32}$/.test(normalized)) return fallback;
+    return normalized.startsWith('-') || normalized.endsWith('-') ? fallback : normalized;
 }
