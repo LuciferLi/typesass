@@ -730,7 +730,7 @@ fn validate_task_content(title: &str, prompt: &str) -> Result<(), String> {
 /// 校验任务图片附件并返回已收敛的附件列表。
 /// 流程：限制数量、文件名、媒体类型和 data URL 长度/前缀，避免附件进入 prompt 或撑爆本机转发链路。
 /// 异常/边界：只做结构和大小校验，不在 HTTP/RPC 日志中回显图片内容。
-pub(crate) fn validate_task_attachments(
+fn validate_task_attachments(
     attachments: Vec<TaskAttachmentRecord>,
 ) -> Result<Vec<TaskAttachmentRecord>, String> {
     if attachments.len() > TASK_ATTACHMENT_LIMIT {

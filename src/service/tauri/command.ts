@@ -22,8 +22,6 @@ import type { RuntimeDiagnosticsModel, ShortcutProfileModel } from '@/model/perm
 import type {
     CodexThreadListRequestModel,
     CodexThreadMessagesResponseModel,
-    CodexThreadSendMessageRequestModel,
-    CodexThreadSendMessageResponseModel,
     CodexThreadStreamEventModel,
     CodexThreadSummaryModel,
     CodexWorkspaceModel,
@@ -1068,31 +1066,6 @@ export async function readCodexThreadMessages(
     return requestPublicApi<CodexThreadMessagesResponseModel>(
         `/v1/codex/threads/${encodeURIComponent(threadId)}/messages${query}`,
         { method: 'GET' }
-    );
-}
-
-/**
- * 向 CodeX 已有会话发送继续对话消息。
- * 流程：通过公开 HTTP POST 调用本机 sidecar，sidecar 再委托 Rust 通过 CodeX Desktop 原生 composer 提交。
- * 参数：threadId 为当前选中的真实会话 ID，request 为正文和图片附件。
- * 返回：服务端发送状态。
- * 异常：鉴权、会话不存在、输入框不可用或发送不确定时透传稳定错误；调用方不得对不确定错误自动重发。
- */
-export async function sendCodexThreadMessage(
-    threadId: string,
-    request: CodexThreadSendMessageRequestModel
-): Promise<CodexThreadSendMessageResponseModel> {
-    const payload: CodexThreadSendMessageRequestModel = {
-        content: request.content.trim(),
-        attachments: request.attachments ?? []
-    };
-    return requestPublicApi<CodexThreadSendMessageResponseModel>(
-        `/v1/codex/threads/${encodeURIComponent(threadId)}/messages`,
-        {
-            method: 'POST',
-            payload,
-            timeoutMs: 30_000
-        }
     );
 }
 
