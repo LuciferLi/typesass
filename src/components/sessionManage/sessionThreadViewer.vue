@@ -1,5 +1,5 @@
 <template>
-    <section class="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] border-l border-border bg-background">
+    <section class="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] border-l border-border bg-background">
         <header class="flex min-w-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
             <div class="grid min-w-0 gap-0.5">
                 <h2 class="truncate text-[14px] font-semibold text-foreground">
@@ -578,13 +578,6 @@
                 </article>
             </div>
         </div>
-
-        <session-thread-composer
-            :disabled="!selectedThread || Boolean(errorMessage)"
-            :has-thread="Boolean(selectedThread)"
-            :thread-id="selectedThread?.id ?? ''"
-            :thread-running="selectedThread?.status === 'running'"
-            @refresh="handleRetry" />
     </section>
 </template>
 
@@ -593,7 +586,6 @@
     import { convertFileSrc, isTauri } from '@tauri-apps/api/core';
     import { toast } from 'vue-sonner';
 
-    import SessionThreadComposer from '@/components/sessionManage/sessionThreadComposer.vue';
     import { Button as UiButton } from '@/components/ui/button';
     import type {
         CodexThreadMessageModel,

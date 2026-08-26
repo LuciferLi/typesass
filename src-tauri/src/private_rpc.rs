@@ -32,9 +32,8 @@ use crate::{
     delete_session_project_core, delete_session_task_core, get_codex_connection_core,
     list_codex_threads_core, list_codex_workspaces_core, load_session_workspace_data_core,
     open_session_external_thread_core, queue_session_task_core, read_codex_thread_messages_core,
-    request_access_token_approval_core, restart_codex_core, send_codex_thread_message_core,
-    update_session_project_core, update_session_task_core, CodexThreadListRequest,
-    CodexThreadSendMessageRequest,
+    request_access_token_approval_core, restart_codex_core, update_session_project_core,
+    update_session_task_core, CodexThreadListRequest,
 };
 
 /// 私有 RPC 单次请求 JSON 的最大长度；与公开 HTTP body 上限对齐，覆盖我的应用 zip data URL 上传。
@@ -53,7 +52,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 /// worker 全忙时允许短暂排队的连接数；超过后立即返回 RPC_BUSY，不形成无界线程或内存队列。
 const MAX_PENDING_CONNECTIONS: usize = 8;
 /// FastAPI 可调用的私有 RPC 方法全集；未登记方法在进入业务分发器前默认拒绝。
-const ALLOWED_METHODS: [&str; 24] = [
+const ALLOWED_METHODS: [&str; 23] = [
     "requestAccessTokenApproval",
     "loadWorkspaceData",
     "createProject",
@@ -68,7 +67,6 @@ const ALLOWED_METHODS: [&str; 24] = [
     "listCodexThreads",
     "openCodexThread",
     "readCodexThreadMessages",
-    "sendCodexThreadMessage",
     "getCodexConnection",
     "restartCodex",
     "listMyApps",
@@ -182,19 +180,6 @@ struct ThreadIdParams {
     /// 读取详情窗口大小；打开会话时忽略。
     #[serde(default)]
     limit: Option<usize>,
-}
-
-/// Codex 已有会话继续发送参数，用于把公开 HTTP 请求严格映射到 Rust 发送入口。
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SendCodexThreadMessageParams {
-    /// 目标 Codex 会话 ID。
-    thread_id: String,
-    /// 要发送给 Codex Desktop 的继续对话正文。
-    content: String,
-    /// 随消息发送给 Codex Desktop 的图片附件。
-    #[serde(default)]
-    attachments: Vec<TaskAttachmentRecord>,
 }
 
 /// 创建项目的严格 RPC 参数，避免公共 HTTP 未知字段静默进入 Rust 业务层。
@@ -795,20 +780,6 @@ fn dispatch_method(app: &AppHandle, method: &str, params: Value) -> Result<Value
                 ),
                 "CODEX_UNAVAILABLE",
                 "Codex 会话详情暂不可用。",
-            )
-        }
-        "sendCodexThreadMessage" => {
-            let request = decode_params::<SendCodexThreadMessageParams>(params)?;
-            serialize_business_result(
-                send_codex_thread_message_core(
-                    request.thread_id,
-                    CodexThreadSendMessageRequest {
-                        content: request.content,
-                        attachments: request.attachments,
-                    },
-                ),
-                "CODEX_THREAD_SEND_FAILED",
-                "Codex 会话消息发送失败。",
             )
         }
         "getCodexConnection" => {
