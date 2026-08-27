@@ -181,9 +181,18 @@ const APP_VOICE_RECORD_MAX_DURATION_MS: u64 = 120_000;
 const APP_VOICE_RECORD_MIN_DURATION_MS: u64 = 800;
 const APP_VOICE_AUDIO_MAX_BYTES: usize = 25 * 1024 * 1024;
 const APP_VOICE_PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(65);
-/// 语音快捷键场景的 AI 润色等待上限。
-/// 说明：ASR 已经完成后，润色属于体验增强；上游文本模型慢或返回空时不应让用户长时间卡在处理中。
-const APP_VOICE_TEXT_PROCESS_TIMEOUT: Duration = Duration::from_secs(4);
+/// 语音快捷键场景的 AI 润色最短服务端等待上限。
+/// 说明：ASR 已经完成后，润色属于体验增强；短句保持快速兜底，避免用户长时间卡在处理中。
+const APP_VOICE_TEXT_PROCESS_MIN_TIMEOUT: Duration = Duration::from_secs(6);
+/// 语音快捷键场景的 AI 润色最长服务端等待上限。
+/// 说明：长语音 ASR 原文更长，给模型更多处理时间；仍然限制上限，避免单次快捷键无限等待。
+const APP_VOICE_TEXT_PROCESS_MAX_TIMEOUT: Duration = Duration::from_secs(28);
+/// Rust HTTP 客户端相对服务端 processingTimeoutMs 的额外等待缓冲。
+/// 说明：如果两侧超时完全相同，客户端可能先断开并把服务端超时误报成 HTTP 服务不可用。
+const APP_VOICE_TEXT_PROCESS_HTTP_TIMEOUT_PADDING: Duration = Duration::from_secs(3);
+/// 语音润色动态等待预算的字符步长。
+/// 说明：ASR 文本越长，上游模型首 token 和完整输出越慢，按字符数递增比固定 4 秒更贴近真实耗时。
+const APP_VOICE_TEXT_PROCESS_CHARS_PER_EXTRA_SECOND: usize = 220;
 const APP_VOICE_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const APP_VOICE_TOKEN_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const APP_VOICE_CANCELLED_MESSAGE: &str = "本次语音输入已取消。";
@@ -2867,6 +2876,17 @@ fn run_app_voice_polish_core(
             .map(|item| item.word.trim().to_string())
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
+        let (server_timeout_ms, http_timeout) =
+            resolve_app_voice_text_process_timeouts(&source_text);
+        append_shortcut_diagnostic(
+            app,
+            &format!(
+                "voice text process request started text_chars={} server_timeout_ms={} http_timeout_ms={}",
+                source_text.chars().count(),
+                server_timeout_ms,
+                http_timeout.as_millis()
+            ),
+        );
         let process_result = request_public_api_json_with_timeout::<AppVoiceProcessResponse>(
             app,
             "/v1/text/process",
@@ -2878,9 +2898,9 @@ fn run_app_voice_polish_core(
                 "dictionary": dictionary,
                 "contextApp": normalized_target_app,
                 "styleInstruction": persisted.style_instruction,
-                "processingTimeoutMs": APP_VOICE_TEXT_PROCESS_TIMEOUT.as_millis()
+                "processingTimeoutMs": server_timeout_ms
             })),
-            APP_VOICE_TEXT_PROCESS_TIMEOUT,
+            http_timeout,
         );
         ensure_app_voice_not_cancelled(&cancel_requested)?;
         match process_result {
@@ -3047,6 +3067,24 @@ fn is_app_voice_user_recording_gate_error(error: &str) -> bool {
     matches!(
         error,
         "录音太短了，请说完一句话后再停止。" | "没有检测到有效语音，本次不会转文字。"
+    )
+}
+
+/// 计算 App 原生语音润色的服务端与 HTTP 客户端等待预算。
+/// 流程：以最短等待为基线，按 ASR 原文字符数递增，最多不超过服务端允许的上限；HTTP 客户端额外保留缓冲时间。
+/// 参数：source_text 为 ASR 已经产出的原文。
+/// 返回：服务端 processingTimeoutMs 与本机 HTTP 客户端总超时。
+/// 异常/边界：空文本仍返回最短预算；服务端预算必须低于 HTTP 客户端预算，避免客户端先超时导致错误分类失真。
+fn resolve_app_voice_text_process_timeouts(source_text: &str) -> (u64, Duration) {
+    let source_chars = source_text.trim().chars().count();
+    let extra_seconds = (source_chars / APP_VOICE_TEXT_PROCESS_CHARS_PER_EXTRA_SECOND) as u64;
+    let server_timeout = APP_VOICE_TEXT_PROCESS_MIN_TIMEOUT
+        .saturating_add(Duration::from_secs(extra_seconds))
+        .min(APP_VOICE_TEXT_PROCESS_MAX_TIMEOUT);
+    let server_timeout_ms = u64::try_from(server_timeout.as_millis()).unwrap_or(u64::MAX);
+    (
+        server_timeout_ms,
+        server_timeout.saturating_add(APP_VOICE_TEXT_PROCESS_HTTP_TIMEOUT_PADDING),
     )
 }
 
