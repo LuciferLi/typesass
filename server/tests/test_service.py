@@ -215,9 +215,43 @@ async def test_tc_svc_004_text_modes_context_and_limits(
     assert bodies[0]["max_completion_tokens"] == 256
     assert "保真润色" in bodies[1]["messages"][0]["content"]
     assert "词典：术语" in bodies[1]["messages"][1]["content"]
-    assert "上下文应用：editor" in bodies[1]["messages"][1]["content"]
+    assert "当前输入应用仅供语境参考，禁止输出：editor" in bodies[1]["messages"][1]["content"]
     assert "风格要求：concise" in bodies[1]["messages"][1]["content"]
     assert bodies[1]["max_completion_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_tc_svc_004c_text_process_strips_metadata_leak(
+    settings_factory: object,
+) -> None:
+    """TC-SVC-004C 文本处理清理模型误输出的参考元信息。
+
+    流程：模拟上游模型把上下文应用标签原样输出，确认服务端在返回前移除该标签并保留正文。
+    参数：``settings_factory`` 提供隔离模型目录。
+    返回：无；断言历史和粘贴链路不会收到“上下文应用：ChatGPT”这类元信息。
+    异常边界：只清理固定标签，不修改正常正文内容。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=completion("上下文应用：ChatGPT\n请帮我整理这段语音。", None),
+        )
+
+    settings = settings_factory(max_text_chars=3000)  # type: ignore[operator]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = ModelService(settings, client)
+        result = await service.process_text(
+            TextProcessRequest(
+                modelId="fake-text-id",
+                mode="dictate",
+                text="请帮我整理这段语音。",
+                audioDurationMs=0,
+                contextApp="ChatGPT",
+            ),
+            "req-metadata",
+        )
+    assert result[0] == "请帮我整理这段语音。"
 
 
 @pytest.mark.asyncio
