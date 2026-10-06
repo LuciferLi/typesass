@@ -761,7 +761,7 @@ class MyAppCreateRequest(StrictRequestModel):
         default=None,
         alias="zipDataUrl",
         max_length=12_000_000,
-        description="本地托管静态页面 zip 的 data URL；受公开 HTTP 12 MiB body 上限约束。",
+        description="本地托管静态页面 zip 的 data URL；受私有 RPC 12 MiB 上限约束。",
         examples=["data:application/zip;base64,UEsDBBQAAAA..."],
     )
 
@@ -846,7 +846,7 @@ class AudioTranscriptionRequest(StrictRequestModel):
     )
     audio_base64: str = Field(
         alias="audioBase64",
-        description="不含 data URL 头的标准 base64 音频；服务层严格解码并限制为最大 8 MiB。",
+        description="不含 data URL 头的标准 base64 音频；服务层严格解码并限制为最大 96 MiB。",
         examples=["UklGRiQAAABXQVZFZm10IBAAAAABAAEA..."],
     )
     content_type: str = Field(
@@ -926,8 +926,8 @@ class TextProcessRequest(StrictRequestModel):
         alias="processingTimeoutMs",
         default=None,
         ge=1000,
-        le=30000,
-        description="可选单次文本处理超时毫秒数；语音快捷键等低等待场景可传入较短预算，省略时使用服务默认上游超时。",
+        le=120000,
+        description="可选单次文本处理超时毫秒数；语音快捷键可按 ASR 文本长度传入动态预算，省略时使用服务默认上游超时。",
     )
 
 

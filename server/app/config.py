@@ -9,8 +9,8 @@ from typing import Literal, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 
-PUBLIC_MAX_BODY_BYTES = 12 * 1024 * 1024
-PUBLIC_MAX_AUDIO_BYTES = 8 * 1024 * 1024
+PUBLIC_MAX_BODY_BYTES = 132 * 1024 * 1024
+PUBLIC_MAX_AUDIO_BYTES = 96 * 1024 * 1024
 PUBLIC_MAX_TEXT_CHARS = 20_000
 PUBLIC_ACCESS_TOKEN_TTL_SECONDS = 8 * 60 * 60
 PUBLIC_BASE_URL = "http://127.0.0.1:18080"

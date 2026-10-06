@@ -164,7 +164,7 @@ def build_error_responses(
     """
 
     merged_status_codes = {
-        413: ("请求声明或实际正文超过固定 12 MiB 限制。", "REQUEST_BODY_TOO_LARGE"),
+        413: ("请求声明或实际正文超过固定 132 MiB 限制。", "REQUEST_BODY_TOO_LARGE"),
         500: ("请求处理发生未预期服务错误。", "INTERNAL_ERROR"),
         **status_codes,
     }
@@ -227,7 +227,7 @@ def build_error_code_documentation(
             {
                 "code": "REQUEST_BODY_TOO_LARGE",
                 "retryable": False,
-                "action": "将完整 HTTP 请求正文缩减到 12 MiB 以内后重新发起新请求。",
+                        "action": "将完整 HTTP 请求正文缩减到 132 MiB 以内后重新发起新请求。",
             }
         ],
         "500": [

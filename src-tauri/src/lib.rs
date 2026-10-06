@@ -176,23 +176,23 @@ const CODEX_CDP_THREAD_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
 const PUBLIC_API_TOKEN_IPC_ERROR_CODE: &str = "DESKTOP_OPERATION_FAILED";
 const PUBLIC_API_BASE_URL: &str = "http://127.0.0.1:18080";
 /// 单次 App 原生录音最长时长。
-/// 说明：底层录音模块支持最长 120 秒；快捷键口述不应在用户长句中途 30 秒自动截断。
-const APP_VOICE_RECORD_MAX_DURATION_MS: u64 = 120_000;
+/// 说明：长口述需要允许用户主动结束录音；上限只作为异常兜底，避免无人值守时无限占用录音资源。
+const APP_VOICE_RECORD_MAX_DURATION_MS: u64 = 600_000;
 const APP_VOICE_RECORD_MIN_DURATION_MS: u64 = 800;
-const APP_VOICE_AUDIO_MAX_BYTES: usize = 25 * 1024 * 1024;
-const APP_VOICE_PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(65);
+const APP_VOICE_AUDIO_MAX_BYTES: usize = 96 * 1024 * 1024;
+const APP_VOICE_PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(125);
 /// 语音快捷键场景的 AI 润色最短服务端等待上限。
 /// 说明：ASR 已经完成后，润色属于体验增强；短句保持快速兜底，避免用户长时间卡在处理中。
-const APP_VOICE_TEXT_PROCESS_MIN_TIMEOUT: Duration = Duration::from_secs(6);
+const APP_VOICE_TEXT_PROCESS_MIN_TIMEOUT: Duration = Duration::from_secs(12);
 /// 语音快捷键场景的 AI 润色最长服务端等待上限。
 /// 说明：长语音 ASR 原文更长，给模型更多处理时间；仍然限制上限，避免单次快捷键无限等待。
-const APP_VOICE_TEXT_PROCESS_MAX_TIMEOUT: Duration = Duration::from_secs(28);
+const APP_VOICE_TEXT_PROCESS_MAX_TIMEOUT: Duration = Duration::from_secs(90);
 /// Rust HTTP 客户端相对服务端 processingTimeoutMs 的额外等待缓冲。
 /// 说明：如果两侧超时完全相同，客户端可能先断开并把服务端超时误报成 HTTP 服务不可用。
 const APP_VOICE_TEXT_PROCESS_HTTP_TIMEOUT_PADDING: Duration = Duration::from_secs(3);
 /// 语音润色动态等待预算的字符步长。
 /// 说明：ASR 文本越长，上游模型首 token 和完整输出越慢，按字符数递增比固定 4 秒更贴近真实耗时。
-const APP_VOICE_TEXT_PROCESS_CHARS_PER_EXTRA_SECOND: usize = 220;
+const APP_VOICE_TEXT_PROCESS_CHARS_PER_EXTRA_SECOND: usize = 120;
 const APP_VOICE_TOKEN_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const APP_VOICE_TOKEN_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const APP_VOICE_CANCELLED_MESSAGE: &str = "本次语音输入已取消。";
@@ -2733,7 +2733,7 @@ fn run_app_voice_polish_core(
                 APP_VOICE_AUDIO_MAX_BYTES
             ),
         );
-        return Err("录音文件超过 25MB，请缩短单次语音输入。".to_string());
+        return Err("录音文件超过 96MB，请缩短单次语音输入。".to_string());
     }
     if audio.duration_ms < APP_VOICE_RECORD_MIN_DURATION_MS {
         if let Some(session) = realtime_asr_session.take() {
