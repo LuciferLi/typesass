@@ -93,8 +93,8 @@ pub fn record_microphone_wav_with_pcm_callback(
     ready_callback: Option<AppAudioReadyCallback>,
     pcm_callback: Option<AppAudioPcmCallback>,
 ) -> Result<AppAudioRecord, String> {
-    if max_duration_ms == 0 || max_duration_ms > 120_000 {
-        return Err("录音时长必须在 1 毫秒到 120 秒之间。".to_string());
+    if max_duration_ms == 0 || max_duration_ms > 600_000 {
+        return Err("录音时长必须在 1 毫秒到 10 分钟之间。".to_string());
     }
 
     let host = cpal::default_host();

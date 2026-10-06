@@ -29,6 +29,7 @@ CRITICAL_TOKEN_PATTERN = re.compile(
 )
 TEXT_FIDELITY_FALLBACK_MIN_CHARS = 30
 TEXT_FIDELITY_MIN_LENGTH_RATIO = 0.55
+TEXT_PROCESS_METADATA_PREFIXES = ("词典：", "上下文应用：", "风格要求：")
 
 
 def _critical_text_tokens(text: str) -> set[str]:
@@ -68,6 +69,33 @@ def _should_fallback_to_original_text(source_text: str, processed_text: str) -> 
     return len(normalized_processed) < int(
         len(normalized_source) * TEXT_FIDELITY_MIN_LENGTH_RATIO
     )
+
+
+def _strip_text_process_metadata_leak(processed_text: str) -> str:
+    """清理模型误输出的文本处理参考元信息。
+
+    用途：避免模型把服务端提示中用于参考的词典、上下文应用或风格要求原样输出到用户文本。
+    流程：逐行过滤固定元信息行，并额外处理首行把元信息和正文拼在同一行的常见情况。
+    参数：``processed_text`` 为上游模型返回的原始 assistant 文本。
+    返回：清理后的文本；如果全部被清理为空，则交由后续保真兜底回退原文。
+    异常边界：只识别服务端生成的固定标签，不做语义改写，降低误删用户真实正文的风险。
+    """
+
+    cleaned_lines: list[str] = []
+    for line in processed_text.splitlines():
+        normalized_line = line.strip()
+        if any(normalized_line.startswith(prefix) for prefix in TEXT_PROCESS_METADATA_PREFIXES):
+            for prefix in TEXT_PROCESS_METADATA_PREFIXES:
+                if normalized_line.startswith(prefix):
+                    suffix = normalized_line[len(prefix) :].strip()
+                    if " " in suffix:
+                        maybe_content = suffix.split(" ", 1)[1].strip()
+                        if maybe_content:
+                            cleaned_lines.append(maybe_content)
+                    break
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 class ModelService:
@@ -238,13 +266,17 @@ class ModelService:
         system_prompt = (
             "你是中文文本保真处理助手。{0}"
             "输出前逐项自查：是否遗漏数字、否定、条件、因果、转折或关键对象；如有遗漏，必须恢复。"
-            "只输出最终文本，不解释处理过程。".format(mode_rule)
+            "只输出最终文本，不解释处理过程；禁止输出原文、词典、当前输入应用、风格要求等参考标签。".format(mode_rule)
         )
         context_lines = ["原文：{0}".format(text)]
         if request.dictionary:
             context_lines.append("词典：{0}".format("、".join(request.dictionary)))
         if request.context_app.strip():
-            context_lines.append("上下文应用：{0}".format(request.context_app.strip()))
+            context_lines.append(
+                "当前输入应用仅供语境参考，禁止输出：{0}".format(
+                    request.context_app.strip()
+                )
+            )
         if request.style_instruction.strip():
             context_lines.append(
                 "风格要求：{0}".format(request.style_instruction.strip())
@@ -278,7 +310,7 @@ class ModelService:
                     },
                 )
                 raise ApiError(504, "UPSTREAM_TIMEOUT", "模型服务响应超时。") from error
-        processed_text = self._message_text(response)
+        processed_text = _strip_text_process_metadata_leak(self._message_text(response))
         if _should_fallback_to_original_text(text, processed_text):
             logger.warning(
                 "text_fidelity_fallback",
