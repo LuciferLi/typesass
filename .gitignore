@@ -127,3 +127,44 @@ src-tauri/binaries/codexman-ai-sidecar-*
 server/.venv-build/
 public/downloads/typesass-extension/
 website/downloads/*.dmg
+
+# 本地产物与临时文件（任意层级；保留测试源码、配置和基准截图）
+output/
+outputs/
+tmp/
+temp/
+.tmp/
+.temp/
+tmp-*
+tmp_*
+temp-*
+temp_*
+.tmp-*
+.temp-*
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# TEP 临时目录与文件（大小写兼容，按完整名称或分隔符匹配）
+[tT][eE][pP]
+.[tT][eE][pP]
+[tT][eE][pP]-*
+[tT][eE][pP]_*
+[tT][eE][pP].*
+.[tT][eE][pP]-*
+*.[tT][eE][pP]
+
+# Playwright 运行产物、报告、缓存与本地登录状态
+.playwright/
+.playwright-cli/
+.playwright-mcp/
+playwright-report/
+playwright-reports/
+playwright-output/
+test-results/
+blob-report/
+**/playwright/.cache/
+**/playwright/.auth/
+**/playwright/.state/
